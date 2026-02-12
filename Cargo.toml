@@ -1,0 +1,40 @@
+[package]
+name = "rustaccio"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["s3"]
+s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
+
+[dependencies]
+argon2 = "0.5.3"
+async-trait = "0.1.88"
+aws-config = { version = "1.5.16", optional = true }
+aws-sdk-s3 = { version = "1.75.0", optional = true }
+axum = { version = "0.7.9", features = ["http1", "tokio", "json"] }
+base64 = "0.22.1"
+bytes = "1.10.1"
+chrono = { version = "0.4.40", features = ["clock", "serde"] }
+futures-util = "0.3.31"
+hex = "0.4.3"
+http = "1.2.0"
+password-hash = "0.5.0"
+rand = "0.8.5"
+reqwest = { version = "0.12.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+serde_yaml = "0.9.34"
+sha2 = "0.10.8"
+thiserror = "2.0.12"
+tokio = { version = "1.44.0", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+urlencoding = "2.1.3"
+uuid = { version = "1.15.1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+http-body-util = "0.1.3"
+tower = { version = "0.5.2", features = ["util"] }
+tempfile = "3.18.0"
+wiremock = "0.6.2"

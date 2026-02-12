@@ -1,0 +1,32 @@
+pub const API_MESSAGE_PKG_CREATED: &str = "created new package";
+pub const API_MESSAGE_PKG_CHANGED: &str = "package changed";
+pub const API_MESSAGE_PKG_REMOVED: &str = "package removed";
+pub const API_MESSAGE_TARBALL_REMOVED: &str = "tarball removed";
+pub const API_MESSAGE_TAG_ADDED: &str = "package tagged";
+pub const API_MESSAGE_TAG_REMOVED: &str = "tag removed";
+pub const API_MESSAGE_LOGGED_OUT: &str = "Logged out";
+
+pub const API_ERROR_PASSWORD_SHORT: &str = "The provided password does not pass the validation";
+pub const API_ERROR_MUST_BE_LOGGED: &str = "You must be logged in to publish packages.";
+pub const API_ERROR_BAD_USERNAME_PASSWORD: &str = "bad username/password, access denied";
+pub const API_ERROR_NO_PACKAGE: &str = "no such package available";
+pub const API_ERROR_NO_SUCH_FILE: &str = "no such file available";
+pub const API_ERROR_UNSUPPORTED_REGISTRY_CALL: &str = "unsupported registry call";
+pub const API_ERROR_UNAUTHORIZED_ACCESS: &str = "unauthorized access";
+pub const API_ERROR_ONLY_OWNER: &str = "only owners are allowed to change package";
+pub const API_ERROR_PACKAGE_EXIST: &str = "this package is already present";
+pub const API_ERROR_USERNAME_ALREADY_REGISTERED: &str = "username is already registered";
+pub const API_ERROR_USERNAME_MISMATCH: &str = "username does not match logged in user";
+pub const API_ERROR_SESSION_ID_REQUIRED: &str = "session id is required";
+pub const API_ERROR_SESSION_ID_INVALID: &str = "session id is invalid";
+pub const API_ERROR_SESSION_TOKEN_EXPIRED: &str = "session token expired";
+pub const API_ERROR_VERSION_NOT_EXIST: &str = "this version doesn't exist";
+pub const API_ERROR_PROFILE_ERROR: &str = "profile unexpected error";
+pub const API_ERROR_PARAMETERS_NOT_VALID: &str = "the parameters are not valid";
+pub const API_ERROR_TFA_DISABLED: &str = "the two-factor authentication is not yet supported";
+
+pub const HEADER_JSON: &str = "application/json; charset=utf-8";
+pub const HEADER_JSON_INSTALL: &str = "application/vnd.npm.install-v1+json; charset=utf-8";
+pub const HEADER_OCTET: &str = "application/octet-stream; charset=utf-8";
+pub const TOKEN_BEARER_PREFIX: &str = "Bearer ";
+pub const ANONYMOUS_USER: &str = "anonymous";
