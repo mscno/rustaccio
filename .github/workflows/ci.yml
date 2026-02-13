@@ -45,3 +45,46 @@ jobs:
 
       - name: Cargo doc
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract release notes from changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          awk -v version="$version" '
+            BEGIN {
+              heading = "## [" version "]"
+            }
+            ($0 == heading) || (index($0, heading " - ") == 1) {
+              in_section = 1
+            }
+            in_section && index($0, "## [") == 1 && !(($0 == heading) || (index($0, heading " - ") == 1)) {
+              exit
+            }
+            in_section {
+              print
+            }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+
+          if [[ ! -s RELEASE_NOTES.md ]]; then
+            echo "::error::No changelog entry found for version $version in CHANGELOG.md"
+            exit 1
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          prerelease: ${{ contains(github.ref_name, '-') }}

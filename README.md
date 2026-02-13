@@ -69,11 +69,12 @@ Unified merge precedence is:
 `defaults < RUSTACCIO_CONFIG file < --config file < environment variables`.
 
 `main` delegates to library runtime (`rustaccio::runtime::run_from_env()`), so standalone and embedded usage share the same config/runtime path.
-The full environment variable list is generated into `.env.example` via `cargo run --bin sync_examples`.
+The full `RUSTACCIO_*` environment variable list is generated into `.env.example` via `cargo run --bin sync_examples`.
 
 Environment variables:
 
 - `RUSTACCIO_BIND` (default `127.0.0.1:4873`)
+- `PORT` (optional platform-assigned port; when set, rustaccio binds to `0.0.0.0:$PORT` and this takes precedence over `RUSTACCIO_BIND`)
 - `RUSTACCIO_DATA_DIR` (default `.rustaccio-data`)
 - `RUSTACCIO_CONFIG` (optional Verdaccio-style YAML; loads `packages` ACL rules + `uplinks`)
 - `RUSTACCIO_UPSTREAM` (optional, eg `https://registry.npmjs.org`)
