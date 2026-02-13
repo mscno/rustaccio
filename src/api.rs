@@ -91,6 +91,7 @@ pub async fn dispatch(
     }
 
     if path == "/-/npm/v1/security/advisories/bulk" && method == Method::POST {
+        ensure_audit_enabled(&state)?;
         let payload = parse_json_body(&read_body(req, state.max_body_size).await?)?;
         for upstream in select_default_uplinks(&state) {
             match upstream.post_security_advisories_bulk(&payload).await {
@@ -104,6 +105,7 @@ pub async fn dispatch(
     }
 
     if path == "/-/npm/v1/security/audits/quick" && method == Method::POST {
+        ensure_audit_enabled(&state)?;
         let payload = parse_json_body(&read_body(req, state.max_body_size).await?)?;
         for upstream in select_default_uplinks(&state) {
             match upstream.post_security_audits_quick(&payload).await {
@@ -121,6 +123,7 @@ pub async fn dispatch(
     }
 
     if path == "/-/npm/v1/security/audits" && method == Method::POST {
+        ensure_audit_enabled(&state)?;
         let payload = parse_json_body(&read_body(req, state.max_body_size).await?)?;
         for upstream in select_default_uplinks(&state) {
             match upstream.post_security_audits(&payload).await {
@@ -873,7 +876,8 @@ async fn handle_search(
     let size = params
         .get("size")
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(20);
+        .unwrap_or(20)
+        .min(250);
     let from = params
         .get("from")
         .and_then(|value| value.parse::<usize>().ok())
@@ -1482,6 +1486,13 @@ fn ensure_local_auth_routes_enabled(state: &AppState) -> Result<(), RegistryErro
         return Err(RegistryError::http(StatusCode::NOT_FOUND, "not found"));
     }
     Ok(())
+}
+
+fn ensure_audit_enabled(state: &AppState) -> Result<(), RegistryError> {
+    if state.audit_enabled {
+        return Ok(());
+    }
+    Err(RegistryError::http(StatusCode::NOT_FOUND, "not found"))
 }
 
 fn ensure_admin_authenticated(user: Option<&str>) -> Result<(), RegistryError> {

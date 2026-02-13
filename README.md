@@ -2,6 +2,10 @@
 
 A Rust/Tokio/Axum npm registry proxy inspired by Verdaccio core behavior.
 
+## Compatibility Policy
+
+Rustaccio prioritizes npm client compatibility for common Verdaccio workflows (install, publish, dist-tags, auth, and uplink proxying). It does not guarantee byte-for-byte parity with Verdaccio internals or edge-case behavior; known differences and current limits are documented in [Verdaccio Differences and Limits](#verdaccio-differences-and-limits).
+
 ## Quick Start
 
 1. Copy the example config:
@@ -339,6 +343,20 @@ The integration suite in `tests/parity.rs` currently validates:
 - package ACL parity subset (`access`/`publish`/`unpublish`) with pattern matching and proxy uplink selection
 - `url_prefix` path handling + `max_body_size` request enforcement
 - built-in web UI serving, SPA fallback behavior, and `web.enable` route gating
+
+## Verdaccio Differences and Limits
+
+Rustaccio targets Verdaccio-compatible npm client behavior for core flows, but it is not a byte-for-byte Verdaccio clone. Current known differences/limits:
+
+- ACL matching is a parity subset: rule matching supports common wildcard patterns, but not full Verdaccio/micromatch pattern semantics.
+- Authorization parsing currently accepts `Bearer <token>` only.
+- `:revision` route segments are accepted for Verdaccio-compatible route shapes, but revision values are not currently used for optimistic-concurrency checks.
+- `/-/npm/v1/user` currently does not support 2FA updates (`tfa` payload returns `503`).
+- Search (`/-/v1/search`) currently uses `text`, `size`, and `from`; score tuning params are ignored, and `total` reflects returned page size.
+- YAML `listen` can be configured as a list for config compatibility, but the server currently binds a single effective socket address.
+- `server.keepAliveTimeout` is parsed for config parity but is currently not applied by the active axum runtime path.
+- Built-in web UI is a lightweight Verdaccio-style SPA shell and static assets, not the full upstream Verdaccio frontend/runtime surface.
+- Rustaccio-specific admin endpoints are exposed at `/-/admin/reindex` and `/-/admin/storage-health`.
 
 ## Architecture
 

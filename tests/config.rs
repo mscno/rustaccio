@@ -181,9 +181,27 @@ fn from_env_with_config_file_errors_for_missing_path() {
 }
 
 #[test]
+fn from_env_errors_when_rustaccio_config_path_is_invalid() {
+    with_env_vars(
+        &[
+            (
+                "RUSTACCIO_CONFIG",
+                Some("/definitely/missing/rustaccio.yml"),
+            ),
+            ("PORT", None),
+            ("RUSTACCIO_BIND", None),
+        ],
+        || {
+            let err = Config::from_env().expect_err("invalid env config");
+            assert!(err.contains("failed to load RUSTACCIO_CONFIG"));
+        },
+    );
+}
+
+#[test]
 fn from_env_uses_port_env_for_platform_compatibility() {
     with_env_vars(&[("RUSTACCIO_BIND", None), ("PORT", Some("6123"))], || {
-        let cfg = Config::from_env();
+        let cfg = Config::from_env().expect("config from env");
         assert_eq!(cfg.listen, vec!["0.0.0.0:6123".to_string()]);
     });
 }
@@ -196,7 +214,7 @@ fn port_env_overrides_rustaccio_bind() {
             ("PORT", Some("6123")),
         ],
         || {
-            let cfg = Config::from_env();
+            let cfg = Config::from_env().expect("config from env");
             assert_eq!(cfg.listen, vec!["0.0.0.0:6123".to_string()]);
         },
     );

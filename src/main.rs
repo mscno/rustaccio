@@ -51,8 +51,12 @@ where
 }
 
 fn parse_env_usize(key: &str, default: usize, min: usize, max: usize) -> usize {
-    let parsed = std::env::var(key)
-        .ok()
+    let raw = std::env::var(key).ok();
+    parse_usize_or_default(raw.as_deref(), default, min, max)
+}
+
+fn parse_usize_or_default(raw: Option<&str>, default: usize, min: usize, max: usize) -> usize {
+    let parsed = raw
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(default);
     parsed.clamp(min, max)
@@ -129,7 +133,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_cli_args;
+    use super::{parse_cli_args, parse_usize_or_default};
     use std::path::PathBuf;
 
     #[test]
@@ -169,5 +173,17 @@ mod tests {
     fn errors_on_unknown_flag() {
         let err = parse_cli_args(vec!["--wat".to_string()]).expect_err("unknown arg");
         assert_eq!(err, "unknown argument: --wat");
+    }
+
+    #[test]
+    fn parse_env_usize_clamps_values() {
+        assert_eq!(parse_usize_or_default(Some("900"), 4, 1, 32), 32);
+        assert_eq!(parse_usize_or_default(Some("0"), 4, 1, 32), 1);
+    }
+
+    #[test]
+    fn parse_env_usize_uses_default_for_invalid_values() {
+        assert_eq!(parse_usize_or_default(Some("invalid"), 7, 1, 32), 7);
+        assert_eq!(parse_usize_or_default(None, 7, 1, 32), 7);
     }
 }

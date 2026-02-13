@@ -115,17 +115,17 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self, String> {
         let mut cfg = Self::defaults();
-        cfg.apply_env_config_file_if_present();
+        cfg.apply_env_config_file_if_present()?;
         cfg.apply_env_overrides();
         cfg.ensure_default_uplink();
-        cfg
+        Ok(cfg)
     }
 
     pub fn from_env_with_config_file(config_path: PathBuf) -> Result<Self, String> {
         let mut cfg = Self::defaults();
-        cfg.apply_env_config_file_if_present();
+        cfg.apply_env_config_file_if_present()?;
         cfg.apply_yaml_overrides(Self::from_yaml_file(config_path)?);
         cfg.apply_env_overrides();
         cfg.ensure_default_uplink();
@@ -164,16 +164,17 @@ impl Config {
         Self::defaults()
     }
 
-    fn apply_env_config_file_if_present(&mut self) {
+    fn apply_env_config_file_if_present(&mut self) -> Result<(), String> {
         let Ok(path) = env::var("RUSTACCIO_CONFIG") else {
-            return;
+            return Ok(());
         };
         if path.trim().is_empty() {
-            return;
+            return Ok(());
         }
-        if let Ok(loaded) = Self::from_yaml_file(PathBuf::from(path)) {
-            self.apply_yaml_overrides(loaded);
-        }
+        let loaded = Self::from_yaml_file(PathBuf::from(&path))
+            .map_err(|err| format!("failed to load RUSTACCIO_CONFIG={path}: {err}"))?;
+        self.apply_yaml_overrides(loaded);
+        Ok(())
     }
 
     fn apply_env_overrides(&mut self) {

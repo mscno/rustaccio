@@ -27,6 +27,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
 use password_hash::{SaltString, rand_core::OsRng};
 use rand::RngCore;
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -52,6 +53,15 @@ pub struct Store {
     auth_hook: Option<Arc<dyn AuthHook>>,
     password_min_length: usize,
     login_session_ttl_seconds: i64,
+}
+
+#[derive(Serialize)]
+struct PersistedStateView<'a> {
+    users: &'a HashMap<String, UserRecord>,
+    auth_tokens: &'a HashMap<String, AuthTokenRecord>,
+    npm_tokens: &'a Vec<NpmTokenRecord>,
+    login_sessions: &'a HashMap<String, LoginSessionRecord>,
+    packages: HashMap<&'a String, &'a PackageRecord>,
 }
 
 impl Store {
@@ -108,11 +118,7 @@ impl Store {
             login_session_ttl_seconds: config.login_session_ttl_seconds,
         };
         if reindexed_from_backend || pruned_legacy_uplink_cache_entries > 0 {
-            let snapshot = {
-                let guard = store.state.read().await;
-                guard.clone()
-            };
-            store.persist_snapshot(&snapshot).await?;
+            store.persist_state().await?;
         }
         debug!(
             reindexed_from_backend,
@@ -635,10 +641,11 @@ impl Store {
         Ok(())
     }
 
-    async fn persist_snapshot(&self, snapshot: &PersistedState) -> Result<(), RegistryError> {
-        let mut persisted = snapshot.clone();
-        Self::prune_ephemeral_uplink_cache_entries(&mut persisted);
-        let bytes = serde_json::to_vec_pretty(&persisted)?;
+    async fn persist_state(&self) -> Result<(), RegistryError> {
+        let bytes = {
+            let state = self.state.read().await;
+            Self::serialize_persisted_state(&state)?
+        };
         Self::write_local_snapshot_bytes(&self.state_file, &bytes).await?;
         if self.tarball_backend.supports_shared_state_snapshot() {
             self.tarball_backend
@@ -648,43 +655,57 @@ impl Store {
         Ok(())
     }
 
-    async fn sync_all_package_sidecars_from_snapshot(
-        &self,
-        snapshot: &PersistedState,
-    ) -> Result<usize, RegistryError> {
+    fn serialize_persisted_state(state: &PersistedState) -> Result<Vec<u8>, RegistryError> {
+        let packages = state
+            .packages
+            .iter()
+            .filter(|(_, record)| !record.cached_from_uplink)
+            .collect::<HashMap<_, _>>();
+        let view = PersistedStateView {
+            users: &state.users,
+            auth_tokens: &state.auth_tokens,
+            npm_tokens: &state.npm_tokens,
+            login_sessions: &state.login_sessions,
+            packages,
+        };
+        Ok(serde_json::to_vec_pretty(&view)?)
+    }
+
+    async fn sync_all_package_sidecars(&self) -> Result<usize, RegistryError> {
+        let package_manifests = {
+            let state = self.state.read().await;
+            state
+                .packages
+                .iter()
+                .filter(|(_, record)| !record.cached_from_uplink && record.manifest.is_object())
+                .map(|(package_name, record)| (package_name.clone(), record.manifest.clone()))
+                .collect::<Vec<_>>()
+        };
+
         let mut synced = 0usize;
-        for (package_name, record) in &snapshot.packages {
-            if record.cached_from_uplink || !record.manifest.is_object() {
-                continue;
-            }
+        for (package_name, manifest) in package_manifests {
             self.tarball_backend
-                .write_package_metadata(package_name, &record.manifest)
+                .write_package_metadata(&package_name, &manifest)
                 .await?;
             synced += 1;
         }
         Ok(synced)
     }
 
-    async fn sync_package_sidecar_from_snapshot(
-        &self,
-        snapshot: &PersistedState,
-        package_name: &str,
-    ) -> Result<(), RegistryError> {
-        let Some(record) = snapshot.packages.get(package_name) else {
-            return Ok(());
+    async fn sync_package_sidecar(&self, package_name: &str) -> Result<(), RegistryError> {
+        let manifest = {
+            let state = self.state.read().await;
+            let Some(record) = state.packages.get(package_name) else {
+                return Ok(());
+            };
+            if record.cached_from_uplink || !record.manifest.is_object() {
+                return Ok(());
+            }
+            record.manifest.clone()
         };
-        if record.cached_from_uplink || !record.manifest.is_object() {
-            return Ok(());
-        }
         self.tarball_backend
-            .write_package_metadata(package_name, &record.manifest)
+            .write_package_metadata(package_name, &manifest)
             .await
-    }
-
-    fn prune_ephemeral_uplink_cache_entries(state: &mut PersistedState) {
-        state
-            .packages
-            .retain(|_, record| !record.cached_from_uplink);
     }
 
     fn prune_legacy_uplink_snapshot_entries(state: &mut PersistedState) -> usize {
@@ -861,54 +882,19 @@ impl Store {
             ));
         }
 
+        let source;
         if let Some(hook) = &self.auth_hook {
             debug!("delegating user creation to embedded auth hook");
             hook.add_user(name, password, self.password_min_length)
                 .await?;
-
-            let snapshot = {
-                let mut state = self.state.write().await;
-                let token = Self::random_token_hex(24);
-                state.auth_tokens.insert(
-                    token.clone(),
-                    AuthTokenRecord {
-                        user: name.to_string(),
-                        created_at: Self::now_ms(),
-                    },
-                );
-                (state.clone(), token)
-            };
-
-            self.persist_snapshot(&snapshot.0).await?;
-            debug!("created user via embedded auth hook");
-            return Ok(snapshot.1);
-        }
-
-        if let Some(plugin) = &self.auth_plugin {
+            source = "embedded auth hook";
+        } else if let Some(plugin) = &self.auth_plugin {
             debug!("delegating user creation to auth plugin");
             plugin
                 .add_user(name, password, self.password_min_length)
                 .await?;
-
-            let snapshot = {
-                let mut state = self.state.write().await;
-                let token = Self::random_token_hex(24);
-                state.auth_tokens.insert(
-                    token.clone(),
-                    AuthTokenRecord {
-                        user: name.to_string(),
-                        created_at: Self::now_ms(),
-                    },
-                );
-                (state.clone(), token)
-            };
-
-            self.persist_snapshot(&snapshot.0).await?;
-            debug!("created user via auth plugin");
-            return Ok(snapshot.1);
-        }
-
-        let snapshot = {
+            source = "auth plugin";
+        } else {
             let mut state = self.state.write().await;
             if state.users.contains_key(name) {
                 return Err(RegistryError::http(
@@ -925,7 +911,11 @@ impl Store {
                     created_at: Self::now_ms(),
                 },
             );
+            source = "local auth store";
+        }
 
+        let token = {
+            let mut state = self.state.write().await;
             let token = Self::random_token_hex(24);
             state.auth_tokens.insert(
                 token.clone(),
@@ -934,14 +924,12 @@ impl Store {
                     created_at: Self::now_ms(),
                 },
             );
-
-            let snapshot = state.clone();
-            (snapshot, token)
+            token
         };
 
-        self.persist_snapshot(&snapshot.0).await?;
-        debug!("created local user");
-        Ok(snapshot.1)
+        self.persist_state().await?;
+        debug!(source, "created user");
+        Ok(token)
     }
 
     #[instrument(skip(self, password), fields(username = name))]
@@ -963,7 +951,7 @@ impl Store {
             verify_password(&user.password_hash, password)?;
         }
 
-        let snapshot = {
+        let token = {
             let mut state = self.state.write().await;
             let token = Self::random_token_hex(24);
             state.auth_tokens.insert(
@@ -973,12 +961,12 @@ impl Store {
                     created_at: Self::now_ms(),
                 },
             );
-            (state.clone(), token)
+            token
         };
 
-        self.persist_snapshot(&snapshot.0).await?;
+        self.persist_state().await?;
         debug!("user login succeeded");
-        Ok(snapshot.1)
+        Ok(token)
     }
 
     pub async fn verify_credentials(
@@ -1028,7 +1016,7 @@ impl Store {
             ));
         }
 
-        let snapshot = {
+        {
             let mut state = self.state.write().await;
             let Some(user) = state.users.get_mut(name) else {
                 return Err(RegistryError::http(
@@ -1040,10 +1028,9 @@ impl Store {
                 RegistryError::http(StatusCode::FORBIDDEN, API_ERROR_BAD_USERNAME_PASSWORD)
             })?;
             user.password_hash = hash_password(new)?;
-            state.clone()
-        };
+        }
 
-        self.persist_snapshot(&snapshot).await?;
+        self.persist_state().await?;
         debug!("password changed");
         Ok(())
     }
@@ -1051,7 +1038,7 @@ impl Store {
     #[instrument(skip(self))]
     pub async fn create_login_session(&self) -> Result<String, RegistryError> {
         let session_id = Uuid::new_v4().to_string();
-        let snapshot = {
+        {
             let mut state = self.state.write().await;
             state.login_sessions.insert(
                 session_id.clone(),
@@ -1060,9 +1047,8 @@ impl Store {
                     created_at: Self::now_ms(),
                 },
             );
-            state.clone()
-        };
-        self.persist_snapshot(&snapshot).await?;
+        }
+        self.persist_state().await?;
         debug!("created login session");
         Ok(session_id)
     }
@@ -1072,7 +1058,7 @@ impl Store {
         session_id: &str,
         token: String,
     ) -> Result<(), RegistryError> {
-        let snapshot = {
+        {
             let mut state = self.state.write().await;
             let Some(session) = state.login_sessions.get_mut(session_id) else {
                 return Err(RegistryError::http(
@@ -1082,9 +1068,8 @@ impl Store {
             };
             session.token = token;
             session.created_at = Self::now_ms();
-            state.clone()
-        };
-        self.persist_snapshot(&snapshot).await?;
+        }
+        self.persist_state().await?;
         Ok(())
     }
 
@@ -1093,7 +1078,7 @@ impl Store {
         &self,
         session_id: &str,
     ) -> Result<Option<String>, RegistryError> {
-        let snapshot_result = {
+        let (token, created_at) = {
             let mut state = self.state.write().await;
             let Some(session) = state.login_sessions.get(session_id) else {
                 return Err(RegistryError::http(
@@ -1109,14 +1094,13 @@ impl Store {
             let token = session.token.clone();
             let created_at = session.created_at;
             state.login_sessions.remove(session_id);
-            let snapshot = state.clone();
-            (snapshot, token, created_at)
+            (token, created_at)
         };
 
-        self.persist_snapshot(&snapshot_result.0).await?;
+        self.persist_state().await?;
 
         let oldest = Self::now_ms() - (self.login_session_ttl_seconds * 1000);
-        if snapshot_result.2 < oldest {
+        if created_at < oldest {
             warn!("login session token expired");
             return Err(RegistryError::http(
                 StatusCode::UNAUTHORIZED,
@@ -1125,7 +1109,7 @@ impl Store {
         }
 
         debug!("login session completed");
-        Ok(Some(snapshot_result.1))
+        Ok(Some(token))
     }
 
     pub async fn list_npm_tokens(&self, user: &str) -> Vec<NpmTokenRecord> {
@@ -1161,32 +1145,31 @@ impl Store {
             created: Self::now_ms(),
         };
 
-        let snapshot = {
+        {
             let mut state = self.state.write().await;
             state.npm_tokens.push(token.clone());
-            state.clone()
-        };
+        }
 
-        self.persist_snapshot(&snapshot).await?;
+        self.persist_state().await?;
         debug!("created npm token");
         Ok((token, raw_token))
     }
 
     #[instrument(skip(self), fields(username = user))]
     pub async fn delete_npm_token(&self, user: &str, token_key: &str) -> Result<(), RegistryError> {
-        let snapshot = {
+        let changed = {
             let mut state = self.state.write().await;
             let before = state.npm_tokens.len();
             state
                 .npm_tokens
                 .retain(|token| !(token.user == user && token.key == token_key));
-            if before == state.npm_tokens.len() {
-                return Ok(());
-            }
-            state.clone()
+            before != state.npm_tokens.len()
         };
+        if !changed {
+            return Ok(());
+        }
 
-        self.persist_snapshot(&snapshot).await?;
+        self.persist_state().await?;
         debug!("deleted npm token");
         Ok(())
     }
@@ -1412,7 +1395,7 @@ impl Store {
             && (body.get("users").is_some() || body.get("maintainers").is_some());
 
         if is_owner_or_star_update {
-            let snapshot = {
+            {
                 let mut state = self.state.write().await;
                 let record = Self::package_record(&mut state, package_name)?;
                 let Some(manifest) = record.manifest.as_object_mut() else {
@@ -1430,12 +1413,10 @@ impl Store {
                 Self::bump_revision(manifest);
                 record.updated_at = Self::now_ms();
                 record.cached_from_uplink = false;
-                state.clone()
-            };
+            }
 
-            self.persist_snapshot(&snapshot).await?;
-            self.sync_package_sidecar_from_snapshot(&snapshot, package_name)
-                .await?;
+            self.persist_state().await?;
+            self.sync_package_sidecar(package_name).await?;
             debug!("updated package owner/star metadata");
             return Ok(API_MESSAGE_PKG_CHANGED.to_string());
         }
@@ -1448,7 +1429,7 @@ impl Store {
             })?;
 
         if !Self::has_attachment_data(&body) {
-            let snapshot = {
+            {
                 let mut state = self.state.write().await;
                 let Some(record) = state.packages.get_mut(package_name) else {
                     return Err(RegistryError::http(
@@ -1473,12 +1454,10 @@ impl Store {
 
                 record.updated_at = Self::now_ms();
                 record.cached_from_uplink = false;
-                state.clone()
-            };
+            }
 
-            self.persist_snapshot(&snapshot).await?;
-            self.sync_package_sidecar_from_snapshot(&snapshot, package_name)
-                .await?;
+            self.persist_state().await?;
+            self.sync_package_sidecar(package_name).await?;
             debug!("applied metadata-only publish update");
             return Ok(API_MESSAGE_PKG_CHANGED.to_string());
         }
@@ -1510,7 +1489,7 @@ impl Store {
                 .await?;
         }
 
-        let snapshot_and_message = {
+        let message = {
             let mut state = self.state.write().await;
 
             let message;
@@ -1614,22 +1593,18 @@ impl Store {
                 message = API_MESSAGE_PKG_CREATED.to_string();
             }
 
-            (state.clone(), message)
+            message
         };
 
-        self.persist_snapshot(&snapshot_and_message.0).await?;
-        self.sync_package_sidecar_from_snapshot(&snapshot_and_message.0, package_name)
-            .await?;
-        debug!(
-            message = snapshot_and_message.1.as_str(),
-            "published package manifest"
-        );
-        Ok(snapshot_and_message.1)
+        self.persist_state().await?;
+        self.sync_package_sidecar(package_name).await?;
+        debug!(message = message.as_str(), "published package manifest");
+        Ok(message)
     }
 
     #[instrument(skip(self), fields(package = package_name))]
     pub async fn remove_package(&self, package_name: &str) -> Result<String, RegistryError> {
-        let snapshot = {
+        {
             let mut state = self.state.write().await;
             if state.packages.remove(package_name).is_none() {
                 return Err(RegistryError::http(
@@ -1637,12 +1612,11 @@ impl Store {
                     API_ERROR_NO_PACKAGE,
                 ));
             }
-            state.clone()
-        };
+        }
 
         let _ = self.tarball_backend.delete_package(package_name).await;
 
-        self.persist_snapshot(&snapshot).await?;
+        self.persist_state().await?;
         debug!("removed package");
         Ok(API_MESSAGE_PKG_REMOVED.to_string())
     }
@@ -1664,7 +1638,7 @@ impl Store {
         }
 
         let removed_file = self.tarball_backend.delete(package_name, filename).await?;
-        let snapshot = {
+        {
             let mut state = self.state.write().await;
             let record = Self::package_record(&mut state, package_name)?;
             let Some(manifest) = record.manifest.as_object_mut() else {
@@ -1726,12 +1700,10 @@ impl Store {
 
             Self::bump_revision(manifest);
             record.updated_at = Self::now_ms();
-            state.clone()
-        };
+        }
 
-        self.persist_snapshot(&snapshot).await?;
-        self.sync_package_sidecar_from_snapshot(&snapshot, package_name)
-            .await?;
+        self.persist_state().await?;
+        self.sync_package_sidecar(package_name).await?;
         debug!("removed tarball");
         Ok(API_MESSAGE_TARBALL_REMOVED.to_string())
     }
@@ -1742,7 +1714,7 @@ impl Store {
         tag: &str,
         version: Option<&str>,
     ) -> Result<String, RegistryError> {
-        let snapshot = {
+        let response = {
             let mut state = self.state.write().await;
             let record = Self::package_record(&mut state, package_name)?;
             let Some(manifest) = record.manifest.as_object_mut() else {
@@ -1766,13 +1738,12 @@ impl Store {
             record.updated_at = Self::now_ms();
             record.cached_from_uplink = false;
 
-            (state.clone(), response.to_string())
+            response.to_string()
         };
 
-        self.persist_snapshot(&snapshot.0).await?;
-        self.sync_package_sidecar_from_snapshot(&snapshot.0, package_name)
-            .await?;
-        Ok(snapshot.1)
+        self.persist_state().await?;
+        self.sync_package_sidecar(package_name).await?;
+        Ok(response)
     }
 
     pub async fn dist_tags(&self, package_name: &str) -> Result<Value, RegistryError> {
@@ -1861,20 +1832,19 @@ impl Store {
     }
 
     pub async fn reindex_from_backend(&self) -> Result<Value, RegistryError> {
-        let (snapshot, changed, before_packages, after_packages) = {
+        let (changed, before_packages, after_packages) = {
             let mut state = self.state.write().await;
             let before_packages = state.packages.len();
             let changed =
                 Self::hydrate_from_tarball_backend(&mut state, &self.tarball_backend).await?;
             let after_packages = state.packages.len();
-            (state.clone(), changed, before_packages, after_packages)
+            (changed, before_packages, after_packages)
         };
         if changed {
-            self.persist_snapshot(&snapshot).await?;
+            self.persist_state().await?;
         }
         let sidecars_synced = if changed {
-            self.sync_all_package_sidecars_from_snapshot(&snapshot)
-                .await?
+            self.sync_all_package_sidecars().await?
         } else {
             0
         };

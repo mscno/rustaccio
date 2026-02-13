@@ -32,11 +32,7 @@ pub struct AppState {
 pub fn build_router(state: AppState) -> Router {
     let request_id_header = HeaderName::from_static("x-request-id");
     let max_body_size = state.max_body_size;
-    let request_timeout_secs = std::env::var("RUSTACCIO_REQUEST_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(30)
-        .clamp(1, 300);
+    let request_timeout_secs = request_timeout_secs_from_env();
     let trace_layer = TraceLayer::new_for_http()
         .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
         .on_response(DefaultOnResponse::new().level(Level::INFO))
@@ -53,4 +49,32 @@ pub fn build_router(state: AppState) -> Router {
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
         .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
         .layer(trace_layer)
+}
+
+fn request_timeout_secs_from_env() -> u64 {
+    let raw = std::env::var("RUSTACCIO_REQUEST_TIMEOUT_SECS").ok();
+    parse_request_timeout_secs(raw.as_deref())
+}
+
+fn parse_request_timeout_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(30)
+        .clamp(1, 300)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_request_timeout_secs;
+
+    #[test]
+    fn request_timeout_defaults_to_30() {
+        assert_eq!(parse_request_timeout_secs(None), 30);
+        assert_eq!(parse_request_timeout_secs(Some("bad")), 30);
+    }
+
+    #[test]
+    fn request_timeout_is_clamped() {
+        assert_eq!(parse_request_timeout_secs(Some("0")), 1);
+        assert_eq!(parse_request_timeout_secs(Some("999")), 300);
+    }
 }

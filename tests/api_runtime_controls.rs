@@ -300,3 +300,61 @@ async fn external_request_auth_not_found_surfaces_as_bad_gateway() {
         Some("external request auth endpoint not found: /request-auth")
     );
 }
+
+#[tokio::test]
+async fn audit_endpoints_are_disabled_when_audit_flag_is_false() {
+    let dir = TempDir::new().expect("dir");
+    let mut cfg = base_config(dir.path().to_path_buf());
+    cfg.audit_enabled = false;
+    let app = app_with_config(&cfg, None).await;
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/-/npm/v1/security/audits/quick")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&json!({})).expect("payload")))
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/-/npm/v1/security/advisories/bulk")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&json!({})).expect("payload")))
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn web_routes_are_hidden_when_web_is_disabled() {
+    let dir = TempDir::new().expect("dir");
+    let mut cfg = base_config(dir.path().to_path_buf());
+    cfg.web_enabled = false;
+    let app = app_with_config(&cfg, None).await;
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/-/web/static/app.js")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/-/web/login")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

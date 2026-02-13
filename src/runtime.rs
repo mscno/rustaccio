@@ -8,6 +8,7 @@ use crate::{
     storage::{Store, StoreOptions},
     upstream::Upstream,
 };
+use axum::http::StatusCode;
 use std::{collections::HashMap, sync::Arc};
 use tracing::instrument;
 
@@ -70,13 +71,14 @@ pub async fn run(
     );
 
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
         .tcp_nodelay(true)
         .await
         .map_err(|_| RegistryError::Internal)
 }
 
 pub async fn run_standalone(config: Config) -> Result<(), RegistryError> {
-    let default_level = std::env::var("RUSTACCIO_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+    let default_level = startup_log_level(&config).to_string();
     let tracing_settings = observability::init_from_env(&default_level);
     tracing::debug!(
         log_filter = tracing_settings.filter,
@@ -87,6 +89,53 @@ pub async fn run_standalone(config: Config) -> Result<(), RegistryError> {
 }
 
 pub async fn run_from_env() -> Result<(), RegistryError> {
-    let config = Config::from_env();
+    let config = Config::from_env().map_err(|err| {
+        RegistryError::http(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("invalid runtime configuration: {err}"),
+        )
+    })?;
     run_standalone(config).await
+}
+
+fn startup_log_level(config: &Config) -> &str {
+    config.log_level.as_str()
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let ctrl_c = async {
+            let _ = tokio::signal::ctrl_c().await;
+        };
+        let terminate = async {
+            if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+                let _ = sigterm.recv().await;
+            }
+        };
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = terminate => {},
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::startup_log_level;
+    use crate::config::Config;
+
+    #[test]
+    fn startup_log_level_uses_config_value() {
+        let mut cfg = Config::defaults_for_examples();
+        cfg.log_level = "debug".to_string();
+        assert_eq!(startup_log_level(&cfg), "debug");
+    }
 }
