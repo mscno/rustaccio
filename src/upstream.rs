@@ -1,8 +1,15 @@
 use crate::error::RegistryError;
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use reqwest::Client;
 use serde_json::Value;
 use tracing::{debug, instrument, warn};
+
+#[derive(Debug, Clone)]
+pub struct UpstreamPassthroughResponse {
+    pub status: StatusCode,
+    pub body: Vec<u8>,
+    pub content_type: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct Upstream {
@@ -136,6 +143,53 @@ impl Upstream {
     ) -> Result<Option<Value>, RegistryError> {
         self.post_json_path("/-/npm/v1/security/audits", payload)
             .await
+    }
+
+    pub async fn passthrough_request(
+        &self,
+        method: &Method,
+        path: &str,
+        query: Option<&str>,
+    ) -> Result<Option<UpstreamPassthroughResponse>, RegistryError> {
+        let req_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
+            .map_err(|_| RegistryError::Internal)?;
+        let mut url = format!("{}{}", self.base_url, path);
+        if let Some(query) = query
+            && !query.is_empty()
+        {
+            url.push('?');
+            url.push_str(query);
+        }
+
+        let resp = self
+            .client
+            .request(req_method, url)
+            .send()
+            .await
+            .map_err(|_| {
+                warn!("uplink passthrough request failed");
+                RegistryError::http(StatusCode::BAD_GATEWAY, "uplink is offline")
+            })?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|_| RegistryError::http(StatusCode::BAD_GATEWAY, "bad uplink payload"))?;
+
+        Ok(Some(UpstreamPassthroughResponse {
+            status,
+            body: body.to_vec(),
+            content_type,
+        }))
     }
 
     #[instrument(skip(self, payload), fields(path, upstream = %self.base_url))]

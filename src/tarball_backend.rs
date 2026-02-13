@@ -2,9 +2,21 @@ use crate::{
     config::{Config, S3TarballStorageConfig, TarballStorageBackend},
     error::RegistryError,
 };
+#[cfg(feature = "s3")]
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use axum::http::StatusCode;
 use std::path::PathBuf;
 use tracing::{debug, instrument, warn};
+
+#[cfg(feature = "s3")]
+const DEFAULT_CA_BUNDLE_PATHS: [&str; 2] =
+    ["/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TarballRef {
+    pub package: String,
+    pub filename: String,
+}
 
 #[derive(Debug, Clone)]
 pub enum TarballBackend {
@@ -85,6 +97,38 @@ impl TarballBackend {
             Self::S3(backend) => backend.delete_package(package).await,
         }
     }
+
+    pub async fn list(&self) -> Result<Vec<TarballRef>, RegistryError> {
+        match self {
+            Self::Local(backend) => backend.list().await,
+            #[cfg(feature = "s3")]
+            Self::S3(backend) => backend.list().await,
+        }
+    }
+
+    pub fn supports_shared_state_snapshot(&self) -> bool {
+        match self {
+            Self::Local(_) => false,
+            #[cfg(feature = "s3")]
+            Self::S3(_) => true,
+        }
+    }
+
+    pub async fn load_shared_state_snapshot(&self) -> Result<Option<Vec<u8>>, RegistryError> {
+        match self {
+            Self::Local(_) => Ok(None),
+            #[cfg(feature = "s3")]
+            Self::S3(backend) => backend.get_state_snapshot().await,
+        }
+    }
+
+    pub async fn save_shared_state_snapshot(&self, content: &[u8]) -> Result<(), RegistryError> {
+        match self {
+            Self::Local(_) => Ok(()),
+            #[cfg(feature = "s3")]
+            Self::S3(backend) => backend.put_state_snapshot(content).await,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +143,10 @@ impl LocalTarballBackend {
 
     fn package_dir(name: &str) -> String {
         name.replace('/', "__")
+    }
+
+    fn package_name(dir: &str) -> String {
+        dir.replace("__", "/")
     }
 
     fn tarball_path(&self, package: &str, filename: &str) -> PathBuf {
@@ -156,6 +204,34 @@ impl LocalTarballBackend {
         }
         Ok(())
     }
+
+    pub async fn list(&self) -> Result<Vec<TarballRef>, RegistryError> {
+        let mut out = Vec::new();
+        let mut package_dirs = tokio::fs::read_dir(&self.root).await?;
+
+        while let Some(package_dir) = package_dirs.next_entry().await? {
+            if !package_dir.file_type().await?.is_dir() {
+                continue;
+            }
+
+            let encoded = package_dir.file_name().to_string_lossy().to_string();
+            let package = Self::package_name(&encoded);
+            let mut files = tokio::fs::read_dir(package_dir.path()).await?;
+
+            while let Some(file) = files.next_entry().await? {
+                if !file.file_type().await?.is_file() {
+                    continue;
+                }
+
+                out.push(TarballRef {
+                    package: package.clone(),
+                    filename: file.file_name().to_string_lossy().to_string(),
+                });
+            }
+        }
+
+        Ok(out)
+    }
 }
 
 #[cfg(feature = "s3")]
@@ -168,6 +244,9 @@ pub struct S3TarballBackend {
 
 #[cfg(feature = "s3")]
 impl S3TarballBackend {
+    const SHARED_STATE_PACKAGE: &'static str = "__rustaccio_meta";
+    const SHARED_STATE_FILENAME: &'static str = "state.json";
+
     #[instrument(skip(cfg), fields(bucket = cfg.bucket, region = cfg.region, endpoint = cfg.endpoint.as_deref().unwrap_or("<aws-default>")))]
     pub async fn new(cfg: &S3TarballStorageConfig) -> Result<Self, RegistryError> {
         if cfg.bucket.trim().is_empty() {
@@ -179,6 +258,25 @@ impl S3TarballBackend {
 
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .region(aws_sdk_s3::config::Region::new(cfg.region.clone()));
+
+        if let Some(ca_bundle) = load_s3_ca_bundle_pem()? {
+            let tls_context = aws_smithy_http_client::tls::TlsContext::builder()
+                .with_trust_store(
+                    aws_smithy_http_client::tls::TrustStore::empty()
+                        .with_native_roots(false)
+                        .with_pem_certificate(ca_bundle),
+                )
+                .build()
+                .map_err(|_| RegistryError::Internal)?;
+            let http_client = aws_smithy_http_client::Builder::new()
+                .tls_provider(aws_smithy_http_client::tls::Provider::rustls(
+                    aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
+                ))
+                .tls_context(tls_context)
+                .build_https();
+            loader = loader.http_client(http_client);
+            debug!("configured s3 http client with PEM CA bundle");
+        }
 
         if let (Some(access_key), Some(secret_key)) =
             (cfg.access_key_id.clone(), cfg.secret_access_key.clone())
@@ -216,6 +314,79 @@ impl S3TarballBackend {
         format!("{}{}/", self.prefix, package.replace('/', "__"))
     }
 
+    fn parse_ref_from_key(&self, key: &str) -> Option<TarballRef> {
+        parse_tarball_ref_from_object_key(&self.prefix, key)
+    }
+
+    fn verdaccio_dash_key(&self, package: &str, filename: &str) -> String {
+        format!("{}{package}/-/{filename}", self.prefix)
+    }
+
+    fn verdaccio_plain_key(&self, package: &str, filename: &str) -> String {
+        format!("{}{package}/{filename}", self.prefix)
+    }
+
+    fn encoded_verdaccio_dash_key(&self, package: &str, filename: &str) -> String {
+        format!("{}{}/-/{}", self.prefix, urlencoding::encode(package), filename)
+    }
+
+    fn encoded_verdaccio_plain_key(&self, package: &str, filename: &str) -> String {
+        format!("{}{}/{}", self.prefix, urlencoding::encode(package), filename)
+    }
+
+    fn candidate_keys_for_tarball(&self, package: &str, filename: &str) -> Vec<String> {
+        let mut keys = Vec::new();
+        for key in [
+            self.key(package, filename),
+            self.verdaccio_dash_key(package, filename),
+            self.verdaccio_plain_key(package, filename),
+            self.encoded_verdaccio_dash_key(package, filename),
+            self.encoded_verdaccio_plain_key(package, filename),
+        ] {
+            if !keys.iter().any(|existing| existing == &key) {
+                keys.push(key);
+            }
+        }
+        keys
+    }
+
+    fn candidate_prefixes_for_package(&self, package: &str) -> Vec<String> {
+        let mut prefixes = Vec::new();
+        for prefix in [
+            self.package_prefix(package),
+            format!("{}{package}/", self.prefix),
+            format!("{}{}/", self.prefix, urlencoding::encode(package)),
+        ] {
+            if !prefixes.iter().any(|existing| existing == &prefix) {
+                prefixes.push(prefix);
+            }
+        }
+        prefixes
+    }
+
+    async fn get_by_key(&self, key: &str) -> Result<Option<Vec<u8>>, RegistryError> {
+        let response = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) if is_not_found(&err) => return Ok(None),
+            Err(err) => return Err(map_s3_sdk_error("get_object", &err)),
+        };
+
+        let bytes = response.body.collect().await.map_err(|err| {
+            RegistryError::http(
+                StatusCode::BAD_GATEWAY,
+                format!("s3 get_object stream failed: {err}"),
+            )
+        })?;
+        Ok(Some(bytes.into_bytes().to_vec()))
+    }
+
     #[instrument(skip(self), fields(key))]
     async fn exists(&self, key: &str) -> Result<bool, RegistryError> {
         match self
@@ -228,10 +399,7 @@ impl S3TarballBackend {
         {
             Ok(_) => Ok(true),
             Err(err) if is_not_found(&err) => Ok(false),
-            Err(_) => {
-                warn!("s3 head_object failed");
-                Err(RegistryError::Internal)
-            }
+            Err(err) => Err(map_s3_sdk_error("head_object", &err)),
         }
     }
 
@@ -249,7 +417,7 @@ impl S3TarballBackend {
             .body(aws_sdk_s3::primitives::ByteStream::from(content.to_vec()))
             .send()
             .await
-            .map_err(|_| RegistryError::Internal)?;
+            .map_err(|err| map_s3_sdk_error("put_object", &err))?;
         debug!("uploaded tarball to s3");
         Ok(())
     }
@@ -260,77 +428,99 @@ impl S3TarballBackend {
         package: &str,
         filename: &str,
     ) -> Result<Option<Vec<u8>>, RegistryError> {
-        let key = self.key(package, filename);
-        let response = match self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(err) if is_not_found(&err) => return Ok(None),
-            Err(_) => {
-                warn!("s3 get_object failed");
-                return Err(RegistryError::Internal);
+        for key in self.candidate_keys_for_tarball(package, filename) {
+            if let Some(bytes) = self.get_by_key(&key).await? {
+                debug!(bytes = bytes.len(), key, "downloaded tarball from s3");
+                return Ok(Some(bytes));
             }
-        };
-
-        let bytes = response
-            .body
-            .collect()
-            .await
-            .map_err(|_| RegistryError::Internal)?;
-        let bytes = bytes.into_bytes();
-        debug!(bytes = bytes.len(), "downloaded tarball from s3");
-        Ok(Some(bytes.to_vec()))
+        }
+        Ok(None)
     }
 
     #[instrument(skip(self), fields(package, filename))]
     pub async fn delete(&self, package: &str, filename: &str) -> Result<bool, RegistryError> {
-        let key = self.key(package, filename);
-        if !self.exists(&key).await? {
-            return Ok(false);
+        for key in self.candidate_keys_for_tarball(package, filename) {
+            if !self.exists(&key).await? {
+                continue;
+            }
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+                .await
+                .map_err(|err| map_s3_sdk_error("delete_object", &err))?;
+            debug!("deleted tarball from s3");
+            return Ok(true);
         }
-
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|_| RegistryError::Internal)?;
-        debug!("deleted tarball from s3");
-        Ok(true)
+        Ok(false)
     }
 
     #[instrument(skip(self), fields(package))]
     pub async fn delete_package(&self, package: &str) -> Result<(), RegistryError> {
+        for prefix in self.candidate_prefixes_for_package(package) {
+            let mut continuation: Option<String> = None;
+            loop {
+                let mut request = self
+                    .client
+                    .list_objects_v2()
+                    .bucket(&self.bucket)
+                    .prefix(prefix.clone());
+                if let Some(token) = continuation.clone() {
+                    request = request.continuation_token(token);
+                }
+
+                let response = request
+                    .send()
+                    .await
+                    .map_err(|err| map_s3_sdk_error("list_objects_v2", &err))?;
+                let objects = response.contents();
+                for object in objects {
+                    if let Some(key) = object.key() {
+                        self.client
+                            .delete_object()
+                            .bucket(&self.bucket)
+                            .key(key)
+                            .send()
+                            .await
+                            .map_err(|err| map_s3_sdk_error("delete_object", &err))?;
+                    }
+                }
+
+                if response.is_truncated.unwrap_or(false) {
+                    continuation = response.next_continuation_token;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn list(&self) -> Result<Vec<TarballRef>, RegistryError> {
         let mut continuation: Option<String> = None;
-        let prefix = self.package_prefix(package);
+        let mut out = Vec::new();
 
         loop {
             let mut request = self
                 .client
                 .list_objects_v2()
                 .bucket(&self.bucket)
-                .prefix(prefix.clone());
+                .prefix(self.prefix.clone());
             if let Some(token) = continuation.clone() {
                 request = request.continuation_token(token);
             }
 
-            let response = request.send().await.map_err(|_| RegistryError::Internal)?;
-            let objects = response.contents();
-            for object in objects {
-                if let Some(key) = object.key() {
-                    self.client
-                        .delete_object()
-                        .bucket(&self.bucket)
-                        .key(key)
-                        .send()
-                        .await
-                        .map_err(|_| RegistryError::Internal)?;
+            let response = request
+                .send()
+                .await
+                .map_err(|err| map_s3_sdk_error("list_objects_v2", &err))?;
+            for object in response.contents() {
+                if let Some(key) = object.key()
+                    && let Some(reference) = self.parse_ref_from_key(key)
+                {
+                    out.push(reference);
                 }
             }
 
@@ -341,7 +531,21 @@ impl S3TarballBackend {
             }
         }
 
-        Ok(())
+        Ok(out)
+    }
+
+    pub async fn get_state_snapshot(&self) -> Result<Option<Vec<u8>>, RegistryError> {
+        self.get(Self::SHARED_STATE_PACKAGE, Self::SHARED_STATE_FILENAME)
+            .await
+    }
+
+    pub async fn put_state_snapshot(&self, content: &[u8]) -> Result<(), RegistryError> {
+        self.put(
+            Self::SHARED_STATE_PACKAGE,
+            Self::SHARED_STATE_FILENAME,
+            content,
+        )
+        .await
     }
 }
 
@@ -356,8 +560,179 @@ fn normalize_prefix(prefix: &str) -> String {
 }
 
 #[cfg(feature = "s3")]
+fn parse_tarball_ref_from_object_key(prefix: &str, key: &str) -> Option<TarballRef> {
+    let rest = key.strip_prefix(prefix)?.trim_matches('/');
+    if rest.is_empty() || !(rest.ends_with(".tgz") || rest.ends_with(".tar.gz")) {
+        return None;
+    }
+
+    let (package_raw, filename, from_dash_layout) = if let Some((package, filename)) =
+        rest.split_once("/-/")
+    {
+        if filename.is_empty() || filename.contains('/') {
+            return None;
+        }
+        (package, filename, true)
+    } else {
+        let (package, filename) = rest.rsplit_once('/')?;
+        if package.is_empty() || filename.is_empty() || filename.contains('/') {
+            return None;
+        }
+        (package, filename, false)
+    };
+
+    let decoded = urlencoding::decode(package_raw)
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|_| package_raw.to_string());
+    let package = if from_dash_layout || decoded.contains('/') {
+        decoded
+    } else {
+        decoded.replace("__", "/")
+    };
+    if package.is_empty() {
+        return None;
+    }
+
+    Some(TarballRef {
+        package,
+        filename: filename.to_string(),
+    })
+}
+
+#[cfg(feature = "s3")]
+fn load_s3_ca_bundle_pem() -> Result<Option<Vec<u8>>, RegistryError> {
+    if let Ok(path) = std::env::var("RUSTACCIO_S3_CA_BUNDLE")
+        && !path.trim().is_empty()
+    {
+        let bytes = std::fs::read(&path).map_err(|err| {
+            RegistryError::http(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to read RUSTACCIO_S3_CA_BUNDLE at {path}: {err}"),
+            )
+        })?;
+        return Ok(Some(strip_non_certificate_lines(bytes)));
+    }
+
+    for path in DEFAULT_CA_BUNDLE_PATHS {
+        if let Ok(bytes) = std::fs::read(path) {
+            debug!(path, "loaded system CA bundle for s3 tls");
+            return Ok(Some(strip_non_certificate_lines(bytes)));
+        }
+    }
+
+    Ok(None)
+}
+
+#[cfg(feature = "s3")]
+fn strip_non_certificate_lines(input: Vec<u8>) -> Vec<u8> {
+    let text = String::from_utf8_lossy(&input);
+    let mut out = String::new();
+    let mut in_cert = false;
+    for line in text.lines() {
+        if line.starts_with("-----BEGIN CERTIFICATE-----") {
+            in_cert = true;
+        }
+        if in_cert {
+            out.push_str(line);
+            out.push('\n');
+        }
+        if line.starts_with("-----END CERTIFICATE-----") {
+            in_cert = false;
+        }
+    }
+    if out.is_empty() {
+        input
+    } else {
+        out.into_bytes()
+    }
+}
+
+#[cfg(feature = "s3")]
+fn map_s3_sdk_error<E>(operation: &str, err: &aws_sdk_s3::error::SdkError<E>) -> RegistryError
+where
+    E: ProvideErrorMetadata + std::fmt::Debug,
+{
+    let http_status = err
+        .raw_response()
+        .and_then(|response| StatusCode::from_u16(response.status().as_u16()).ok())
+        .unwrap_or(StatusCode::BAD_GATEWAY);
+    let aws_code = err.code().unwrap_or("unknown");
+    let aws_message = err.message().unwrap_or("");
+
+    warn!(
+        operation,
+        http_status = http_status.as_u16(),
+        aws_code = ?err.code(),
+        aws_message = ?err.message(),
+        error = ?err,
+        "s3 operation failed"
+    );
+
+    let detail = if aws_message.is_empty() {
+        if aws_code == "unknown" {
+            format!("{err:?}")
+        } else {
+            aws_code.to_string()
+        }
+    } else {
+        format!("{aws_code} - {aws_message}")
+    };
+    RegistryError::http(
+        http_status,
+        format!(
+            "s3 {operation} failed (status {}): {detail}",
+            http_status.as_u16()
+        ),
+    )
+}
+
+#[cfg(feature = "s3")]
 fn is_not_found<E>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
     err.raw_response()
         .map(|response| response.status().as_u16() == 404)
         .unwrap_or(false)
+}
+
+#[cfg(all(test, feature = "s3"))]
+mod tests {
+    use super::{TarballRef, parse_tarball_ref_from_object_key};
+
+    #[test]
+    fn parses_rustaccio_legacy_key_layout() {
+        let key = "registry/@scope__pkg/pkg-1.2.3.tgz";
+        let parsed = parse_tarball_ref_from_object_key("registry/", key);
+        assert_eq!(
+            parsed,
+            Some(TarballRef {
+                package: "@scope/pkg".to_string(),
+                filename: "pkg-1.2.3.tgz".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_verdaccio_dash_key_layout() {
+        let key = "registry/@scope/pkg/-/pkg-1.2.3.tgz";
+        let parsed = parse_tarball_ref_from_object_key("registry/", key);
+        assert_eq!(
+            parsed,
+            Some(TarballRef {
+                package: "@scope/pkg".to_string(),
+                filename: "pkg-1.2.3.tgz".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_verdaccio_encoded_dash_key_layout() {
+        let key = "registry/%40scope%2fpkg/-/pkg-1.2.3.tgz";
+        let parsed = parse_tarball_ref_from_object_key("registry/", key);
+        assert_eq!(
+            parsed,
+            Some(TarballRef {
+                package: "@scope/pkg".to_string(),
+                filename: "pkg-1.2.3.tgz".to_string(),
+            })
+        );
+    }
 }

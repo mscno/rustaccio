@@ -42,6 +42,8 @@ pub struct PackageRecord {
     pub manifest: Value,
     pub upstream_tarballs: HashMap<String, String>,
     pub updated_at: i64,
+    #[serde(default)]
+    pub cached_from_uplink: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

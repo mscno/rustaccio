@@ -86,6 +86,7 @@ Environment variables:
 - `RUSTACCIO_S3_ACCESS_KEY_ID` / `RUSTACCIO_S3_SECRET_ACCESS_KEY` (optional static credentials)
 - `RUSTACCIO_S3_PREFIX` (optional key prefix)
 - `RUSTACCIO_S3_FORCE_PATH_STYLE` (default `true`)
+- `RUSTACCIO_S3_CA_BUNDLE` (optional PEM bundle path for S3 TLS trust; falls back to common system bundle paths when present)
 
 Build features:
 
@@ -166,6 +167,7 @@ The integration suite in `tests/parity.rs` currently validates:
 - external HTTP auth plugin backend (`add user`, `authenticate`, `change password`)
 - HTTP request-auth hook contract (`token + method + path -> identity/groups`)
 - pluggable tarball backend (`local` filesystem or `s3`)
+- `tarball backend startup reindexing` to discover versions from existing backend tarballs before serving requests
 - npm token APIs (list/create/delete + validation errors)
 - profile APIs (get + password change validation)
 - security audit endpoints (uplink proxy + local fallback response shape)

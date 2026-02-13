@@ -28,19 +28,28 @@ pub async fn dispatch(
 ) -> Result<Response<Body>, RegistryError> {
     let method = req.method().clone();
     let uri = req.uri().clone();
-    let path = uri.path().to_string();
+    let raw_path = uri.path().to_string();
+    let Some(path) = normalize_incoming_path(&raw_path, &state.url_prefix) else {
+        warn!(
+            raw_path,
+            url_prefix = state.url_prefix.as_str(),
+            "request path did not match configured url_prefix"
+        );
+        return Err(RegistryError::http(StatusCode::NOT_FOUND, "not found"));
+    };
     let query = uri.query().map(ToOwned::to_owned);
     let headers = req.headers().clone();
     let span = tracing::Span::current();
     span.record("method", tracing::field::display(&method));
-    span.record("path", tracing::field::display(&path));
+    span.record("path", tracing::field::display(&raw_path));
     debug!(has_query = query.is_some(), "dispatching request");
 
     if let Some(response) = crate::web_ui::maybe_handle_request(&state, &method, &path) {
         return Ok(response);
     }
 
-    let auth_user = resolve_auth_user(&state.store, &headers, &method, &path).await?;
+    let auth_identity = resolve_auth_identity(&state.store, &headers, &method, &path).await?;
+    let auth_user = auth_identity_primary_name(auth_identity.as_ref()).map(ToOwned::to_owned);
 
     if method == Method::GET && path == "/-/ping" {
         return Ok(json_response(StatusCode::OK, json!({}), HEADER_JSON));
@@ -69,11 +78,11 @@ pub async fn dispatch(
     }
 
     if path == "/-/v1/search" && method == Method::GET {
-        return handle_search(&state, query.as_deref(), auth_user.as_deref()).await;
+        return handle_search(&state, query.as_deref(), auth_identity.as_ref()).await;
     }
 
     if path == "/-/npm/v1/security/advisories/bulk" && method == Method::POST {
-        let payload = parse_json_body(&read_body(req).await?)?;
+        let payload = parse_json_body(&read_body(req, state.max_body_size).await?)?;
         if let Some(upstream) = select_default_uplink(&state)
             && let Some(body) = upstream.post_security_advisories_bulk(&payload).await?
         {
@@ -83,7 +92,7 @@ pub async fn dispatch(
     }
 
     if path == "/-/npm/v1/security/audits/quick" && method == Method::POST {
-        let payload = parse_json_body(&read_body(req).await?)?;
+        let payload = parse_json_body(&read_body(req, state.max_body_size).await?)?;
         if let Some(upstream) = select_default_uplink(&state)
             && let Some(body) = upstream.post_security_audits_quick(&payload).await?
         {
@@ -97,7 +106,7 @@ pub async fn dispatch(
     }
 
     if path == "/-/npm/v1/security/audits" && method == Method::POST {
-        let payload = parse_json_body(&read_body(req).await?)?;
+        let payload = parse_json_body(&read_body(req, state.max_body_size).await?)?;
         if let Some(upstream) = select_default_uplink(&state)
             && let Some(body) = upstream.post_security_audits(&payload).await?
         {
@@ -128,16 +137,16 @@ pub async fn dispatch(
 
     if let Some((package_name, tag)) = parse_canonical_dist_tags_path(&path) {
         if method == Method::GET && tag.is_none() {
-            ensure_access_permission(&state, &package_name, auth_user.as_deref()).await?;
+            ensure_access_permission(&state, &package_name, auth_identity.as_ref()).await?;
             ensure_package_cached(&state, &headers, &package_name).await?;
             let tags = state.store.dist_tags(&package_name).await?;
             return Ok(json_response(StatusCode::OK, tags, HEADER_JSON));
         }
 
         if method == Method::PUT {
-            ensure_publish_permission(&state, &package_name, auth_user.as_deref()).await?;
+            ensure_publish_permission(&state, &package_name, auth_identity.as_ref()).await?;
             ensure_package_owner_permission(&state, &package_name, auth_user.as_deref()).await?;
-            let bytes = read_body(req).await?;
+            let bytes = read_body(req, state.max_body_size).await?;
             let version = parse_json_string_body(&bytes)?;
             let message = state
                 .store
@@ -155,7 +164,7 @@ pub async fn dispatch(
         }
 
         if method == Method::DELETE {
-            ensure_publish_permission(&state, &package_name, auth_user.as_deref()).await?;
+            ensure_publish_permission(&state, &package_name, auth_identity.as_ref()).await?;
             ensure_package_owner_permission(&state, &package_name, auth_user.as_deref()).await?;
             let message = state
                 .store
@@ -170,6 +179,7 @@ pub async fn dispatch(
     }
 
     if path == "/-/npm/v1/user" {
+        ensure_local_auth_routes_enabled(&state)?;
         if method == Method::GET {
             let Some(name) = auth_user else {
                 return Ok(json_response(
@@ -194,7 +204,7 @@ pub async fn dispatch(
                 ));
             };
 
-            let body = parse_json_body(&read_body(req).await?)?;
+            let body = parse_json_body(&read_body(req, state.max_body_size).await?)?;
             let password_obj = body.get("password").and_then(Value::as_object);
             let old = password_obj
                 .and_then(|obj| obj.get("old"))
@@ -218,6 +228,7 @@ pub async fn dispatch(
     }
 
     if path == "/-/npm/v1/tokens" {
+        ensure_local_auth_routes_enabled(&state)?;
         let user = auth_user
             .clone()
             .ok_or_else(crate::storage::no_credentials)?;
@@ -228,7 +239,7 @@ pub async fn dispatch(
         }
 
         if method == Method::POST {
-            let body = parse_json_body(&read_body(req).await?)?;
+            let body = parse_json_body(&read_body(req, state.max_body_size).await?)?;
             let password = body
                 .get("password")
                 .and_then(Value::as_str)
@@ -266,6 +277,7 @@ pub async fn dispatch(
     if let Some(token_key) = path.strip_prefix("/-/npm/v1/tokens/token/")
         && method == Method::DELETE
     {
+        ensure_local_auth_routes_enabled(&state)?;
         let user = auth_user
             .clone()
             .ok_or_else(crate::storage::no_credentials)?;
@@ -274,13 +286,15 @@ pub async fn dispatch(
     }
 
     if path == "/-/v1/login" && method == Method::POST {
+        ensure_local_auth_routes_enabled(&state)?;
         if !state.web_login_enabled {
             return Err(RegistryError::http(StatusCode::NOT_FOUND, "not found"));
         }
         let session_id = state.store.create_login_session().await?;
-        let base = request_base_url(&headers);
+        let base = request_registry_base_url(&headers, state.trust_proxy, &state.url_prefix);
+        let next = prefixed_route_path(&state.url_prefix, &format!("/-/v1/login_cli/{session_id}"));
         let response = json!({
-            "loginUrl": format!("{base}/-/web/login?next=/-/v1/login_cli/{session_id}"),
+            "loginUrl": format!("{base}/-/web/login?next={next}"),
             "doneUrl": format!("{base}/-/v1/done/{session_id}"),
         });
         return Ok(json_response(StatusCode::OK, response, HEADER_JSON));
@@ -289,6 +303,7 @@ pub async fn dispatch(
     if let Some(session_id) = path.strip_prefix("/-/v1/done/")
         && method == Method::GET
     {
+        ensure_local_auth_routes_enabled(&state)?;
         if !state.web_login_enabled {
             return Err(RegistryError::http(StatusCode::NOT_FOUND, "not found"));
         }
@@ -316,11 +331,12 @@ pub async fn dispatch(
     if let Some(session_id) = path.strip_prefix("/-/v1/login_cli/")
         && method == Method::POST
     {
+        ensure_local_auth_routes_enabled(&state)?;
         if !state.web_login_enabled {
             return Err(RegistryError::http(StatusCode::NOT_FOUND, "not found"));
         }
         Store::ensure_session_id(Some(session_id))?;
-        let body = parse_json_body(&read_body(req).await?)?;
+        let body = parse_json_body(&read_body(req, state.max_body_size).await?)?;
         let username = body
             .get("username")
             .and_then(Value::as_str)
@@ -349,6 +365,7 @@ pub async fn dispatch(
     }
 
     if let Some(rest) = path.strip_prefix("/-/user/") {
+        ensure_local_auth_routes_enabled(&state)?;
         if method == Method::DELETE && rest.starts_with("token/") {
             return Ok(json_response(
                 StatusCode::OK,
@@ -382,7 +399,7 @@ pub async fn dispatch(
         }
 
         if method == Method::PUT {
-            let body = parse_json_body(&read_body(req).await?)?;
+            let body = parse_json_body(&read_body(req, state.max_body_size).await?)?;
             let name = body.get("name").and_then(Value::as_str).unwrap_or_default();
             let password = body.get("password").and_then(Value::as_str);
 
@@ -432,11 +449,20 @@ pub async fn dispatch(
             headers,
             query,
             auth_user,
+            auth_identity,
             package_name,
             tail,
             req,
         })
         .await;
+    }
+
+    if let Some(upstream) = select_default_uplink(&state)
+        && let Some(proxy) = upstream
+            .passthrough_request(&method, &path, query.as_deref())
+            .await?
+    {
+        return Ok(proxy_response(proxy));
     }
 
     warn!("route not found");
@@ -449,6 +475,7 @@ struct PackageRouteContext {
     headers: HeaderMap,
     query: Option<String>,
     auth_user: Option<String>,
+    auth_identity: Option<AuthIdentity>,
     package_name: String,
     tail: Vec<String>,
     req: Request<Body>,
@@ -462,6 +489,7 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
         headers,
         query,
         auth_user,
+        auth_identity,
         package_name,
         tail,
         req,
@@ -470,13 +498,13 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
         package = package_name,
         method = %method,
         tail_len = tail.len(),
-        authenticated = auth_user.is_some(),
+        authenticated = auth_identity.is_some(),
         "handling package route"
     );
 
     if method == Method::GET {
         if tail.is_empty() {
-            ensure_access_permission(&state, &package_name, auth_user.as_deref()).await?;
+            ensure_access_permission(&state, &package_name, auth_identity.as_ref()).await?;
             return handle_get_package(
                 &state,
                 &headers,
@@ -488,19 +516,19 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
         }
 
         if tail.len() == 1 {
-            ensure_access_permission(&state, &package_name, auth_user.as_deref()).await?;
+            ensure_access_permission(&state, &package_name, auth_identity.as_ref()).await?;
             return handle_get_package_version(&state, &headers, &package_name, &tail[0]).await;
         }
 
         if tail.len() == 2 && tail[0] == "-" {
-            ensure_access_permission(&state, &package_name, auth_user.as_deref()).await?;
+            ensure_access_permission(&state, &package_name, auth_identity.as_ref()).await?;
             return handle_get_tarball(&state, &package_name, &tail[1]).await;
         }
     }
 
     if method == Method::HEAD {
         if tail.is_empty() {
-            ensure_access_permission(&state, &package_name, auth_user.as_deref()).await?;
+            ensure_access_permission(&state, &package_name, auth_identity.as_ref()).await?;
             let resp = handle_get_package(
                 &state,
                 &headers,
@@ -513,14 +541,14 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
         }
 
         if tail.len() == 1 {
-            ensure_access_permission(&state, &package_name, auth_user.as_deref()).await?;
+            ensure_access_permission(&state, &package_name, auth_identity.as_ref()).await?;
             let resp =
                 handle_get_package_version(&state, &headers, &package_name, &tail[0]).await?;
             return Ok(head_response(resp));
         }
 
         if tail.len() == 2 && tail[0] == "-" {
-            ensure_access_permission(&state, &package_name, auth_user.as_deref()).await?;
+            ensure_access_permission(&state, &package_name, auth_identity.as_ref()).await?;
             let resp = handle_get_tarball(&state, &package_name, &tail[1]).await?;
             return Ok(head_response(resp));
         }
@@ -528,11 +556,11 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
 
     if method == Method::PUT {
         if tail.is_empty() {
-            ensure_publish_permission(&state, &package_name, auth_user.as_deref()).await?;
+            ensure_publish_permission(&state, &package_name, auth_identity.as_ref()).await?;
             ensure_package_cached(&state, &headers, &package_name).await?;
             ensure_package_owner_permission(&state, &package_name, auth_user.as_deref()).await?;
             let user = auth_user.as_deref().unwrap_or(ANONYMOUS_USER);
-            let body = parse_json_body(&read_body(req).await?)?;
+            let body = parse_json_body(&read_body(req, state.max_body_size).await?)?;
             let message = state
                 .store
                 .publish_manifest(&package_name, body, user)
@@ -545,11 +573,11 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
         }
 
         if tail.len() == 2 && tail[0] == "-rev" {
-            ensure_unpublish_permission(&state, &package_name, auth_user.as_deref()).await?;
+            ensure_unpublish_permission(&state, &package_name, auth_identity.as_ref()).await?;
             ensure_package_cached(&state, &headers, &package_name).await?;
             ensure_package_owner_permission(&state, &package_name, auth_user.as_deref()).await?;
             let user = auth_user.as_deref().unwrap_or(ANONYMOUS_USER);
-            let body = parse_json_body(&read_body(req).await?)?;
+            let body = parse_json_body(&read_body(req, state.max_body_size).await?)?;
             let message = state
                 .store
                 .publish_manifest(&package_name, body, user)
@@ -562,9 +590,9 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
         }
 
         if tail.len() == 1 {
-            ensure_publish_permission(&state, &package_name, auth_user.as_deref()).await?;
+            ensure_publish_permission(&state, &package_name, auth_identity.as_ref()).await?;
             ensure_package_owner_permission(&state, &package_name, auth_user.as_deref()).await?;
-            let version = parse_json_string_body(&read_body(req).await?)?;
+            let version = parse_json_string_body(&read_body(req, state.max_body_size).await?)?;
             let message = state
                 .store
                 .merge_dist_tag(&package_name, &tail[0], Some(&version))
@@ -579,7 +607,7 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
 
     if method == Method::DELETE {
         if tail.len() == 2 && tail[0] == "-rev" {
-            ensure_unpublish_permission(&state, &package_name, auth_user.as_deref()).await?;
+            ensure_unpublish_permission(&state, &package_name, auth_identity.as_ref()).await?;
             ensure_package_owner_permission(&state, &package_name, auth_user.as_deref()).await?;
             let message = state.store.remove_package(&package_name).await?;
             return Ok(json_response(
@@ -590,8 +618,8 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
         }
 
         if tail.len() == 4 && tail[0] == "-" && tail[2] == "-rev" {
-            ensure_unpublish_permission(&state, &package_name, auth_user.as_deref()).await?;
-            ensure_publish_permission(&state, &package_name, auth_user.as_deref()).await?;
+            ensure_unpublish_permission(&state, &package_name, auth_identity.as_ref()).await?;
+            ensure_publish_permission(&state, &package_name, auth_identity.as_ref()).await?;
             ensure_package_owner_permission(&state, &package_name, auth_user.as_deref()).await?;
             let message = state.store.remove_tarball(&package_name, &tail[1]).await?;
             return Ok(json_response(
@@ -618,7 +646,7 @@ async fn handle_get_package(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
     let abbreviated = accept.contains("application/vnd.npm.install-v1+json");
-    let base = request_base_url(headers);
+    let base = request_registry_base_url(headers, state.trust_proxy, &state.url_prefix);
 
     ensure_package_cached(state, headers, package_name).await?;
     let local = state.store.get_package_record(package_name).await;
@@ -657,7 +685,7 @@ async fn handle_get_package_version(
     query_version: &str,
 ) -> Result<Response<Body>, RegistryError> {
     ensure_package_cached(state, headers, package_name).await?;
-    let base = request_base_url(headers);
+    let base = request_registry_base_url(headers, state.trust_proxy, &state.url_prefix);
     let Some(record) = state.store.get_package_record(package_name).await else {
         return Err(RegistryError::http(
             StatusCode::NOT_FOUND,
@@ -747,7 +775,7 @@ async fn ensure_package_cached(
         return Ok(());
     };
 
-    let base = request_base_url(headers);
+    let base = request_registry_base_url(headers, state.trust_proxy, &state.url_prefix);
     let (normalized, upstream_map) =
         state
             .store
@@ -760,13 +788,12 @@ async fn ensure_package_cached(
     Ok(())
 }
 
-#[instrument(skip(state), fields(has_query = query.is_some(), authenticated = auth_user.is_some()))]
+#[instrument(skip(state), fields(has_query = query.is_some(), authenticated = auth_identity.is_some()))]
 async fn handle_search(
     state: &AppState,
     query: Option<&str>,
-    auth_user: Option<&str>,
+    auth_identity: Option<&AuthIdentity>,
 ) -> Result<Response<Body>, RegistryError> {
-    let auth_identity = username_identity(auth_user);
     let params = query_params(query);
     let text = params
         .get("text")
@@ -794,7 +821,7 @@ async fn handle_search(
                 .to_string();
             let name_lc = name.to_lowercase();
 
-            if state.acl.can_access(&name, auth_identity.as_ref())
+            if state.acl.can_access(&name, auth_identity)
                 && (text.is_empty() || name_lc.contains(&text))
             {
                 objects.push(item);
@@ -811,9 +838,7 @@ async fn handle_search(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            if !package_name.is_empty()
-                && state.acl.can_access(&package_name, auth_identity.as_ref())
-            {
+            if !package_name.is_empty() && state.acl.can_access(&package_name, auth_identity) {
                 objects.push(item);
             }
         }
@@ -857,12 +882,12 @@ async fn handle_search(
 }
 
 #[instrument(skip(store, headers), fields(method = %method, path))]
-async fn resolve_auth_user(
+async fn resolve_auth_identity(
     store: &Store,
     headers: &HeaderMap,
     method: &Method,
     path: &str,
-) -> Result<Option<String>, RegistryError> {
+) -> Result<Option<AuthIdentity>, RegistryError> {
     let raw = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
@@ -882,16 +907,12 @@ async fn resolve_auth_user(
                 warn!("token rejected");
                 return Err(unauthorized_message_for_path(path));
             };
-            let user = identity
-                .username
-                .or_else(|| identity.groups.first().cloned())
-                .unwrap_or_default();
-            if user.is_empty() {
+            if identity.username.is_none() && identity.groups.is_empty() {
                 warn!("auth identity did not contain a user");
                 return Err(unauthorized_message_for_path(path));
             }
             debug!("token accepted");
-            Ok(Some(user))
+            Ok(Some(identity))
         }
         None if header_present => {
             warn!("malformed authorization header");
@@ -913,20 +934,15 @@ fn unauthorized_message_for_path(path: &str) -> RegistryError {
 async fn ensure_access_permission(
     state: &AppState,
     package_name: &str,
-    user: Option<&str>,
+    identity: Option<&AuthIdentity>,
 ) -> Result<(), RegistryError> {
-    let identity = username_identity(user);
-    if let Some(allowed) = state
-        .store
-        .allow_access(identity.as_ref(), package_name)
-        .await?
-    {
+    if let Some(allowed) = state.store.allow_access(identity, package_name).await? {
         if allowed {
             return Ok(());
         }
         warn!(
             package = package_name,
-            user = user.unwrap_or(ANONYMOUS_USER),
+            user = auth_identity_primary_name(identity).unwrap_or(ANONYMOUS_USER),
             "access denied by auth hook"
         );
         return Err(unauthorized(&format!(
@@ -934,12 +950,12 @@ async fn ensure_access_permission(
         )));
     }
 
-    if state.acl.can_access(package_name, identity.as_ref()) {
+    if state.acl.can_access(package_name, identity) {
         return Ok(());
     }
     warn!(
         package = package_name,
-        user = user.unwrap_or(ANONYMOUS_USER),
+        user = auth_identity_primary_name(identity).unwrap_or(ANONYMOUS_USER),
         "access denied by ACL"
     );
     Err(unauthorized(&format!(
@@ -950,20 +966,15 @@ async fn ensure_access_permission(
 async fn ensure_publish_permission(
     state: &AppState,
     package_name: &str,
-    user: Option<&str>,
+    identity: Option<&AuthIdentity>,
 ) -> Result<(), RegistryError> {
-    let identity = username_identity(user);
-    if let Some(allowed) = state
-        .store
-        .allow_publish(identity.as_ref(), package_name)
-        .await?
-    {
+    if let Some(allowed) = state.store.allow_publish(identity, package_name).await? {
         if allowed {
             return Ok(());
         }
         warn!(
             package = package_name,
-            user = user.unwrap_or(ANONYMOUS_USER),
+            user = auth_identity_primary_name(identity).unwrap_or(ANONYMOUS_USER),
             "publish denied by auth hook"
         );
         return Err(unauthorized(&format!(
@@ -971,12 +982,12 @@ async fn ensure_publish_permission(
         )));
     }
 
-    if state.acl.can_publish(package_name, identity.as_ref()) {
+    if state.acl.can_publish(package_name, identity) {
         return Ok(());
     }
     warn!(
         package = package_name,
-        user = user.unwrap_or(ANONYMOUS_USER),
+        user = auth_identity_primary_name(identity).unwrap_or(ANONYMOUS_USER),
         "publish denied by ACL"
     );
     Err(unauthorized(&format!(
@@ -987,20 +998,15 @@ async fn ensure_publish_permission(
 async fn ensure_unpublish_permission(
     state: &AppState,
     package_name: &str,
-    user: Option<&str>,
+    identity: Option<&AuthIdentity>,
 ) -> Result<(), RegistryError> {
-    let identity = username_identity(user);
-    if let Some(allowed) = state
-        .store
-        .allow_unpublish(identity.as_ref(), package_name)
-        .await?
-    {
+    if let Some(allowed) = state.store.allow_unpublish(identity, package_name).await? {
         if allowed {
             return Ok(());
         }
         warn!(
             package = package_name,
-            user = user.unwrap_or(ANONYMOUS_USER),
+            user = auth_identity_primary_name(identity).unwrap_or(ANONYMOUS_USER),
             "unpublish denied by auth hook"
         );
         return Err(unauthorized(&format!(
@@ -1008,12 +1014,12 @@ async fn ensure_unpublish_permission(
         )));
     }
 
-    if state.acl.can_unpublish(package_name, identity.as_ref()) {
+    if state.acl.can_unpublish(package_name, identity) {
         return Ok(());
     }
     warn!(
         package = package_name,
-        user = user.unwrap_or(ANONYMOUS_USER),
+        user = auth_identity_primary_name(identity).unwrap_or(ANONYMOUS_USER),
         "unpublish denied by ACL"
     );
     Err(unauthorized(&format!(
@@ -1056,11 +1062,12 @@ fn is_package_owner(manifest: &Value, username: &str) -> bool {
     })
 }
 
-fn username_identity(user: Option<&str>) -> Option<AuthIdentity> {
-    user.map(|name| AuthIdentity {
-        username: Some(name.to_string()),
-        groups: Vec::new(),
-    })
+fn auth_identity_primary_name(identity: Option<&AuthIdentity>) -> Option<&str> {
+    let identity = identity?;
+    identity
+        .username
+        .as_deref()
+        .or_else(|| identity.groups.first().map(String::as_str))
 }
 
 fn select_uplink_for_package<'a>(
@@ -1184,19 +1191,74 @@ fn decode_path_component(value: &str) -> String {
         .unwrap_or_else(|_| value.to_string())
 }
 
-fn request_base_url(headers: &HeaderMap) -> String {
-    let protocol = headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("http");
+fn request_base_url(headers: &HeaderMap, trust_proxy: bool) -> String {
+    let protocol = if trust_proxy {
+        headers
+            .get("x-forwarded-proto")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("http")
+    } else {
+        "http"
+    };
 
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get(header::HOST))
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("localhost:4873");
+    let host = if trust_proxy {
+        headers
+            .get("x-forwarded-host")
+            .or_else(|| headers.get(header::HOST))
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("localhost:4873")
+    } else {
+        headers
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("localhost:4873")
+    };
 
     format!("{protocol}://{host}")
+}
+
+fn request_registry_base_url(headers: &HeaderMap, trust_proxy: bool, url_prefix: &str) -> String {
+    let origin = request_base_url(headers, trust_proxy);
+    if url_prefix == "/" {
+        origin
+    } else {
+        format!("{origin}{url_prefix}")
+    }
+}
+
+fn normalize_incoming_path(path: &str, url_prefix: &str) -> Option<String> {
+    if url_prefix == "/" {
+        return Some(path.to_string());
+    }
+
+    if path == url_prefix {
+        return Some("/".to_string());
+    }
+
+    let prefix_with_slash = format!("{url_prefix}/");
+    if let Some(stripped) = path.strip_prefix(&prefix_with_slash) {
+        return Some(format!("/{stripped}"));
+    }
+
+    None
+}
+
+fn prefixed_route_path(url_prefix: &str, path: &str) -> String {
+    if url_prefix == "/" {
+        path.to_string()
+    } else {
+        format!("{}{}", url_prefix.trim_end_matches('/'), path)
+    }
+}
+
+fn proxy_response(proxy: crate::upstream::UpstreamPassthroughResponse) -> Response<Body> {
+    let mut builder = Response::builder().status(proxy.status);
+    if let Some(content_type) = proxy.content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    builder
+        .body(Body::from(proxy.body))
+        .unwrap_or_else(|_| Response::new(Body::from(Vec::<u8>::new())))
 }
 
 fn json_response(status: StatusCode, body: Value, content_type: &str) -> Response<Body> {
@@ -1241,9 +1303,16 @@ fn head_response(mut response: Response<Body>) -> Response<Body> {
     response
 }
 
-async fn read_body(req: Request<Body>) -> Result<Vec<u8>, RegistryError> {
-    to_bytes(req.into_body(), 50 * 1024 * 1024)
+fn ensure_local_auth_routes_enabled(state: &AppState) -> Result<(), RegistryError> {
+    if state.auth_external_mode {
+        return Err(RegistryError::http(StatusCode::NOT_FOUND, "not found"));
+    }
+    Ok(())
+}
+
+async fn read_body(req: Request<Body>, max_body_size: usize) -> Result<Vec<u8>, RegistryError> {
+    to_bytes(req.into_body(), max_body_size)
         .await
         .map(|bytes| bytes.to_vec())
-        .map_err(|_| RegistryError::Internal)
+        .map_err(|_| RegistryError::http(StatusCode::PAYLOAD_TOO_LARGE, "request entity too large"))
 }

@@ -2,19 +2,22 @@ use axum::{
     body::Body,
     http::{Method, Request, StatusCode, header},
 };
+use flate2::{Compression, write::GzEncoder};
 use http_body_util::BodyExt;
 use rustaccio::{
     acl::{Acl, PackageRule},
     app::{AppState, build_router},
     config::{
-        AuthBackend, AuthPluginConfig, Config, HttpAuthPluginConfig, TarballStorageBackend,
-        TarballStorageConfig,
+        AuthBackend, AuthPluginConfig, Config, HttpAuthPluginConfig, S3TarballStorageConfig,
+        TarballStorageBackend, TarballStorageConfig,
     },
+    runtime,
     storage::Store,
     upstream::Upstream,
 };
 use serde_json::{Value, json};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, io::Write, path::PathBuf, sync::Arc};
+use tar::Builder as TarBuilder;
 use tempfile::TempDir;
 use tower::ServiceExt;
 use wiremock::{
@@ -104,6 +107,50 @@ async fn test_app_with_rules_and_options(
         trust_proxy: cfg.trust_proxy,
         auth_external_mode: cfg.auth_plugin.external_mode,
     })
+}
+
+async fn test_app_with_runtime_settings(
+    data_dir: PathBuf,
+    upstream: Option<String>,
+    url_prefix: &str,
+    trust_proxy: bool,
+) -> axum::Router {
+    let mut uplinks = HashMap::new();
+    if let Some(url) = upstream.clone() {
+        uplinks.insert("default".to_string(), url);
+    }
+
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().expect("bind"),
+        data_dir,
+        listen: vec!["127.0.0.1:0".to_string()],
+        upstream_registry: upstream,
+        uplinks,
+        acl_rules: vec![PackageRule::open("**")],
+        web_enabled: true,
+        web_title: "Rustaccio".to_string(),
+        web_login: true,
+        publish_check_owners: false,
+        password_min_length: 3,
+        login_session_ttl_seconds: 120,
+        max_body_size: 50 * 1024 * 1024,
+        audit_enabled: true,
+        url_prefix: url_prefix.to_string(),
+        trust_proxy,
+        keep_alive_timeout_secs: None,
+        log_level: "info".to_string(),
+        auth_plugin: AuthPluginConfig {
+            backend: AuthBackend::Local,
+            external_mode: false,
+            http: None,
+        },
+        tarball_storage: TarballStorageConfig {
+            backend: TarballStorageBackend::Local,
+            s3: None,
+        },
+    };
+    let state = runtime::build_state(&cfg, None).await.expect("state");
+    build_router(state)
 }
 
 async fn test_app_with_explicit_uplinks(
@@ -877,6 +924,60 @@ async fn upstream_proxy_manifest_and_tarball_flow() {
     let resp = send(&app, req).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(bytes_body(resp).await, b"upstream tgz");
+}
+
+#[tokio::test]
+async fn upstream_cached_packages_are_not_persisted_in_snapshot() {
+    let upstream = MockServer::start().await;
+    let upstream_manifest = json!({
+        "_id": "upstream-only",
+        "name": "upstream-only",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "upstream-only",
+                "version": "1.0.0",
+                "description": "from npm uplink",
+                "dist": {
+                    "tarball": format!("{}/upstream-only/-/upstream-only-1.0.0.tgz", upstream.uri())
+                }
+            }
+        }
+    });
+    Mock::given(method("GET"))
+        .and(path("/upstream-only"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(upstream_manifest))
+        .mount(&upstream)
+        .await;
+
+    let dir = TempDir::new().expect("dir");
+    let app = test_app(dir.path().to_path_buf(), Some(upstream.uri())).await;
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/upstream-only")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let state_file = dir.path().join("state.json");
+    if tokio::fs::try_exists(&state_file)
+        .await
+        .expect("state file existence")
+    {
+        let bytes = tokio::fs::read(&state_file).await.expect("read state");
+        if !bytes.is_empty() {
+            let snapshot: Value = serde_json::from_slice(&bytes).expect("parse state");
+            let persisted = snapshot
+                .get("packages")
+                .and_then(Value::as_object)
+                .and_then(|packages| packages.get("upstream-only"));
+            assert!(
+                persisted.is_none(),
+                "upstream cache entries should stay runtime-only and never persist in snapshot"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -1785,6 +1886,98 @@ async fn deprecate_and_undeprecate_flow() {
 }
 
 #[tokio::test]
+async fn deprecate_all_existing_versions_keeps_new_publish_undeprecated() {
+    let dir = TempDir::new().expect("dir");
+    let app = test_app(dir.path().to_path_buf(), None).await;
+    let token = create_user(&app, "deprecator-all", "secret").await;
+    let package = "@verdaccio/deprecated-3";
+
+    for (version, filename, data) in [
+        ("1.0.0", "deprecated-3-1.0.0.tgz", b"v1".as_slice()),
+        ("1.1.0", "deprecated-3-1.1.0.tgz", b"v2".as_slice()),
+        ("1.2.0", "deprecated-3-1.2.0.tgz", b"v3".as_slice()),
+        ("1.3.0", "deprecated-3-1.3.0.tgz", b"v4".as_slice()),
+    ] {
+        let manifest = pkg_manifest(package, version, filename, data);
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/%40verdaccio%2Fdeprecated-3")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&manifest).expect("payload")))
+            .expect("request");
+        assert_eq!(send(&app, req).await.status(), StatusCode::CREATED);
+    }
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/%40verdaccio%2Fdeprecated-3")
+        .body(Body::empty())
+        .expect("request");
+    let body = json_body(send(&app, req).await).await;
+    let rev = body["_rev"].as_str().unwrap_or_default().to_string();
+    let dist_tags = body["dist-tags"].clone();
+    let users = body["users"].clone();
+    let maintainers = body["maintainers"].clone();
+    let time = body["time"].clone();
+
+    let message = "some message";
+    let deprecate_body = json!({
+        "_id": package,
+        "name": package,
+        "_rev": rev,
+        "dist-tags": dist_tags,
+        "users": users,
+        "maintainers": maintainers,
+        "time": time,
+        "versions": {
+            "1.0.0": { "deprecated": message },
+            "1.1.0": { "deprecated": message },
+            "1.2.0": { "deprecated": message },
+            "1.3.0": { "deprecated": message }
+        }
+    });
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri("/%40verdaccio%2Fdeprecated-3")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&deprecate_body).expect("payload"),
+        ))
+        .expect("request");
+    assert_eq!(send(&app, req).await.status(), StatusCode::CREATED);
+
+    for version in ["1.0.0", "1.1.0", "1.2.0", "1.3.0"] {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/%40verdaccio%2Fdeprecated-3/{version}"))
+            .body(Body::empty())
+            .expect("request");
+        let body = json_body(send(&app, req).await).await;
+        assert_eq!(body["deprecated"].as_str(), Some(message));
+    }
+
+    let manifest = pkg_manifest(package, "1.4.0", "deprecated-3-1.4.0.tgz", b"v5");
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri("/%40verdaccio%2Fdeprecated-3")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&manifest).expect("payload")))
+        .expect("request");
+    assert_eq!(send(&app, req).await.status(), StatusCode::CREATED);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/%40verdaccio%2Fdeprecated-3/1.4.0")
+        .body(Body::empty())
+        .expect("request");
+    let body = json_body(send(&app, req).await).await;
+    assert!(body.get("deprecated").is_none());
+}
+
+#[tokio::test]
 async fn unpublish_specific_version_via_put_rev_flow() {
     let dir = TempDir::new().expect("dir");
     let app = test_app(dir.path().to_path_buf(), None).await;
@@ -2214,4 +2407,507 @@ async fn publish_check_owners_disabled_allows_non_owner_mutations() {
         .body(Body::from(b"\"1.0.0\"".to_vec()))
         .expect("request");
     assert_eq!(send(&app, req).await.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn url_prefix_routes_api_and_web_requests() {
+    let dir = TempDir::new().expect("dir");
+    let app =
+        test_app_with_runtime_settings(dir.path().to_path_buf(), None, "/verdaccio", false).await;
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/verdaccio/")
+        .body(Body::empty())
+        .expect("request");
+    assert_eq!(send(&app, req).await.status(), StatusCode::OK);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/-/web/static/app.js")
+        .body(Body::empty())
+        .expect("request");
+    assert_eq!(send(&app, req).await.status(), StatusCode::NOT_FOUND);
+
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri("/verdaccio/-/user/org.couchdb.user:prefixed")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({"name":"prefixed","password":"secret"})).expect("payload"),
+        ))
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = json_body(resp).await;
+    let token = body
+        .get("token")
+        .and_then(Value::as_str)
+        .expect("token")
+        .to_string();
+
+    let manifest = pkg_manifest(
+        "prefixed-pkg",
+        "1.0.0",
+        "prefixed-pkg-1.0.0.tgz",
+        b"prefixed",
+    );
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri("/verdaccio/prefixed-pkg")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&manifest).expect("payload")))
+        .expect("request");
+    assert_eq!(send(&app, req).await.status(), StatusCode::CREATED);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/verdaccio/prefixed-pkg")
+        .header(header::HOST, "registry.internal:4873")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let tarball = body["versions"]["1.0.0"]["dist"]["tarball"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(tarball.starts_with("http://registry.internal:4873/verdaccio/"));
+}
+
+#[tokio::test]
+async fn trust_proxy_and_url_prefix_shape_login_links() {
+    let dir = TempDir::new().expect("dir");
+    let app_untrusted =
+        test_app_with_runtime_settings(dir.path().join("untrusted"), None, "/verdaccio", false)
+            .await;
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/verdaccio/-/v1/login")
+        .header(header::HOST, "registry.internal:4873")
+        .header("x-forwarded-proto", "https")
+        .header("x-forwarded-host", "registry.example.com")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app_untrusted, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let login = body["loginUrl"].as_str().unwrap_or_default();
+    assert!(login.starts_with("http://registry.internal:4873/verdaccio/"));
+
+    let app_trusted =
+        test_app_with_runtime_settings(dir.path().join("trusted"), None, "/verdaccio", true).await;
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/verdaccio/-/v1/login")
+        .header(header::HOST, "registry.internal:4873")
+        .header("x-forwarded-proto", "https")
+        .header("x-forwarded-host", "registry.example.com")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app_trusted, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let login = body["loginUrl"].as_str().unwrap_or_default();
+    assert!(login.starts_with("https://registry.example.com/verdaccio/"));
+}
+
+#[tokio::test]
+async fn generic_unmatched_routes_passthrough_to_default_uplink() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/-/v1/keys"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "keys": [{"id": "k1", "key": "abc"}]
+        })))
+        .mount(&upstream)
+        .await;
+
+    let dir = TempDir::new().expect("dir");
+    let app = test_app(dir.path().to_path_buf(), Some(upstream.uri())).await;
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/-/v1/keys")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["keys"][0]["id"].as_str(),
+        Some("k1"),
+        "response should come from default uplink passthrough"
+    );
+}
+
+fn s3_test_config(data_dir: PathBuf, endpoint: String) -> Config {
+    Config {
+        bind: "127.0.0.1:0".parse().expect("bind"),
+        data_dir,
+        listen: vec!["127.0.0.1:0".to_string()],
+        upstream_registry: None,
+        uplinks: HashMap::new(),
+        acl_rules: vec![PackageRule::open("**")],
+        web_enabled: true,
+        web_title: "Rustaccio".to_string(),
+        web_login: false,
+        publish_check_owners: false,
+        password_min_length: 3,
+        login_session_ttl_seconds: 120,
+        max_body_size: 50 * 1024 * 1024,
+        audit_enabled: true,
+        url_prefix: "/".to_string(),
+        trust_proxy: false,
+        keep_alive_timeout_secs: None,
+        log_level: "info".to_string(),
+        auth_plugin: AuthPluginConfig {
+            backend: AuthBackend::Local,
+            external_mode: false,
+            http: None,
+        },
+        tarball_storage: TarballStorageConfig {
+            backend: TarballStorageBackend::S3,
+            s3: Some(S3TarballStorageConfig {
+                bucket: "registry-test".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: Some(endpoint),
+                access_key_id: Some("test".to_string()),
+                secret_access_key: Some("test".to_string()),
+                prefix: "registry".to_string(),
+                force_path_style: true,
+            }),
+        },
+    }
+}
+
+fn empty_s3_list_xml() -> &'static str {
+    r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>registry-test</Name>
+  <Prefix>registry/</Prefix>
+  <KeyCount>0</KeyCount>
+  <MaxKeys>1000</MaxKeys>
+  <IsTruncated>false</IsTruncated>
+</ListBucketResult>"#
+}
+
+fn s3_list_xml(keys: &[&str]) -> String {
+    let contents = keys
+        .iter()
+        .map(|key| {
+            format!(
+                "<Contents><Key>{key}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>\"etag\"</ETag><Size>123</Size><StorageClass>STANDARD</StorageClass></Contents>"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>registry-test</Name><Prefix>registry/</Prefix><KeyCount>{}</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>{contents}</ListBucketResult>",
+        keys.len()
+    )
+}
+
+fn npm_tarball_with_package_json(package_json: &Value) -> Vec<u8> {
+    let mut tar_bytes = Vec::new();
+    {
+        let mut tar = TarBuilder::new(&mut tar_bytes);
+        let payload = serde_json::to_vec(package_json).expect("package json bytes");
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "package/package.json", payload.as_slice())
+            .expect("append package json");
+        tar.finish().expect("finish tar");
+    }
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&tar_bytes).expect("write tgz data");
+    encoder.finish().expect("finish tgz")
+}
+
+#[tokio::test]
+async fn s3_mode_loads_shared_state_snapshot() {
+    let s3 = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().starts_with("/registry-test")
+                && request
+                    .url
+                    .query_pairs()
+                    .any(|(k, v)| k == "list-type" && v == "2")
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_s3_list_xml()))
+        .mount(&s3)
+        .await;
+
+    let remote_state = json!({
+        "users": {},
+        "auth_tokens": {},
+        "npm_tokens": [],
+        "login_sessions": {},
+        "packages": {
+            "from-s3": {
+                "manifest": {
+                    "_id": "from-s3",
+                    "name": "from-s3",
+                    "dist-tags": { "latest": "1.0.0" },
+                    "versions": {
+                        "1.0.0": {
+                            "name": "from-s3",
+                            "version": "1.0.0",
+                            "dist": {
+                                "tarball": "https://registry.example/from-s3/-/from-s3-1.0.0.tgz"
+                            }
+                        }
+                    }
+                },
+                "upstream_tarballs": {},
+                "updated_at": 1
+            }
+        }
+    });
+    Mock::given(method("GET"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().starts_with("/registry-test/")
+                && request.url.path().contains("__rustaccio_meta")
+                && request.url.path().ends_with("state.json")
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(remote_state))
+        .mount(&s3)
+        .await;
+
+    let dir = TempDir::new().expect("dir");
+    let cfg = s3_test_config(dir.path().to_path_buf(), s3.uri());
+    let store = Store::open(&cfg).await.expect("store");
+    assert!(
+        store.get_package_record("from-s3").await.is_some(),
+        "store should bootstrap package metadata from S3 shared snapshot"
+    );
+
+    let local_state_file = dir.path().join("state.json");
+    assert!(
+        tokio::fs::try_exists(local_state_file)
+            .await
+            .expect("state file existence"),
+        "S3-loaded snapshot should be mirrored to local state.json"
+    );
+}
+
+#[tokio::test]
+async fn s3_mode_persists_shared_state_snapshot_on_mutation() {
+    let s3 = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().starts_with("/registry-test")
+                && request
+                    .url
+                    .query_pairs()
+                    .any(|(k, v)| k == "list-type" && v == "2")
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_s3_list_xml()))
+        .mount(&s3)
+        .await;
+    Mock::given(method("GET"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().starts_with("/registry-test/")
+                && request.url.path().contains("__rustaccio_meta")
+                && request.url.path().ends_with("state.json")
+        })
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&s3)
+        .await;
+    Mock::given(method("PUT"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().starts_with("/registry-test/")
+                && request.url.path().contains("__rustaccio_meta")
+                && request.url.path().ends_with("state.json")
+        })
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&s3)
+        .await;
+
+    let dir = TempDir::new().expect("dir");
+    let cfg = s3_test_config(dir.path().to_path_buf(), s3.uri());
+    let store = Store::open(&cfg).await.expect("store");
+    let _token = store
+        .create_user("s3-user", "secret")
+        .await
+        .expect("create user");
+
+    let requests = s3.received_requests().await.expect("received requests");
+    let put_seen = requests.iter().any(|request| {
+        request.method.as_str() == "PUT"
+            && request.url.path().starts_with("/registry-test/")
+            && request.url.path().contains("__rustaccio_meta")
+            && request.url.path().ends_with("state.json")
+    });
+    assert!(
+        put_seen,
+        "mutations should persist a shared state snapshot back to S3"
+    );
+}
+
+#[tokio::test]
+async fn s3_mode_indexes_tarballs_without_snapshot_for_search_and_browse() {
+    let s3 = MockServer::start().await;
+    let tarball_key = "registry/s3-scan/s3-scan-1.2.3.tgz";
+
+    Mock::given(method("GET"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().starts_with("/registry-test")
+                && request
+                    .url
+                    .query_pairs()
+                    .any(|(k, v)| k == "list-type" && v == "2")
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_string(s3_list_xml(&[tarball_key])))
+        .mount(&s3)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().contains("__rustaccio_meta/state.json")
+        })
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&s3)
+        .await;
+
+    let tarball = npm_tarball_with_package_json(&json!({
+        "name": "s3-scan",
+        "version": "1.2.3",
+        "description": "indexed from tarball package.json",
+        "keywords": ["scan", "s3"],
+        "author": { "name": "scan-bot", "email": "bot@example.com" }
+    }));
+    Mock::given(method("GET"))
+        .and(|request: &wiremock::Request| request.url.path().contains("s3-scan-1.2.3.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball))
+        .mount(&s3)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().contains("__rustaccio_meta/state.json")
+        })
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&s3)
+        .await;
+
+    let dir = TempDir::new().expect("dir");
+    let cfg = s3_test_config(dir.path().to_path_buf(), s3.uri());
+    let state = runtime::build_state(&cfg, None).await.expect("state");
+    let app = build_router(state);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/-/v1/search?text=s3-scan&size=20&from=0")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let objects = body["objects"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !objects.is_empty(),
+        "startup indexing should expose S3 tarball packages via search"
+    );
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/s3-scan")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["name"].as_str(), Some("s3-scan"));
+    assert_eq!(
+        body["versions"]["1.2.3"]["description"].as_str(),
+        Some("indexed from tarball package.json")
+    );
+}
+
+#[tokio::test]
+async fn s3_mode_indexes_verdaccio_scoped_dash_layout_tarballs() {
+    let s3 = MockServer::start().await;
+    let key = "registry/@geoman-io/leaflet-geoman-free/-/leaflet-geoman-free-1.0.0.tgz";
+
+    Mock::given(method("GET"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().starts_with("/registry-test")
+                && request
+                    .url
+                    .query_pairs()
+                    .any(|(k, v)| k == "list-type" && v == "2")
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_string(s3_list_xml(&[key])))
+        .mount(&s3)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().contains("__rustaccio_meta/state.json")
+        })
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&s3)
+        .await;
+
+    let tarball = npm_tarball_with_package_json(&json!({
+        "name": "@geoman-io/leaflet-geoman-free",
+        "version": "1.0.0",
+        "description": "verdaccio-style scoped key layout",
+    }));
+    Mock::given(method("GET"))
+        .and(|request: &wiremock::Request| request.url.path().contains("leaflet-geoman-free-1.0.0.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball))
+        .mount(&s3)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().contains("__rustaccio_meta/state.json")
+        })
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&s3)
+        .await;
+
+    let dir = TempDir::new().expect("dir");
+    let cfg = s3_test_config(dir.path().to_path_buf(), s3.uri());
+    let state = runtime::build_state(&cfg, None).await.expect("state");
+    let app = build_router(state);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/-/v1/search?text=leaflet-geoman-free&size=20&from=0")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let objects = body["objects"].as_array().cloned().unwrap_or_default();
+    assert!(!objects.is_empty());
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/@geoman-io%2Fleaflet-geoman-free")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["name"].as_str(), Some("@geoman-io/leaflet-geoman-free"));
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/@geoman-io%2Fleaflet-geoman-free/-/leaflet-geoman-free-1.0.0.tgz")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(bytes_body(resp).await.len(), 170);
 }

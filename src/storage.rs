@@ -25,15 +25,19 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::http::StatusCode;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
+use flate2::read::GzDecoder;
 use password_hash::{SaltString, rand_core::OsRng};
 use rand::RngCore;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet},
+    io::{Cursor, Read},
     path::{Path, PathBuf},
     sync::Arc,
 };
+use tar::Archive;
 use tokio::sync::RwLock;
 use tracing::{debug, instrument, warn};
 use uuid::Uuid;
@@ -68,16 +72,18 @@ impl Store {
         let tarball_backend = TarballBackend::from_config(config).await?;
 
         let state_file = config.data_dir.join("state.json");
-        let state = if tokio::fs::try_exists(&state_file).await.unwrap_or(false) {
-            let bytes = tokio::fs::read(&state_file).await?;
-            if bytes.is_empty() {
-                PersistedState::default()
+        let mut state = if tarball_backend.supports_shared_state_snapshot() {
+            if let Some(remote) = Self::read_shared_state_snapshot(&tarball_backend).await? {
+                Self::write_local_snapshot(&state_file, &remote).await?;
+                remote
             } else {
-                serde_json::from_slice(&bytes)?
+                Self::read_local_snapshot(&state_file).await?
             }
         } else {
-            PersistedState::default()
+            Self::read_local_snapshot(&state_file).await?
         };
+        let pruned_legacy_uplink_cache_entries =
+            Self::prune_legacy_uplink_snapshot_entries(&mut state);
 
         let auth_plugin = match config.auth_plugin.backend {
             AuthBackend::Local => None,
@@ -92,6 +98,9 @@ impl Store {
             }
         };
 
+        let reindexed_from_backend =
+            Self::hydrate_from_tarball_backend(&mut state, &tarball_backend).await?;
+
         let store = Self {
             state: RwLock::new(state),
             state_file,
@@ -101,7 +110,17 @@ impl Store {
             password_min_length: config.password_min_length,
             login_session_ttl_seconds: config.login_session_ttl_seconds,
         };
-        debug!("store initialized");
+        if reindexed_from_backend || pruned_legacy_uplink_cache_entries > 0 {
+            let snapshot = {
+                let guard = store.state.read().await;
+                guard.clone()
+            };
+            store.persist_snapshot(&snapshot).await?;
+        }
+        debug!(
+            reindexed_from_backend,
+            pruned_legacy_uplink_cache_entries, "store initialized"
+        );
         Ok(store)
     }
 
@@ -111,6 +130,354 @@ impl Store {
 
     fn now_http() -> String {
         Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+    }
+
+    async fn hydrate_from_tarball_backend(
+        state: &mut PersistedState,
+        tarball_backend: &TarballBackend,
+    ) -> Result<bool, RegistryError> {
+        let references = tarball_backend.list().await?;
+        if references.is_empty() {
+            return Ok(false);
+        }
+
+        let now_ms = Self::now_ms();
+        let now_rfc3339 = Utc::now().to_rfc3339();
+        let mut changed = false;
+        let mut indexed_packages = 0usize;
+        let mut indexed_versions = 0usize;
+        let mut metadata_enriched_versions = 0usize;
+
+        for reference in references {
+            let Some(version) = Self::infer_version_from_filename(&reference.filename) else {
+                continue;
+            };
+
+            if !state.packages.contains_key(&reference.package) {
+                state.packages.insert(
+                    reference.package.clone(),
+                    PackageRecord {
+                        manifest: Value::Object(Self::inferred_manifest_shell(
+                            &reference.package,
+                            &now_rfc3339,
+                        )),
+                        upstream_tarballs: HashMap::new(),
+                        updated_at: now_ms,
+                        cached_from_uplink: false,
+                    },
+                );
+                indexed_packages += 1;
+                changed = true;
+            }
+
+            let Some(record) = state.packages.get_mut(&reference.package) else {
+                continue;
+            };
+            if record.cached_from_uplink {
+                record.cached_from_uplink = false;
+                changed = true;
+            }
+            if !record.manifest.is_object() {
+                record.manifest = Value::Object(Self::inferred_manifest_shell(
+                    &reference.package,
+                    &now_rfc3339,
+                ));
+                changed = true;
+            }
+
+            let Some(manifest) = record.manifest.as_object_mut() else {
+                continue;
+            };
+            let mut record_changed = false;
+
+            manifest.insert("_id".to_string(), Value::String(reference.package.clone()));
+            manifest.insert("name".to_string(), Value::String(reference.package.clone()));
+            if !manifest.contains_key("_rev") {
+                manifest.insert("_rev".to_string(), Value::String("1-rustaccio".to_string()));
+                record_changed = true;
+            }
+
+            let versions = Self::ensure_object_field(manifest, "versions");
+            if !versions.contains_key(&version) {
+                let tarball_metadata = Self::read_tarball_package_metadata(
+                    tarball_backend,
+                    &reference.package,
+                    &reference.filename,
+                )
+                .await;
+                versions.insert(
+                    version.clone(),
+                    Self::inferred_version_manifest(
+                        &reference.package,
+                        &version,
+                        &reference.filename,
+                        tarball_metadata.as_ref(),
+                    ),
+                );
+                if let Some(metadata) = tarball_metadata {
+                    if Self::merge_startup_manifest_metadata(
+                        manifest,
+                        &metadata,
+                        &reference.package,
+                    ) {
+                        metadata_enriched_versions += 1;
+                    }
+                }
+                indexed_versions += 1;
+                record_changed = true;
+            }
+
+            let attachments = Self::ensure_object_field(manifest, "_attachments");
+            if !attachments.contains_key(&reference.filename) {
+                attachments.insert(reference.filename.clone(), json!({ "version": version }));
+                record_changed = true;
+            }
+
+            let dist_tags = Self::ensure_object_field(manifest, "dist-tags");
+            let update_latest = match dist_tags.get("latest").and_then(Value::as_str) {
+                Some(current) => Self::compare_versions(&version, current).is_gt(),
+                None => true,
+            };
+            if update_latest {
+                dist_tags.insert("latest".to_string(), Value::String(version.clone()));
+                record_changed = true;
+            }
+
+            if !manifest
+                .get("maintainers")
+                .is_some_and(serde_json::Value::is_array)
+            {
+                manifest.insert("maintainers".to_string(), Value::Array(Vec::new()));
+                record_changed = true;
+            }
+            if !manifest
+                .get("users")
+                .is_some_and(serde_json::Value::is_object)
+            {
+                manifest.insert("users".to_string(), Value::Object(Map::new()));
+                record_changed = true;
+            }
+
+            let time = Self::ensure_object_field(manifest, "time");
+            if !time.contains_key("created") {
+                time.insert("created".to_string(), Value::String(now_rfc3339.clone()));
+                record_changed = true;
+            }
+            if !time.contains_key(&version) {
+                time.insert(version.clone(), Value::String(now_rfc3339.clone()));
+                record_changed = true;
+            }
+            time.insert("modified".to_string(), Value::String(now_rfc3339.clone()));
+
+            if record_changed {
+                record.updated_at = now_ms;
+                changed = true;
+            }
+        }
+
+        debug!(
+            indexed_packages,
+            indexed_versions,
+            metadata_enriched_versions,
+            changed,
+            "indexed tarball backend during startup"
+        );
+        Ok(changed)
+    }
+
+    fn inferred_manifest_shell(package_name: &str, now_rfc3339: &str) -> Map<String, Value> {
+        let mut manifest = Map::new();
+        manifest.insert("_id".to_string(), Value::String(package_name.to_string()));
+        manifest.insert("name".to_string(), Value::String(package_name.to_string()));
+        manifest.insert("_rev".to_string(), Value::String("1-rustaccio".to_string()));
+        manifest.insert("versions".to_string(), Value::Object(Map::new()));
+        manifest.insert("dist-tags".to_string(), Value::Object(Map::new()));
+        manifest.insert("_attachments".to_string(), Value::Object(Map::new()));
+        manifest.insert("maintainers".to_string(), Value::Array(Vec::new()));
+        manifest.insert("users".to_string(), Value::Object(Map::new()));
+        manifest.insert(
+            "time".to_string(),
+            json!({
+                "created": now_rfc3339,
+                "modified": now_rfc3339,
+            }),
+        );
+        manifest
+    }
+
+    fn ensure_object_field<'a>(
+        manifest: &'a mut Map<String, Value>,
+        key: &str,
+    ) -> &'a mut Map<String, Value> {
+        if !manifest.get(key).is_some_and(serde_json::Value::is_object) {
+            manifest.insert(key.to_string(), Value::Object(Map::new()));
+        }
+        manifest
+            .get_mut(key)
+            .and_then(Value::as_object_mut)
+            .expect("object field was initialized")
+    }
+
+    fn inferred_tarball_url(package_name: &str, filename: &str) -> String {
+        format!(
+            "http://localhost:4873/{}/-/{}",
+            package_name_to_encoded(package_name),
+            filename
+        )
+    }
+
+    fn inferred_version_manifest(
+        package_name: &str,
+        version: &str,
+        filename: &str,
+        tarball_metadata: Option<&Value>,
+    ) -> Value {
+        let mut payload = tarball_metadata
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        payload.insert(
+            "_id".to_string(),
+            Value::String(format!("{package_name}@{version}")),
+        );
+        payload.insert("name".to_string(), Value::String(package_name.to_string()));
+        payload.insert("version".to_string(), Value::String(version.to_string()));
+
+        let mut dist = payload
+            .get("dist")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        dist.insert(
+            "tarball".to_string(),
+            Value::String(Self::inferred_tarball_url(package_name, filename)),
+        );
+        payload.insert("dist".to_string(), Value::Object(dist));
+        Value::Object(payload)
+    }
+
+    fn merge_startup_manifest_metadata(
+        manifest: &mut Map<String, Value>,
+        tarball_metadata: &Value,
+        package_name: &str,
+    ) -> bool {
+        let Some(metadata) = tarball_metadata.as_object() else {
+            return false;
+        };
+
+        let mut changed = false;
+        if !manifest.contains_key("description")
+            && let Some(description) = metadata.get("description")
+            && description.is_string()
+        {
+            manifest.insert("description".to_string(), description.clone());
+            changed = true;
+        }
+        if !manifest.contains_key("readme")
+            && let Some(readme) = metadata.get("readme")
+            && readme.is_string()
+        {
+            manifest.insert("readme".to_string(), readme.clone());
+            changed = true;
+        }
+
+        let maintainers_empty = manifest
+            .get("maintainers")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty);
+        if maintainers_empty
+            && let Some(maintainers) = metadata.get("maintainers")
+            && maintainers.is_array()
+        {
+            manifest.insert("maintainers".to_string(), maintainers.clone());
+            changed = true;
+        }
+
+        manifest.insert("name".to_string(), Value::String(package_name.to_string()));
+        manifest.insert("_id".to_string(), Value::String(package_name.to_string()));
+        changed
+    }
+
+    async fn read_tarball_package_metadata(
+        tarball_backend: &TarballBackend,
+        package_name: &str,
+        filename: &str,
+    ) -> Option<Value> {
+        let bytes = tarball_backend
+            .get(package_name, filename)
+            .await
+            .ok()
+            .flatten()?;
+        Self::extract_package_json_from_tarball(&bytes)
+    }
+
+    fn extract_package_json_from_tarball(bytes: &[u8]) -> Option<Value> {
+        let cursor = Cursor::new(bytes);
+        let decoder = GzDecoder::new(cursor);
+        let mut archive = Archive::new(decoder);
+        let mut entries = archive.entries().ok()?;
+
+        while let Some(next) = entries.next() {
+            let mut entry = next.ok()?;
+            let path = entry.path().ok()?.to_string_lossy().to_string();
+            if path == "package/package.json" || path.ends_with("/package.json") {
+                let mut package_json = Vec::new();
+                entry.read_to_end(&mut package_json).ok()?;
+                let value = serde_json::from_slice::<Value>(&package_json).ok()?;
+                if value.is_object() {
+                    return Some(value);
+                }
+                return None;
+            }
+        }
+
+        None
+    }
+
+    fn infer_version_from_filename(filename: &str) -> Option<String> {
+        let stem = filename
+            .strip_suffix(".tgz")
+            .or_else(|| filename.strip_suffix(".tar.gz"))?;
+        let (_, version) = stem.rsplit_once('-')?;
+        if version.is_empty() {
+            return None;
+        }
+        if !version
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_digit())
+        {
+            return None;
+        }
+        Some(version.to_string())
+    }
+
+    fn semverish(version: &str) -> Option<([u64; 3], bool, String)> {
+        let without_build = version.split('+').next().unwrap_or(version);
+        let (core, prerelease) = without_build
+            .split_once('-')
+            .map_or((without_build, None), |(core, pre)| (core, Some(pre)));
+        let mut parts = core.split('.');
+        let major = parts.next()?.parse::<u64>().ok()?;
+        let minor = parts.next()?.parse::<u64>().ok()?;
+        let patch = parts.next()?.parse::<u64>().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some((
+            [major, minor, patch],
+            prerelease.is_none(),
+            prerelease.unwrap_or_default().to_string(),
+        ))
+    }
+
+    fn compare_versions(candidate: &str, current: &str) -> Ordering {
+        match (Self::semverish(candidate), Self::semverish(current)) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            (Some(_), None) => Ordering::Greater,
+            (None, Some(_)) => Ordering::Less,
+            (None, None) => candidate.cmp(current),
+        }
     }
 
     fn random_token_hex(bytes: usize) -> String {
@@ -136,12 +503,81 @@ impl Store {
         )
     }
 
-    async fn persist_snapshot(&self, snapshot: &PersistedState) -> Result<(), RegistryError> {
-        let tmp_file = self.state_file.with_extension("json.tmp");
+    async fn read_local_snapshot(state_file: &Path) -> Result<PersistedState, RegistryError> {
+        if tokio::fs::try_exists(state_file).await.unwrap_or(false) {
+            let bytes = tokio::fs::read(state_file).await?;
+            if bytes.is_empty() {
+                Ok(PersistedState::default())
+            } else {
+                Ok(serde_json::from_slice(&bytes)?)
+            }
+        } else {
+            Ok(PersistedState::default())
+        }
+    }
+
+    async fn read_shared_state_snapshot(
+        tarball_backend: &TarballBackend,
+    ) -> Result<Option<PersistedState>, RegistryError> {
+        let Some(bytes) = tarball_backend.load_shared_state_snapshot().await? else {
+            return Ok(None);
+        };
+        if bytes.is_empty() {
+            return Ok(Some(PersistedState::default()));
+        }
+        let snapshot = serde_json::from_slice::<PersistedState>(&bytes)?;
+        Ok(Some(snapshot))
+    }
+
+    async fn write_local_snapshot(
+        state_file: &Path,
+        snapshot: &PersistedState,
+    ) -> Result<(), RegistryError> {
         let bytes = serde_json::to_vec_pretty(snapshot)?;
+        Self::write_local_snapshot_bytes(state_file, &bytes).await
+    }
+
+    async fn write_local_snapshot_bytes(
+        state_file: &Path,
+        bytes: &[u8],
+    ) -> Result<(), RegistryError> {
+        let tmp_file = state_file.with_extension("json.tmp");
         tokio::fs::write(&tmp_file, bytes).await?;
-        tokio::fs::rename(&tmp_file, &self.state_file).await?;
+        tokio::fs::rename(&tmp_file, state_file).await?;
         Ok(())
+    }
+
+    async fn persist_snapshot(&self, snapshot: &PersistedState) -> Result<(), RegistryError> {
+        let mut persisted = snapshot.clone();
+        Self::prune_ephemeral_uplink_cache_entries(&mut persisted);
+        let bytes = serde_json::to_vec_pretty(&persisted)?;
+        Self::write_local_snapshot_bytes(&self.state_file, &bytes).await?;
+        if self.tarball_backend.supports_shared_state_snapshot() {
+            self.tarball_backend
+                .save_shared_state_snapshot(&bytes)
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn prune_ephemeral_uplink_cache_entries(state: &mut PersistedState) {
+        state
+            .packages
+            .retain(|_, record| !record.cached_from_uplink);
+    }
+
+    fn prune_legacy_uplink_snapshot_entries(state: &mut PersistedState) -> usize {
+        let before = state.packages.len();
+        state.packages.retain(|_, record| {
+            let attachments_empty = record
+                .manifest
+                .get("_attachments")
+                .and_then(Value::as_object)
+                .is_none_or(|attachments| attachments.is_empty());
+            let looks_like_uplink_cache = attachments_empty && !record.upstream_tarballs.is_empty();
+            !looks_like_uplink_cache
+        });
+        before.saturating_sub(state.packages.len())
     }
 
     async fn write_tarball_file(
@@ -831,6 +1267,7 @@ impl Store {
                 Self::ensure_manifest_defaults(manifest, package_name, username);
                 Self::bump_revision(manifest);
                 record.updated_at = Self::now_ms();
+                record.cached_from_uplink = false;
                 state.clone()
             };
 
@@ -871,6 +1308,7 @@ impl Store {
                 }
 
                 record.updated_at = Self::now_ms();
+                record.cached_from_uplink = false;
                 state.clone()
             };
 
@@ -973,6 +1411,7 @@ impl Store {
                 }
 
                 record.updated_at = Self::now_ms();
+                record.cached_from_uplink = false;
                 message = API_MESSAGE_PKG_CHANGED.to_string();
             } else {
                 let mut manifest = body.as_object().cloned().ok_or_else(|| {
@@ -1003,6 +1442,7 @@ impl Store {
                         manifest: Value::Object(manifest),
                         upstream_tarballs: HashMap::new(),
                         updated_at: Self::now_ms(),
+                        cached_from_uplink: false,
                     },
                 );
                 message = API_MESSAGE_PKG_CREATED.to_string();
@@ -1045,6 +1485,17 @@ impl Store {
         package_name: &str,
         filename: &str,
     ) -> Result<String, RegistryError> {
+        {
+            let state = self.state.read().await;
+            if !state.packages.contains_key(package_name) {
+                return Err(RegistryError::http(
+                    StatusCode::NOT_FOUND,
+                    API_ERROR_NO_PACKAGE,
+                ));
+            }
+        }
+
+        let removed_file = self.tarball_backend.delete(package_name, filename).await?;
         let snapshot = {
             let mut state = self.state.write().await;
             let record = Self::package_record(&mut state, package_name)?;
@@ -1097,7 +1548,6 @@ impl Store {
             }
 
             let removed_upstream = record.upstream_tarballs.remove(filename).is_some();
-            let removed_file = self.tarball_backend.delete(package_name, filename).await?;
 
             if !removed_file && !removed_upstream && removed_versions.is_empty() {
                 return Err(RegistryError::http(
@@ -1144,6 +1594,7 @@ impl Store {
 
             Self::bump_revision(manifest);
             record.updated_at = Self::now_ms();
+            record.cached_from_uplink = false;
 
             (state.clone(), response.to_string())
         };
@@ -1180,20 +1631,17 @@ impl Store {
         manifest: Value,
         upstream_tarballs: HashMap<String, String>,
     ) -> Result<(), RegistryError> {
-        let snapshot = {
-            let mut state = self.state.write().await;
-            state.packages.insert(
-                package_name.to_string(),
-                PackageRecord {
-                    manifest,
-                    upstream_tarballs,
-                    updated_at: Self::now_ms(),
-                },
-            );
-            state.clone()
-        };
+        let mut state = self.state.write().await;
+        state.packages.insert(
+            package_name.to_string(),
+            PackageRecord {
+                manifest,
+                upstream_tarballs,
+                updated_at: Self::now_ms(),
+                cached_from_uplink: true,
+            },
+        );
 
-        self.persist_snapshot(&snapshot).await?;
         debug!("upserted upstream package cache");
         Ok(())
     }
@@ -1212,17 +1660,9 @@ impl Store {
         filename: &str,
         url: String,
     ) -> Result<(), RegistryError> {
-        let snapshot = {
-            let mut state = self.state.write().await;
-            if let Some(record) = state.packages.get_mut(package_name) {
-                record.upstream_tarballs.insert(filename.to_string(), url);
-                Some(state.clone())
-            } else {
-                None
-            }
-        };
-        if let Some(snapshot) = snapshot {
-            self.persist_snapshot(&snapshot).await?;
+        let mut state = self.state.write().await;
+        if let Some(record) = state.packages.get_mut(package_name) {
+            record.upstream_tarballs.insert(filename.to_string(), url);
         }
         Ok(())
     }
@@ -1240,7 +1680,12 @@ impl Store {
 
     pub async fn all_packages(&self) -> Vec<PackageRecord> {
         let state = self.state.read().await;
-        state.packages.values().cloned().collect()
+        state
+            .packages
+            .values()
+            .filter(|record| !record.cached_from_uplink)
+            .cloned()
+            .collect()
     }
 
     pub async fn starred_packages(&self, user_key: &str) -> Vec<String> {
@@ -1708,4 +2153,90 @@ pub fn unauthorized_on_invalid_token(header_present: bool) -> Result<(), Registr
 
 pub fn ok_object() -> Value {
     json!({})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Store;
+    use crate::config::Config;
+    use std::{io::Write, path::Path};
+
+    fn config_for_data_dir(data_dir: &Path) -> Config {
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        writeln!(file, "storage: {}", data_dir.display()).expect("write yaml config");
+        Config::from_yaml_file(file.path().to_path_buf()).expect("parse config")
+    }
+
+    #[tokio::test]
+    async fn hydrates_unindexed_local_tarballs_on_startup() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let data_dir = temp.path().join("registry");
+        let package_dir = data_dir.join("tarballs").join("demo");
+        tokio::fs::create_dir_all(&package_dir)
+            .await
+            .expect("create tarball dir");
+        tokio::fs::write(package_dir.join("demo-1.0.0.tgz"), b"one")
+            .await
+            .expect("write tarball");
+        tokio::fs::write(package_dir.join("demo-1.2.0.tgz"), b"two")
+            .await
+            .expect("write tarball");
+
+        let config = config_for_data_dir(&data_dir);
+        let store = Store::open(&config).await.expect("open store");
+        let package = store
+            .get_package_record("demo")
+            .await
+            .expect("package discovered");
+        let versions = package
+            .manifest
+            .get("versions")
+            .and_then(serde_json::Value::as_object)
+            .expect("versions object");
+        assert!(versions.contains_key("1.0.0"));
+        assert!(versions.contains_key("1.2.0"));
+        assert_eq!(
+            package
+                .manifest
+                .get("dist-tags")
+                .and_then(|tags| tags.get("latest"))
+                .and_then(serde_json::Value::as_str),
+            Some("1.2.0")
+        );
+
+        let state_file = data_dir.join("state.json");
+        assert!(
+            tokio::fs::try_exists(&state_file)
+                .await
+                .expect("state file existence"),
+            "startup hydration should persist state"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrates_scoped_package_tarballs_on_startup() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let data_dir = temp.path().join("registry");
+        let package_dir = data_dir.join("tarballs").join("@scope__pkg");
+        tokio::fs::create_dir_all(&package_dir)
+            .await
+            .expect("create scoped tarball dir");
+        tokio::fs::write(package_dir.join("pkg-2.3.4.tgz"), b"pkg")
+            .await
+            .expect("write scoped tarball");
+
+        let config = config_for_data_dir(&data_dir);
+        let store = Store::open(&config).await.expect("open store");
+        let package = store
+            .get_package_record("@scope/pkg")
+            .await
+            .expect("scoped package discovered");
+        assert!(
+            package
+                .manifest
+                .get("versions")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|versions| versions.contains_key("2.3.4"))
+        );
+    }
 }
