@@ -147,11 +147,21 @@ impl Store {
         let mut indexed_packages = 0usize;
         let mut indexed_versions = 0usize;
         let mut metadata_enriched_versions = 0usize;
+        let mut package_metadata_cache: HashMap<String, Option<Value>> = HashMap::new();
 
         for reference in references {
             let Some(version) = Self::infer_version_from_filename(&reference.filename) else {
                 continue;
             };
+            if !package_metadata_cache.contains_key(&reference.package) {
+                let package_metadata = tarball_backend
+                    .read_package_metadata(&reference.package)
+                    .await?;
+                package_metadata_cache.insert(reference.package.clone(), package_metadata);
+            }
+            let package_metadata = package_metadata_cache
+                .get(&reference.package)
+                .and_then(|value| value.as_ref());
 
             if !state.packages.contains_key(&reference.package) {
                 state.packages.insert(
@@ -196,25 +206,34 @@ impl Store {
                 manifest.insert("_rev".to_string(), Value::String("1-rustaccio".to_string()));
                 record_changed = true;
             }
+            if let Some(metadata) = package_metadata
+                && Self::merge_startup_manifest_metadata(manifest, metadata, &reference.package)
+            {
+                record_changed = true;
+            }
 
             let versions = Self::ensure_object_field(manifest, "versions");
             if !versions.contains_key(&version) {
-                let tarball_metadata = Self::read_tarball_package_metadata(
-                    tarball_backend,
-                    &reference.package,
-                    &reference.filename,
-                )
-                .await;
+                let mut startup_metadata =
+                    Self::startup_metadata_for_version(package_metadata, &version).cloned();
+                if startup_metadata.is_none() {
+                    startup_metadata = Self::read_tarball_package_metadata(
+                        tarball_backend,
+                        &reference.package,
+                        &reference.filename,
+                    )
+                    .await;
+                }
                 versions.insert(
                     version.clone(),
                     Self::inferred_version_manifest(
                         &reference.package,
                         &version,
                         &reference.filename,
-                        tarball_metadata.as_ref(),
+                        startup_metadata.as_ref(),
                     ),
                 );
-                if let Some(metadata) = tarball_metadata {
+                if let Some(metadata) = startup_metadata {
                     if Self::merge_startup_manifest_metadata(
                         manifest,
                         &metadata,
@@ -396,6 +415,28 @@ impl Store {
         manifest.insert("name".to_string(), Value::String(package_name.to_string()));
         manifest.insert("_id".to_string(), Value::String(package_name.to_string()));
         changed
+    }
+
+    fn startup_metadata_for_version<'a>(
+        package_metadata: Option<&'a Value>,
+        version: &str,
+    ) -> Option<&'a Value> {
+        let metadata = package_metadata?;
+        let from_versions = metadata
+            .get("versions")
+            .and_then(Value::as_object)
+            .and_then(|versions| versions.get(version))
+            .filter(|value| value.is_object());
+        if from_versions.is_some() {
+            return from_versions;
+        }
+
+        if metadata.get("version").and_then(Value::as_str) == Some(version) && metadata.is_object()
+        {
+            return Some(metadata);
+        }
+
+        None
     }
 
     async fn read_tarball_package_metadata(

@@ -5,6 +5,7 @@ use crate::{
 #[cfg(feature = "s3")]
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use axum::http::StatusCode;
+use serde_json::Value;
 use std::path::PathBuf;
 use tracing::{debug, instrument, warn};
 
@@ -129,6 +130,17 @@ impl TarballBackend {
             Self::S3(backend) => backend.put_state_snapshot(content).await,
         }
     }
+
+    pub async fn read_package_metadata(
+        &self,
+        package: &str,
+    ) -> Result<Option<Value>, RegistryError> {
+        match self {
+            Self::Local(backend) => backend.read_package_metadata(package).await,
+            #[cfg(feature = "s3")]
+            Self::S3(backend) => backend.read_package_metadata(package).await,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -232,6 +244,22 @@ impl LocalTarballBackend {
 
         Ok(out)
     }
+
+    pub async fn read_package_metadata(
+        &self,
+        package: &str,
+    ) -> Result<Option<Value>, RegistryError> {
+        let path = self
+            .root
+            .join(Self::package_dir(package))
+            .join("package.json");
+        if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return Ok(None);
+        }
+        let bytes = tokio::fs::read(path).await?;
+        let parsed = serde_json::from_slice::<Value>(&bytes).ok();
+        Ok(parsed.filter(Value::is_object))
+    }
 }
 
 #[cfg(feature = "s3")]
@@ -327,11 +355,21 @@ impl S3TarballBackend {
     }
 
     fn encoded_verdaccio_dash_key(&self, package: &str, filename: &str) -> String {
-        format!("{}{}/-/{}", self.prefix, urlencoding::encode(package), filename)
+        format!(
+            "{}{}/-/{}",
+            self.prefix,
+            urlencoding::encode(package),
+            filename
+        )
     }
 
     fn encoded_verdaccio_plain_key(&self, package: &str, filename: &str) -> String {
-        format!("{}{}/{}", self.prefix, urlencoding::encode(package), filename)
+        format!(
+            "{}{}/{}",
+            self.prefix,
+            urlencoding::encode(package),
+            filename
+        )
     }
 
     fn candidate_keys_for_tarball(&self, package: &str, filename: &str) -> Vec<String> {
@@ -362,6 +400,21 @@ impl S3TarballBackend {
             }
         }
         prefixes
+    }
+
+    fn candidate_keys_for_package_metadata(&self, package: &str) -> Vec<String> {
+        let filename = "package.json";
+        let mut keys = Vec::new();
+        for key in [
+            self.key(package, filename),
+            self.verdaccio_plain_key(package, filename),
+            self.encoded_verdaccio_plain_key(package, filename),
+        ] {
+            if !keys.iter().any(|existing| existing == &key) {
+                keys.push(key);
+            }
+        }
+        keys
     }
 
     async fn get_by_key(&self, key: &str) -> Result<Option<Vec<u8>>, RegistryError> {
@@ -547,6 +600,22 @@ impl S3TarballBackend {
         )
         .await
     }
+
+    pub async fn read_package_metadata(
+        &self,
+        package: &str,
+    ) -> Result<Option<Value>, RegistryError> {
+        for key in self.candidate_keys_for_package_metadata(package) {
+            let Some(bytes) = self.get_by_key(&key).await? else {
+                continue;
+            };
+            let parsed = serde_json::from_slice::<Value>(&bytes).ok();
+            if let Some(value) = parsed.filter(Value::is_object) {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
 }
 
 #[cfg(feature = "s3")]
@@ -566,20 +635,19 @@ fn parse_tarball_ref_from_object_key(prefix: &str, key: &str) -> Option<TarballR
         return None;
     }
 
-    let (package_raw, filename, from_dash_layout) = if let Some((package, filename)) =
-        rest.split_once("/-/")
-    {
-        if filename.is_empty() || filename.contains('/') {
-            return None;
-        }
-        (package, filename, true)
-    } else {
-        let (package, filename) = rest.rsplit_once('/')?;
-        if package.is_empty() || filename.is_empty() || filename.contains('/') {
-            return None;
-        }
-        (package, filename, false)
-    };
+    let (package_raw, filename, from_dash_layout) =
+        if let Some((package, filename)) = rest.split_once("/-/") {
+            if filename.is_empty() || filename.contains('/') {
+                return None;
+            }
+            (package, filename, true)
+        } else {
+            let (package, filename) = rest.rsplit_once('/')?;
+            if package.is_empty() || filename.is_empty() || filename.contains('/') {
+                return None;
+            }
+            (package, filename, false)
+        };
 
     let decoded = urlencoding::decode(package_raw)
         .map(|value| value.into_owned())

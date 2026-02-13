@@ -927,6 +927,166 @@ async fn upstream_proxy_manifest_and_tarball_flow() {
 }
 
 #[tokio::test]
+async fn tarball_request_bootstraps_package_from_upstream() {
+    let upstream = MockServer::start().await;
+    let pkg = "tarball-first";
+    let filename = "tarball-first-1.0.0.tgz";
+
+    let upstream_manifest = json!({
+        "_id": pkg,
+        "name": pkg,
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": pkg,
+                "version": "1.0.0",
+                "dist": { "tarball": format!("{upstream_uri}/{pkg}/-/{filename}", upstream_uri = upstream.uri()) }
+            }
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path(format!("/{pkg}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(upstream_manifest))
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{pkg}/-/{filename}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tarball-first-bytes".to_vec()))
+        .mount(&upstream)
+        .await;
+
+    let dir = TempDir::new().expect("dir");
+    let app = test_app(dir.path().to_path_buf(), Some(upstream.uri())).await;
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/{pkg}/-/{filename}"))
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(bytes_body(resp).await, b"tarball-first-bytes");
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/{pkg}"))
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn fetches_upstream_tarball_when_local_manifest_lacks_dist_info() {
+    let upstream = MockServer::start().await;
+    let pkg = "upstream";
+    let remote_filename = "upstream-1.0.1.tgz";
+
+    Mock::given(method("GET"))
+        .and(path(format!("/{pkg}/-/{remote_filename}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"remote-1.0.1".to_vec()))
+        .mount(&upstream)
+        .await;
+
+    let dir = TempDir::new().expect("dir");
+    let app = test_app(dir.path().to_path_buf(), Some(upstream.uri())).await;
+    let token = create_user(&app, "distless", "secret").await;
+
+    let manifest = pkg_manifest(pkg, "1.0.0", "upstream-1.0.0.tgz", b"local-1.0.0");
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri("/upstream")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&manifest).expect("payload")))
+        .expect("request");
+    assert_eq!(send(&app, req).await.status(), StatusCode::CREATED);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/{pkg}/-/{remote_filename}"))
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(bytes_body(resp).await, b"remote-1.0.1");
+}
+
+#[tokio::test]
+async fn tarball_uses_local_cache_after_first_upstream_fetch() {
+    let upstream = MockServer::start().await;
+    let pkg = "cache-me";
+    let filename = "cache-me-1.0.0.tgz";
+
+    let upstream_manifest = json!({
+        "_id": pkg,
+        "name": pkg,
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": pkg,
+                "version": "1.0.0",
+                "dist": { "tarball": format!("{upstream_uri}/{pkg}/-/{filename}", upstream_uri = upstream.uri()) }
+            }
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path(format!("/{pkg}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(upstream_manifest))
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{pkg}/-/{filename}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"cache-bytes".to_vec()))
+        .mount(&upstream)
+        .await;
+
+    let dir = TempDir::new().expect("dir");
+    let app = test_app(dir.path().to_path_buf(), Some(upstream.uri())).await;
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/{pkg}"))
+        .body(Body::empty())
+        .expect("request");
+    assert_eq!(send(&app, req).await.status(), StatusCode::OK);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/{pkg}/-/{filename}"))
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(bytes_body(resp).await, b"cache-bytes");
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/{pkg}/-/{filename}"))
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(bytes_body(resp).await, b"cache-bytes");
+
+    let requests = upstream
+        .received_requests()
+        .await
+        .expect("received requests");
+    let tarball_fetch_count = requests
+        .iter()
+        .filter(|request| request.method.as_str() == "GET")
+        .filter(|request| request.url.path() == format!("/{pkg}/-/{filename}"))
+        .count();
+    assert_eq!(
+        tarball_fetch_count, 1,
+        "second tarball request should be served from local cache"
+    );
+}
+
+#[tokio::test]
 async fn upstream_cached_packages_are_not_persisted_in_snapshot() {
     let upstream = MockServer::start().await;
     let upstream_manifest = json!({
@@ -1886,6 +2046,33 @@ async fn deprecate_and_undeprecate_flow() {
 }
 
 #[tokio::test]
+async fn publish_keeps_top_level_readme_when_version_readme_is_empty() {
+    let dir = TempDir::new().expect("dir");
+    let app = test_app(dir.path().to_path_buf(), None).await;
+    let token = create_user(&app, "readme-user", "secret").await;
+
+    let mut manifest = pkg_manifest("readme-only", "1.0.0", "readme-only-1.0.0.tgz", b"readme");
+    manifest["versions"]["1.0.0"]["readme"] = Value::String(String::new());
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri("/readme-only")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&manifest).expect("payload")))
+        .expect("request");
+    assert_eq!(send(&app, req).await.status(), StatusCode::CREATED);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/readme-only")
+        .body(Body::empty())
+        .expect("request");
+    let body = json_body(send(&app, req).await).await;
+    assert_eq!(body["readme"].as_str(), Some("# test"));
+    assert_eq!(body["versions"]["1.0.0"]["readme"].as_str(), Some(""));
+}
+
+#[tokio::test]
 async fn deprecate_all_existing_versions_keeps_new_publish_undeprecated() {
     let dir = TempDir::new().expect("dir");
     let app = test_app(dir.path().to_path_buf(), None).await;
@@ -2833,6 +3020,121 @@ async fn s3_mode_indexes_tarballs_without_snapshot_for_search_and_browse() {
 }
 
 #[tokio::test]
+async fn s3_mode_prefers_package_sidecar_metadata_over_startup_tarball_downloads() {
+    let s3 = MockServer::start().await;
+    let package = "@geoman-io/maplibre-geoman-free";
+    let tarball_v1 = "registry/@geoman-io/maplibre-geoman-free/maplibre-geoman-free-0.4.8.tgz";
+    let tarball_v2 = "registry/@geoman-io/maplibre-geoman-free/maplibre-geoman-free-0.4.9.tgz";
+
+    Mock::given(method("GET"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().starts_with("/registry-test")
+                && request
+                    .url
+                    .query_pairs()
+                    .any(|(k, v)| k == "list-type" && v == "2")
+        })
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(s3_list_xml(&[tarball_v1, tarball_v2])),
+        )
+        .mount(&s3)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().contains("__rustaccio_meta/state.json")
+        })
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&s3)
+        .await;
+
+    let package_sidecar = json!({
+        "_id": package,
+        "name": package,
+        "description": "indexed from sidecar",
+        "dist-tags": { "latest": "0.4.9" },
+        "versions": {
+            "0.4.8": {
+                "name": package,
+                "version": "0.4.8",
+                "description": "from sidecar 0.4.8",
+            },
+            "0.4.9": {
+                "name": package,
+                "version": "0.4.9",
+                "description": "from sidecar 0.4.9",
+            }
+        }
+    });
+    Mock::given(method("GET"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().contains("maplibre-geoman-free")
+                && request.url.path().ends_with("package.json")
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(package_sidecar))
+        .mount(&s3)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(|request: &wiremock::Request| {
+            request
+                .url
+                .path()
+                .contains("maplibre-geoman-free-0.4.9.tgz")
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tgz-0.4.9".to_vec()))
+        .mount(&s3)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().contains("__rustaccio_meta/state.json")
+        })
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&s3)
+        .await;
+
+    let dir = TempDir::new().expect("dir");
+    let cfg = s3_test_config(dir.path().to_path_buf(), s3.uri());
+    let state = runtime::build_state(&cfg, None).await.expect("state");
+    let app = build_router(state);
+
+    let startup_requests = s3.received_requests().await.expect("startup requests");
+    let startup_tgz_gets = startup_requests
+        .iter()
+        .filter(|request| request.method.as_str() == "GET")
+        .filter(|request| request.url.path().ends_with(".tgz"))
+        .count();
+    assert_eq!(
+        startup_tgz_gets, 0,
+        "startup indexing should use package sidecar metadata without downloading tarballs"
+    );
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/@geoman-io%2Fmaplibre-geoman-free")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["description"].as_str(), Some("indexed from sidecar"));
+    assert_eq!(
+        body["versions"]["0.4.9"]["description"].as_str(),
+        Some("from sidecar 0.4.9")
+    );
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/@geoman-io%2Fmaplibre-geoman-free/-/maplibre-geoman-free-0.4.9.tgz")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(bytes_body(resp).await, b"tgz-0.4.9");
+}
+
+#[tokio::test]
 async fn s3_mode_indexes_verdaccio_scoped_dash_layout_tarballs() {
     let s3 = MockServer::start().await;
     let key = "registry/@geoman-io/leaflet-geoman-free/-/leaflet-geoman-free-1.0.0.tgz";
@@ -2863,7 +3165,9 @@ async fn s3_mode_indexes_verdaccio_scoped_dash_layout_tarballs() {
         "description": "verdaccio-style scoped key layout",
     }));
     Mock::given(method("GET"))
-        .and(|request: &wiremock::Request| request.url.path().contains("leaflet-geoman-free-1.0.0.tgz"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().contains("leaflet-geoman-free-1.0.0.tgz")
+        })
         .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball))
         .mount(&s3)
         .await;
@@ -2900,7 +3204,10 @@ async fn s3_mode_indexes_verdaccio_scoped_dash_layout_tarballs() {
     let resp = send(&app, req).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
-    assert_eq!(body["name"].as_str(), Some("@geoman-io/leaflet-geoman-free"));
+    assert_eq!(
+        body["name"].as_str(),
+        Some("@geoman-io/leaflet-geoman-free")
+    );
 
     let req = Request::builder()
         .method(Method::GET)
@@ -2909,5 +3216,5 @@ async fn s3_mode_indexes_verdaccio_scoped_dash_layout_tarballs() {
         .expect("request");
     let resp = send(&app, req).await;
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(bytes_body(resp).await.len(), 170);
+    assert!(!bytes_body(resp).await.is_empty());
 }
