@@ -106,6 +106,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 File-size gate (enforced by `tests/file_length.rs`): every Rust source file in `src/` and `tests/` must be `<= 400` lines.
+The gate is currently disabled by default; enable it explicitly with:
+
+```bash
+RUSTACCIO_ENFORCE_FILE_LENGTH=1 cargo test --test file_length
+```
 
 ## Library Embedding
 
@@ -241,6 +246,13 @@ Behavior:
 
 - `2xx` means success.
 - Non-`2xx` propagates status and `error`/`message` from plugin JSON body when present.
+
+## License
+
+Licensed under either of:
+
+- MIT (`LICENSE-MIT`)
+- Apache-2.0 (`LICENSE-APACHE`)
 
 ## Embedded Auth Hook Contract
 
