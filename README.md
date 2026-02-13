@@ -69,6 +69,7 @@ Unified merge precedence is:
 `defaults < RUSTACCIO_CONFIG file < --config file < environment variables`.
 
 `main` delegates to library runtime (`rustaccio::runtime::run_from_env()`), so standalone and embedded usage share the same config/runtime path.
+The full environment variable list is generated into `.env.example` via `cargo run --bin sync_examples`.
 
 Environment variables:
 
@@ -86,10 +87,11 @@ Environment variables:
 - `RUSTACCIO_AUDIT_ENABLED` (default `true`)
 - `RUSTACCIO_URL_PREFIX` (default `/`)
 - `RUSTACCIO_TRUST_PROXY` (default `false`)
-- `RUSTACCIO_KEEP_ALIVE_TIMEOUT` (seconds, optional)
+- `RUSTACCIO_KEEP_ALIVE_TIMEOUT` (seconds, optional; currently accepted for config parity but not applied by the current axum serve path)
 - `RUSTACCIO_REQUEST_TIMEOUT_SECS` (default `30`, clamps `1..=300`)
 - `RUSTACCIO_LOG_LEVEL` (default `info`)
 - `RUSTACCIO_LOG_FORMAT` (`pretty`, `compact`, or `json`, default `pretty`)
+- `RUSTACCIO_VERBOSE_DEP_LOGS` (default `false`; set `true`/`1` to keep noisy dependency targets at your chosen `RUST_LOG` level)
 - `RUST_LOG` (optional full tracing filter; overrides default `rustaccio=<level>,tower_http=info`)
 - `RUSTACCIO_TOKIO_WORKER_THREADS` (default `min(max(available_parallelism, 2), 8)`)
 - `RUSTACCIO_TOKIO_MAX_BLOCKING_THREADS` (default `64`)
@@ -289,6 +291,7 @@ Key APIs:
 - `/-/user/*` (add user/login/logout)
 - `/-/v1/search`
 - `/-/all` and `/-/all/since` (deprecated response)
+- `/-/admin/reindex` and `/-/admin/storage-health` (authenticated admin/ops endpoints)
 - `/-/_view/starredByUser`
 - `/-/package/:package/dist-tags` (+ `:tag`)
 - `/-/npm/v1/user`

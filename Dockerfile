@@ -15,13 +15,14 @@ RUN cargo build --release --locked --features s3 -j "${CARGO_BUILD_JOBS}"
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates tini \
+  && apt-get install -y --no-install-recommends tini \
   && rm -rf /var/lib/apt/lists/* \
   && useradd --system --create-home --uid 10001 --home-dir /var/lib/rustaccio rustaccio
 
 WORKDIR /var/lib/rustaccio
 
 COPY --from=builder /app/target/release/rustaccio /usr/local/bin/rustaccio
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 ENV RUSTACCIO_BIND=0.0.0.0:4873
 ENV RUSTACCIO_DATA_DIR=/var/lib/rustaccio/data
