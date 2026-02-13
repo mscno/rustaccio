@@ -1,7 +1,7 @@
 listen:
   - 127.0.0.1:4873
 
-storage: ./.rustaccio-data
+storage: .rustaccio-data
 
 uplinks:
   npmjs:
@@ -13,11 +13,13 @@ packages:
     publish: $authenticated
     unpublish: $authenticated
     proxy: npmjs
+    uplinksLook: true
   "**":
     access: $all
     publish: $authenticated
     unpublish: $authenticated
     proxy: npmjs
+    uplinksLook: true
 
 web:
   enable: true
@@ -37,7 +39,7 @@ max_body_size: 50mb
 url_prefix: /
 
 server:
-  keepAliveTimeout: 60
+  # keepAliveTimeout: 60
   # Any trustProxy value enables trusted proxy mode.
   # trustProxy: true
 
@@ -68,5 +70,5 @@ store:
   #   endpoint: http://127.0.0.1:9001
   #   accessKeyId: minio
   #   secretAccessKey: miniopass
-  #   prefix: tarballs/
+  #   prefix: 
   #   forcePathStyle: true
