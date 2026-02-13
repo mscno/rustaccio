@@ -45,4 +45,3 @@ fn env_example_covers_discovered_runtime_env_vars() {
 fn normalize_newlines(value: &str) -> String {
     value.replace("\r\n", "\n")
 }
-

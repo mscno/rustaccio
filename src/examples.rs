@@ -199,7 +199,10 @@ fn env_defaults() -> BTreeMap<&'static str, &'static str> {
         ("RUSTACCIO_AUTH_BACKEND", "local"),
         ("RUSTACCIO_AUTH_EXTERNAL_MODE", "false"),
         ("RUSTACCIO_AUTH_HTTP_ADDUSER_ENDPOINT", "/adduser"),
-        ("RUSTACCIO_AUTH_HTTP_CHANGE_PASSWORD_ENDPOINT", "/change-password"),
+        (
+            "RUSTACCIO_AUTH_HTTP_CHANGE_PASSWORD_ENDPOINT",
+            "/change-password",
+        ),
         ("RUSTACCIO_AUTH_HTTP_LOGIN_ENDPOINT", "/authenticate"),
         ("RUSTACCIO_AUTH_HTTP_TIMEOUT_MS", "5000"),
         ("RUSTACCIO_BIND", "127.0.0.1:4873"),
@@ -240,4 +243,3 @@ fn write_if_changed(path: &PathBuf, content: &str) -> Result<(), String> {
     }
     fs::write(path, content).map_err(|err| format!("failed to write {}: {err}", path.display()))
 }
-

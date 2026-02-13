@@ -9,4 +9,3 @@ fn main() {
     }
     println!("synced .env.example and config.example.yml");
 }
-

@@ -5,6 +5,8 @@ use axum::{
 #[cfg(feature = "s3")]
 use flate2::{Compression, write::GzEncoder};
 use http_body_util::BodyExt;
+#[cfg(feature = "s3")]
+use rustaccio::config::S3TarballStorageConfig;
 use rustaccio::{
     acl::{Acl, PackageRule},
     app::{AppState, build_router},
@@ -16,8 +18,6 @@ use rustaccio::{
     storage::Store,
     upstream::Upstream,
 };
-#[cfg(feature = "s3")]
-use rustaccio::config::S3TarballStorageConfig;
 use serde_json::{Value, json};
 #[cfg(feature = "s3")]
 use std::io::Write;
