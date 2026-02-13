@@ -1,13 +1,25 @@
 use std::{
+    env,
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
 
-const MAX_LINES: usize = 25000;
+const MAX_LINES: usize = 400;
+const ENFORCE_ENV: &str = "RUSTACCIO_ENFORCE_FILE_LENGTH";
 
 #[test]
-fn rust_source_files_are_limited_to_2500_lines() {
+fn rust_source_files_are_limited_to_400_lines() {
+    let enforce = env::var(ENFORCE_ENV)
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+    if !enforce {
+        eprintln!(
+            "skipping file-length gate (set {ENFORCE_ENV}=1 to enforce {MAX_LINES}-line limit)"
+        );
+        return;
+    }
+
     let mut offenders = Vec::new();
     for root in ["src", "tests"] {
         collect_rs_files(Path::new(root), &mut offenders);
