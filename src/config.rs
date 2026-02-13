@@ -771,6 +771,8 @@ struct YamlPackageRule {
     publish: Option<StringOrVec>,
     unpublish: Option<StringOrVec>,
     proxy: Option<StringOrVec>,
+    #[serde(default, rename = "uplinksLook", alias = "uplinks_look")]
+    uplinks_look: Option<bool>,
 }
 
 fn parse_package_rule(
@@ -791,6 +793,7 @@ fn parse_package_rule(
         publish: parse_principals(parsed.publish, vec!["$authenticated".to_string()]),
         unpublish: parse_principals(parsed.unpublish, vec!["$authenticated".to_string()]),
         proxy: parse_proxy(parsed.proxy),
+        uplinks_look: parsed.uplinks_look.unwrap_or(true),
     })
 }
 

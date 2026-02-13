@@ -8,6 +8,7 @@ pub struct PackageRule {
     pub publish: Vec<String>,
     pub unpublish: Vec<String>,
     pub proxy: Option<String>,
+    pub uplinks_look: bool,
 }
 
 impl PackageRule {
@@ -18,6 +19,7 @@ impl PackageRule {
             publish: vec!["$authenticated".to_string()],
             unpublish: vec!["$authenticated".to_string()],
             proxy: None,
+            uplinks_look: true,
         }
     }
 }
@@ -67,6 +69,12 @@ impl Acl {
     pub fn proxy_for(&self, package: &str) -> Option<&str> {
         self.rule_for(package)
             .and_then(|rule| rule.proxy.as_deref())
+    }
+
+    pub fn uplinks_look_for(&self, package: &str) -> bool {
+        self.rule_for(package)
+            .map(|rule| rule.uplinks_look)
+            .unwrap_or(true)
     }
 }
 

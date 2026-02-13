@@ -966,9 +966,11 @@ async fn resolve_auth_identity(
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
     let header_present = raw.is_some();
+    let auth_scheme = raw.and_then(|value| value.split_whitespace().next());
     let token = parse_authorization(raw);
     debug!(
         authorization_header = header_present,
+        authorization_scheme = auth_scheme.unwrap_or("<none>"),
         "resolving auth identity"
     );
 
@@ -978,7 +980,11 @@ async fn resolve_auth_identity(
                 .authenticate_request(&token, method.as_str(), path)
                 .await?
             else {
-                warn!("token rejected");
+                warn!(
+                    method = method.as_str(),
+                    path,
+                    "authorization token rejected by auth backends"
+                );
                 return Err(unauthorized_message_for_path(path));
             };
             if identity.username.is_none() && identity.groups.is_empty() {
@@ -989,7 +995,10 @@ async fn resolve_auth_identity(
             Ok(Some(identity))
         }
         None if header_present => {
-            warn!("malformed authorization header");
+            warn!(
+                authorization_scheme = auth_scheme.unwrap_or("<unknown>"),
+                "malformed authorization header (expected 'Bearer <token>')"
+            );
             Err(unauthorized_message_for_path(path))
         }
         None => Ok(None),

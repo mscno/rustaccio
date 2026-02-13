@@ -739,23 +739,48 @@ impl Store {
         method: &str,
         path: &str,
     ) -> Result<Option<AuthIdentity>, RegistryError> {
-        if let Some(hook) = &self.auth_hook
-            && let Some(identity) = hook.authenticate_request(token, method, path).await?
-        {
-            return Ok(Some(identity));
+        if let Some(hook) = &self.auth_hook {
+            debug!(method, path, "attempting request auth via embedded auth hook");
+            if let Some(identity) = hook.authenticate_request(token, method, path).await? {
+                debug!(
+                    method,
+                    path,
+                    source = "embedded_auth_hook",
+                    has_username = identity.username.is_some(),
+                    group_count = identity.groups.len(),
+                    "request auth accepted"
+                );
+                return Ok(Some(identity));
+            }
         }
-        if let Some(plugin) = &self.auth_plugin
-            && let Some(identity) = plugin.authenticate_request(token, method, path).await?
-        {
-            return Ok(Some(identity));
+        if let Some(plugin) = &self.auth_plugin {
+            debug!(method, path, "attempting request auth via external auth plugin");
+            if let Some(identity) = plugin.authenticate_request(token, method, path).await? {
+                debug!(
+                    method,
+                    path,
+                    source = "external_auth_plugin",
+                    has_username = identity.username.is_some(),
+                    group_count = identity.groups.len(),
+                    "request auth accepted"
+                );
+                return Ok(Some(identity));
+            }
         }
-        Ok(self
+
+        let local_identity = self
             .username_from_auth_token(token)
             .await
             .map(|username| AuthIdentity {
                 username: Some(username),
                 groups: Vec::new(),
-            }))
+            });
+        if local_identity.is_some() {
+            debug!(method, path, source = "local_token_store", "request auth accepted");
+        } else {
+            debug!(method, path, "request auth yielded no identity");
+        }
+        Ok(local_identity)
     }
 
     pub async fn allow_access(

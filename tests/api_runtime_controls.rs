@@ -19,6 +19,10 @@ use serde_json::{Value, json};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tempfile::TempDir;
 use tower::ServiceExt;
+use wiremock::{
+    Mock, MockServer, ResponseTemplate,
+    matchers::{method, path},
+};
 
 #[derive(Debug)]
 struct GroupOnlyHook;
@@ -237,6 +241,7 @@ async fn group_only_identity_can_satisfy_acl_publish() {
         publish: vec!["dev-team".to_string()],
         unpublish: vec!["dev-team".to_string()],
         proxy: None,
+        uplinks_look: true,
     }];
     let app = app_with_config(&cfg, Some(Arc::new(GroupOnlyHook))).await;
 
@@ -251,4 +256,47 @@ async fn group_only_identity_can_satisfy_acl_publish() {
         .expect("request");
     let resp = send(&app, req).await;
     assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn external_request_auth_not_found_surfaces_as_bad_gateway() {
+    let auth = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/request-auth"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error":"not found"})))
+        .mount(&auth)
+        .await;
+
+    let dir = TempDir::new().expect("dir");
+    let mut cfg = base_config(dir.path().to_path_buf());
+    cfg.auth_plugin = AuthPluginConfig {
+        backend: AuthBackend::Http,
+        external_mode: false,
+        http: Some(HttpAuthPluginConfig {
+            base_url: auth.uri(),
+            add_user_endpoint: "/adduser".to_string(),
+            login_endpoint: "/authenticate".to_string(),
+            change_password_endpoint: "/change-password".to_string(),
+            request_auth_endpoint: Some("/request-auth".to_string()),
+            allow_access_endpoint: None,
+            allow_publish_endpoint: None,
+            allow_unpublish_endpoint: None,
+            timeout_ms: 1_000,
+        }),
+    };
+    let app = app_with_config(&cfg, None).await;
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/@geoman-io/leaflet-geoman-free")
+        .header(header::AUTHORIZATION, "Bearer deadbeef")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["error"].as_str(),
+        Some("external request auth endpoint not found: /request-auth")
+    );
 }

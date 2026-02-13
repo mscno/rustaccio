@@ -138,6 +138,7 @@ async fn embedded_auth_hook_can_drive_acl_permissions() {
             publish: vec!["geo-admin".to_string()],
             unpublish: vec!["geo-admin".to_string()],
             proxy: None,
+            uplinks_look: true,
         }],
         web_enabled: true,
         web_title: "Rustaccio".to_string(),
