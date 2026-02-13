@@ -17,7 +17,7 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
   && apt-get install -y --no-install-recommends tini \
   && rm -rf /var/lib/apt/lists/* \
-  && useradd --system --create-home --uid 10001 --home-dir /var/lib/rustaccio rustaccio
+  && useradd --system --no-log-init --create-home --uid 10001 --home-dir /var/lib/rustaccio rustaccio
 
 WORKDIR /var/lib/rustaccio
 

@@ -52,6 +52,8 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
+          build-args: |
+            CARGO_BUILD_JOBS=1
           platforms: linux/amd64,linux/arm64
           pull: true
           push: true

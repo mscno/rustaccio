@@ -2,6 +2,7 @@
 .github
 .env
 .rustaccio-data
+output
 config.example.yml
 config.yml
 target
