@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Cargo test (all features)
+        run: cargo test --workspace --all-features --all-targets --locked
+
+      - name: Cargo test (no default features)
+        run: cargo test --workspace --no-default-features --all-targets --locked
+
+      - name: File length gate
+        run: RUSTACCIO_ENFORCE_FILE_LENGTH=1 cargo test --test file_length --locked
