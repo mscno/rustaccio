@@ -1,5 +1,7 @@
 use rustaccio::config::{AuthBackend, Config, TarballStorageBackend};
-use std::{io::Write, path::PathBuf};
+use std::{collections::HashSet, io::Write, path::PathBuf, sync::Mutex};
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn parses_verdaccio_style_acl_and_uplinks() {
@@ -161,15 +163,166 @@ web:
     )
     .expect("write");
 
-    let cfg = Config::from_env_with_config_file(file.path().to_path_buf()).expect("parse");
-    assert_eq!(cfg.listen, vec!["127.0.0.1:4999".to_string()]);
-    assert_eq!(cfg.web_title, "Config From Cli");
-    assert!(!cfg.web_enabled);
+    without_config_env(|| {
+        let cfg = Config::from_env_with_config_file(file.path().to_path_buf()).expect("parse");
+        assert_eq!(cfg.listen, vec!["127.0.0.1:4999".to_string()]);
+        assert_eq!(cfg.web_title, "Config From Cli");
+        assert!(!cfg.web_enabled);
+    });
 }
 
 #[test]
 fn from_env_with_config_file_errors_for_missing_path() {
-    let missing = std::env::temp_dir().join("rustaccio-does-not-exist.yml");
-    let err = Config::from_env_with_config_file(missing).expect_err("missing file");
-    assert!(err.contains("failed to read"));
+    without_config_env(|| {
+        let missing = std::env::temp_dir().join("rustaccio-does-not-exist.yml");
+        let err = Config::from_env_with_config_file(missing).expect_err("missing file");
+        assert!(err.contains("failed to read"));
+    });
+}
+
+#[test]
+fn merge_precedence_defaults_then_files_then_env() {
+    let mut env_file = tempfile::NamedTempFile::new().expect("temp file");
+    writeln!(
+        env_file,
+        r#"
+listen:
+  - 127.0.0.1:4888
+web:
+  title: Env File
+  enable: false
+log:
+  level: warn
+store:
+  backend: local
+"#
+    )
+    .expect("write");
+
+    let mut cli_file = tempfile::NamedTempFile::new().expect("temp file");
+    writeln!(
+        cli_file,
+        r#"
+listen:
+  - 127.0.0.1:4999
+web:
+  title: Cli File
+  enable: false
+log:
+  level: error
+store:
+  backend: s3
+"#
+    )
+    .expect("write");
+
+    with_env_vars(
+        &[
+            (
+                "RUSTACCIO_CONFIG",
+                Some(env_file.path().to_str().expect("utf8 path")),
+            ),
+            ("RUSTACCIO_WEB_ENABLE", Some("true")),
+            ("RUSTACCIO_WEB_TITLE", Some("Env Var")),
+            ("RUSTACCIO_TARBALL_BACKEND", Some("s3")),
+            ("RUSTACCIO_S3_BUCKET", Some("env-bucket")),
+            ("RUSTACCIO_S3_REGION", Some("eu-west-1")),
+            ("RUSTACCIO_AUTH_BACKEND", Some("http")),
+            ("RUSTACCIO_AUTH_HTTP_BASE_URL", Some("http://auth-from-env")),
+        ],
+        || {
+            let cfg =
+                Config::from_env_with_config_file(cli_file.path().to_path_buf()).expect("load");
+            assert_eq!(cfg.listen, vec!["127.0.0.1:4999".to_string()]);
+            assert!(cfg.web_enabled);
+            assert_eq!(cfg.web_title, "Env Var");
+            assert_eq!(cfg.log_level, "error");
+            assert_eq!(cfg.tarball_storage.backend, TarballStorageBackend::S3);
+            let s3 = cfg.tarball_storage.s3.expect("s3");
+            assert_eq!(s3.bucket, "env-bucket");
+            assert_eq!(s3.region, "eu-west-1");
+            assert_eq!(cfg.auth_plugin.backend, AuthBackend::Http);
+            let http = cfg.auth_plugin.http.expect("http");
+            assert_eq!(http.base_url, "http://auth-from-env");
+        },
+    );
+}
+
+fn with_env_vars(vars: &[(&str, Option<&str>)], run: impl FnOnce()) {
+    let _guard = ENV_LOCK.lock().expect("env lock");
+    let keys = vars
+        .iter()
+        .map(|(key, _)| key.to_string())
+        .collect::<HashSet<_>>();
+    let previous = keys
+        .iter()
+        .map(|key| (key.clone(), std::env::var(key).ok()))
+        .collect::<Vec<_>>();
+
+    for (key, value) in vars {
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+
+    for (key, value) in previous {
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(&key, value),
+                None => std::env::remove_var(&key),
+            }
+        }
+    }
+
+    if let Err(payload) = run_result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+fn without_config_env(run: impl FnOnce()) {
+    with_env_vars(
+        &[
+            ("RUSTACCIO_BIND", None),
+            ("RUSTACCIO_DATA_DIR", None),
+            ("RUSTACCIO_CONFIG", None),
+            ("RUSTACCIO_UPSTREAM", None),
+            ("RUSTACCIO_WEB_LOGIN", None),
+            ("RUSTACCIO_WEB_ENABLE", None),
+            ("RUSTACCIO_WEB_TITLE", None),
+            ("RUSTACCIO_PUBLISH_CHECK_OWNERS", None),
+            ("RUSTACCIO_PASSWORD_MIN", None),
+            ("RUSTACCIO_LOGIN_SESSION_TTL_SECONDS", None),
+            ("RUSTACCIO_MAX_BODY_SIZE", None),
+            ("RUSTACCIO_AUDIT_ENABLED", None),
+            ("RUSTACCIO_URL_PREFIX", None),
+            ("RUSTACCIO_TRUST_PROXY", None),
+            ("RUSTACCIO_KEEP_ALIVE_TIMEOUT", None),
+            ("RUSTACCIO_LOG_LEVEL", None),
+            ("RUSTACCIO_AUTH_BACKEND", None),
+            ("RUSTACCIO_AUTH_EXTERNAL_MODE", None),
+            ("RUSTACCIO_AUTH_HTTP_BASE_URL", None),
+            ("RUSTACCIO_AUTH_HTTP_ADDUSER_ENDPOINT", None),
+            ("RUSTACCIO_AUTH_HTTP_LOGIN_ENDPOINT", None),
+            ("RUSTACCIO_AUTH_HTTP_CHANGE_PASSWORD_ENDPOINT", None),
+            ("RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT", None),
+            ("RUSTACCIO_AUTH_HTTP_ALLOW_ACCESS_ENDPOINT", None),
+            ("RUSTACCIO_AUTH_HTTP_ALLOW_PUBLISH_ENDPOINT", None),
+            ("RUSTACCIO_AUTH_HTTP_ALLOW_UNPUBLISH_ENDPOINT", None),
+            ("RUSTACCIO_AUTH_HTTP_TIMEOUT_MS", None),
+            ("RUSTACCIO_TARBALL_BACKEND", None),
+            ("RUSTACCIO_S3_BUCKET", None),
+            ("RUSTACCIO_S3_REGION", None),
+            ("RUSTACCIO_S3_ENDPOINT", None),
+            ("RUSTACCIO_S3_ACCESS_KEY_ID", None),
+            ("RUSTACCIO_S3_SECRET_ACCESS_KEY", None),
+            ("RUSTACCIO_S3_PREFIX", None),
+            ("RUSTACCIO_S3_FORCE_PATH_STYLE", None),
+        ],
+        run,
+    );
 }

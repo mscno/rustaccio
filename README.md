@@ -44,6 +44,7 @@ cargo run -- --help
 
 `--config` loads the given YAML file and fails fast if the file cannot be read or parsed.
 `RUSTACCIO_CONFIG` remains available as an environment-variable alternative.
+Merge precedence is: defaults < `RUSTACCIO_CONFIG` file < `--config` file < environment variables.
 
 `main` now delegates to library runtime (`rustaccio::runtime::run_from_env()`), so the same code path is used for standalone and embedded usage.
 

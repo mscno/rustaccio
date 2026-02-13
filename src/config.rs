@@ -388,59 +388,6 @@ impl Config {
         }
     }
 
-    fn apply_s3_env_overrides(mut storage: TarballStorageConfig) -> TarballStorageConfig {
-        if storage.backend != TarballStorageBackend::S3 {
-            return storage;
-        }
-
-        let mut s3 = storage.s3.unwrap_or(S3TarballStorageConfig {
-            bucket: String::new(),
-            region: "us-east-1".to_string(),
-            endpoint: None,
-            access_key_id: None,
-            secret_access_key: None,
-            prefix: String::new(),
-            force_path_style: true,
-        });
-
-        if let Ok(value) = env::var("RUSTACCIO_S3_BUCKET")
-            && !value.is_empty()
-        {
-            s3.bucket = value;
-        }
-        if let Ok(value) = env::var("RUSTACCIO_S3_REGION")
-            && !value.is_empty()
-        {
-            s3.region = value;
-        }
-        if let Ok(value) = env::var("RUSTACCIO_S3_ENDPOINT")
-            && !value.is_empty()
-        {
-            s3.endpoint = Some(value);
-        }
-        if let Ok(value) = env::var("RUSTACCIO_S3_ACCESS_KEY_ID")
-            && !value.is_empty()
-        {
-            s3.access_key_id = Some(value);
-        }
-        if let Ok(value) = env::var("RUSTACCIO_S3_SECRET_ACCESS_KEY")
-            && !value.is_empty()
-        {
-            s3.secret_access_key = Some(value);
-        }
-        if let Ok(value) = env::var("RUSTACCIO_S3_PREFIX") {
-            s3.prefix = value;
-        }
-        if let Ok(value) = env::var("RUSTACCIO_S3_FORCE_PATH_STYLE")
-            && let Ok(parsed) = value.parse::<bool>()
-        {
-            s3.force_path_style = parsed;
-        }
-
-        storage.s3 = Some(s3);
-        storage
-    }
-
     pub fn from_yaml_file(path: PathBuf) -> Result<Self, String> {
         let text = std::fs::read_to_string(&path)
             .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
@@ -539,107 +486,34 @@ impl Config {
     }
 }
 
-fn parse_auth_from_env() -> AuthPluginConfig {
-    let backend = env::var("RUSTACCIO_AUTH_BACKEND")
-        .ok()
-        .map(|v| AuthBackend::from_str(&v))
-        .unwrap_or(AuthBackend::Local);
-    let external_mode = env::var("RUSTACCIO_AUTH_EXTERNAL_MODE")
-        .ok()
-        .and_then(|v| v.parse::<bool>().ok())
-        .unwrap_or(false);
-
-    match backend {
-        AuthBackend::Local => AuthPluginConfig {
-            backend,
-            external_mode,
-            http: None,
-        },
-        AuthBackend::Http => {
-            let base_url = env::var("RUSTACCIO_AUTH_HTTP_BASE_URL").unwrap_or_default();
-            let add_user_endpoint = env::var("RUSTACCIO_AUTH_HTTP_ADDUSER_ENDPOINT")
-                .unwrap_or_else(|_| "/adduser".to_string());
-            let login_endpoint = env::var("RUSTACCIO_AUTH_HTTP_LOGIN_ENDPOINT")
-                .unwrap_or_else(|_| "/authenticate".to_string());
-            let change_password_endpoint = env::var("RUSTACCIO_AUTH_HTTP_CHANGE_PASSWORD_ENDPOINT")
-                .unwrap_or_else(|_| "/change-password".to_string());
-            let request_auth_endpoint = env::var("RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT")
-                .ok()
-                .filter(|v| !v.is_empty());
-            let allow_access_endpoint = env::var("RUSTACCIO_AUTH_HTTP_ALLOW_ACCESS_ENDPOINT")
-                .ok()
-                .filter(|v| !v.is_empty());
-            let allow_publish_endpoint = env::var("RUSTACCIO_AUTH_HTTP_ALLOW_PUBLISH_ENDPOINT")
-                .ok()
-                .filter(|v| !v.is_empty());
-            let allow_unpublish_endpoint = env::var("RUSTACCIO_AUTH_HTTP_ALLOW_UNPUBLISH_ENDPOINT")
-                .ok()
-                .filter(|v| !v.is_empty());
-            let timeout_ms = env::var("RUSTACCIO_AUTH_HTTP_TIMEOUT_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(5_000);
-
-            AuthPluginConfig {
-                backend,
-                external_mode,
-                http: Some(HttpAuthPluginConfig {
-                    base_url,
-                    add_user_endpoint,
-                    login_endpoint,
-                    change_password_endpoint,
-                    request_auth_endpoint,
-                    allow_access_endpoint,
-                    allow_publish_endpoint,
-                    allow_unpublish_endpoint,
-                    timeout_ms,
-                }),
-            }
-        }
+fn default_http_auth_config() -> HttpAuthPluginConfig {
+    HttpAuthPluginConfig {
+        base_url: String::new(),
+        add_user_endpoint: "/adduser".to_string(),
+        login_endpoint: "/authenticate".to_string(),
+        change_password_endpoint: "/change-password".to_string(),
+        request_auth_endpoint: None,
+        allow_access_endpoint: None,
+        allow_publish_endpoint: None,
+        allow_unpublish_endpoint: None,
+        timeout_ms: 5_000,
     }
 }
 
-fn parse_storage_from_env() -> TarballStorageConfig {
-    let backend = env::var("RUSTACCIO_TARBALL_BACKEND")
-        .ok()
-        .map(|v| TarballStorageBackend::from_str(&v))
-        .unwrap_or(TarballStorageBackend::Local);
-
-    match backend {
-        TarballStorageBackend::Local => TarballStorageConfig::default(),
-        TarballStorageBackend::S3 => {
-            let bucket = env::var("RUSTACCIO_S3_BUCKET").unwrap_or_default();
-            let region =
-                env::var("RUSTACCIO_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
-            let endpoint = env::var("RUSTACCIO_S3_ENDPOINT")
-                .ok()
-                .filter(|v| !v.is_empty());
-            let access_key_id = env::var("RUSTACCIO_S3_ACCESS_KEY_ID")
-                .ok()
-                .filter(|v| !v.is_empty());
-            let secret_access_key = env::var("RUSTACCIO_S3_SECRET_ACCESS_KEY")
-                .ok()
-                .filter(|v| !v.is_empty());
-            let prefix = env::var("RUSTACCIO_S3_PREFIX").unwrap_or_default();
-            let force_path_style = env::var("RUSTACCIO_S3_FORCE_PATH_STYLE")
-                .ok()
-                .and_then(|v| v.parse::<bool>().ok())
-                .unwrap_or(true);
-
-            TarballStorageConfig {
-                backend,
-                s3: Some(S3TarballStorageConfig {
-                    bucket,
-                    region,
-                    endpoint,
-                    access_key_id,
-                    secret_access_key,
-                    prefix,
-                    force_path_style,
-                }),
-            }
-        }
+fn default_s3_storage_config() -> S3TarballStorageConfig {
+    S3TarballStorageConfig {
+        bucket: String::new(),
+        region: "us-east-1".to_string(),
+        endpoint: None,
+        access_key_id: None,
+        secret_access_key: None,
+        prefix: String::new(),
+        force_path_style: true,
     }
+}
+
+fn empty_string_to_none(value: String) -> Option<String> {
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn parse_auth_from_yaml(auth: Option<YamlAuth>) -> Result<AuthPluginConfig, String> {
