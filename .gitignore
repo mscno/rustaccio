@@ -3,3 +3,5 @@
 config.yml
 verdaccio
 .rustaccio-data
+tmp
+local
