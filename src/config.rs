@@ -183,6 +183,14 @@ impl Config {
             self.bind = bind;
             self.listen = vec![bind.to_string()];
         }
+        // PaaS compatibility: honor injected PORT (e.g. Railway) and force a public bind address.
+        if let Ok(raw_port) = env::var("PORT")
+            && let Ok(port) = raw_port.parse::<u16>()
+        {
+            let bind = SocketAddr::from(([0, 0, 0, 0], port));
+            self.bind = bind;
+            self.listen = vec![bind.to_string()];
+        }
 
         if let Ok(raw_data_dir) = env::var("RUSTACCIO_DATA_DIR") {
             self.data_dir = PathBuf::from(raw_data_dir);

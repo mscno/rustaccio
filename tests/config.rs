@@ -181,6 +181,28 @@ fn from_env_with_config_file_errors_for_missing_path() {
 }
 
 #[test]
+fn from_env_uses_port_env_for_platform_compatibility() {
+    with_env_vars(&[("RUSTACCIO_BIND", None), ("PORT", Some("6123"))], || {
+        let cfg = Config::from_env();
+        assert_eq!(cfg.listen, vec!["0.0.0.0:6123".to_string()]);
+    });
+}
+
+#[test]
+fn port_env_overrides_rustaccio_bind() {
+    with_env_vars(
+        &[
+            ("RUSTACCIO_BIND", Some("127.0.0.1:4999")),
+            ("PORT", Some("6123")),
+        ],
+        || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.listen, vec!["0.0.0.0:6123".to_string()]);
+        },
+    );
+}
+
+#[test]
 fn merge_precedence_defaults_then_files_then_env() {
     let mut env_file = tempfile::NamedTempFile::new().expect("temp file");
     writeln!(
@@ -219,6 +241,7 @@ store:
     with_env_vars(
         &[
             ("RUSTACCIO_BIND", None),
+            ("PORT", None),
             ("RUSTACCIO_DATA_DIR", None),
             (
                 "RUSTACCIO_CONFIG",
@@ -315,6 +338,7 @@ fn without_config_env(run: impl FnOnce()) {
     with_env_vars(
         &[
             ("RUSTACCIO_BIND", None),
+            ("PORT", None),
             ("RUSTACCIO_DATA_DIR", None),
             ("RUSTACCIO_CONFIG", None),
             ("RUSTACCIO_UPSTREAM", None),
