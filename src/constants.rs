@@ -24,6 +24,7 @@ pub const API_ERROR_VERSION_NOT_EXIST: &str = "this version doesn't exist";
 pub const API_ERROR_PROFILE_ERROR: &str = "profile unexpected error";
 pub const API_ERROR_PARAMETERS_NOT_VALID: &str = "the parameters are not valid";
 pub const API_ERROR_TFA_DISABLED: &str = "the two-factor authentication is not yet supported";
+pub const API_ERROR_SERVER_TIME_OUT: &str = "one of the uplinks is down, refuse to serve request";
 
 pub const HEADER_JSON: &str = "application/json; charset=utf-8";
 pub const HEADER_JSON_INSTALL: &str = "application/vnd.npm.install-v1+json; charset=utf-8";

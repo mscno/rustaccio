@@ -6,7 +6,7 @@ use crate::{
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use axum::http::StatusCode;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 use tracing::{debug, instrument, warn};
 
 #[cfg(feature = "s3")]
@@ -107,6 +107,14 @@ impl TarballBackend {
         }
     }
 
+    pub async fn list_packages(&self) -> Result<Vec<String>, RegistryError> {
+        match self {
+            Self::Local(backend) => backend.list_packages().await,
+            #[cfg(feature = "s3")]
+            Self::S3(backend) => backend.list_packages().await,
+        }
+    }
+
     pub fn supports_shared_state_snapshot(&self) -> bool {
         match self {
             Self::Local(_) => false,
@@ -139,6 +147,26 @@ impl TarballBackend {
             Self::Local(backend) => backend.read_package_metadata(package).await,
             #[cfg(feature = "s3")]
             Self::S3(backend) => backend.read_package_metadata(package).await,
+        }
+    }
+
+    pub async fn write_package_metadata(
+        &self,
+        package: &str,
+        metadata: &Value,
+    ) -> Result<(), RegistryError> {
+        match self {
+            Self::Local(backend) => backend.write_package_metadata(package, metadata).await,
+            #[cfg(feature = "s3")]
+            Self::S3(backend) => backend.write_package_metadata(package, metadata).await,
+        }
+    }
+
+    pub async fn load_legacy_package_index(&self) -> Result<Option<Vec<String>>, RegistryError> {
+        match self {
+            Self::Local(_) => Ok(None),
+            #[cfg(feature = "s3")]
+            Self::S3(backend) => backend.load_legacy_package_index().await,
         }
     }
 }
@@ -245,6 +273,21 @@ impl LocalTarballBackend {
         Ok(out)
     }
 
+    pub async fn list_packages(&self) -> Result<Vec<String>, RegistryError> {
+        let mut out = Vec::new();
+        let mut package_dirs = tokio::fs::read_dir(&self.root).await?;
+
+        while let Some(package_dir) = package_dirs.next_entry().await? {
+            if !package_dir.file_type().await?.is_dir() {
+                continue;
+            }
+            let encoded = package_dir.file_name().to_string_lossy().to_string();
+            out.push(Self::package_name(&encoded));
+        }
+
+        Ok(out)
+    }
+
     pub async fn read_package_metadata(
         &self,
         package: &str,
@@ -260,6 +303,23 @@ impl LocalTarballBackend {
         let parsed = serde_json::from_slice::<Value>(&bytes).ok();
         Ok(parsed.filter(Value::is_object))
     }
+
+    pub async fn write_package_metadata(
+        &self,
+        package: &str,
+        metadata: &Value,
+    ) -> Result<(), RegistryError> {
+        let path = self
+            .root
+            .join(Self::package_dir(package))
+            .join("package.json");
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let bytes = serde_json::to_vec_pretty(metadata)?;
+        tokio::fs::write(path, bytes).await?;
+        Ok(())
+    }
 }
 
 #[cfg(feature = "s3")]
@@ -274,6 +334,7 @@ pub struct S3TarballBackend {
 impl S3TarballBackend {
     const SHARED_STATE_PACKAGE: &'static str = "__rustaccio_meta";
     const SHARED_STATE_FILENAME: &'static str = "state.json";
+    const LEGACY_VERDACCIO_DB_FILENAME: &'static str = "verdaccio-s3-db.json";
 
     #[instrument(skip(cfg), fields(bucket = cfg.bucket, region = cfg.region, endpoint = cfg.endpoint.as_deref().unwrap_or("<aws-default>")))]
     pub async fn new(cfg: &S3TarballStorageConfig) -> Result<Self, RegistryError> {
@@ -413,6 +474,18 @@ impl S3TarballBackend {
             if !keys.iter().any(|existing| existing == &key) {
                 keys.push(key);
             }
+        }
+        keys
+    }
+
+    fn candidate_keys_for_legacy_index(&self) -> Vec<String> {
+        let mut keys = vec![format!(
+            "{}{}",
+            self.prefix,
+            Self::LEGACY_VERDACCIO_DB_FILENAME
+        )];
+        if !self.prefix.is_empty() {
+            keys.push(Self::LEGACY_VERDACCIO_DB_FILENAME.to_string());
         }
         keys
     }
@@ -587,6 +660,49 @@ impl S3TarballBackend {
         Ok(out)
     }
 
+    pub async fn list_packages(&self) -> Result<Vec<String>, RegistryError> {
+        let mut continuation: Option<String> = None;
+        let mut packages = HashSet::new();
+
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(self.prefix.clone());
+            if let Some(token) = continuation.clone() {
+                request = request.continuation_token(token);
+            }
+
+            let response = request
+                .send()
+                .await
+                .map_err(|err| map_s3_sdk_error("list_objects_v2", &err))?;
+            for object in response.contents() {
+                let Some(key) = object.key() else {
+                    continue;
+                };
+                if let Some(reference) = self.parse_ref_from_key(key) {
+                    packages.insert(reference.package);
+                    continue;
+                }
+                if let Some(package) = parse_package_from_metadata_object_key(&self.prefix, key) {
+                    packages.insert(package);
+                }
+            }
+
+            if response.is_truncated.unwrap_or(false) {
+                continuation = response.next_continuation_token;
+            } else {
+                break;
+            }
+        }
+
+        let mut out = packages.into_iter().collect::<Vec<_>>();
+        out.sort();
+        Ok(out)
+    }
+
     pub async fn get_state_snapshot(&self) -> Result<Option<Vec<u8>>, RegistryError> {
         self.get(Self::SHARED_STATE_PACKAGE, Self::SHARED_STATE_FILENAME)
             .await
@@ -612,6 +728,48 @@ impl S3TarballBackend {
             let parsed = serde_json::from_slice::<Value>(&bytes).ok();
             if let Some(value) = parsed.filter(Value::is_object) {
                 return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn write_package_metadata(
+        &self,
+        package: &str,
+        metadata: &Value,
+    ) -> Result<(), RegistryError> {
+        let key = self.verdaccio_plain_key(package, "package.json");
+        let body = serde_json::to_vec_pretty(metadata)?;
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(aws_sdk_s3::primitives::ByteStream::from(body))
+            .send()
+            .await
+            .map_err(|err| map_s3_sdk_error("put_object", &err))?;
+        Ok(())
+    }
+
+    pub async fn load_legacy_package_index(&self) -> Result<Option<Vec<String>>, RegistryError> {
+        for key in self.candidate_keys_for_legacy_index() {
+            let Some(bytes) = self.get_by_key(&key).await? else {
+                continue;
+            };
+            let parsed = serde_json::from_slice::<Value>(&bytes).ok();
+            let list = parsed
+                .as_ref()
+                .and_then(|value| value.get("list"))
+                .and_then(Value::as_array)
+                .map(|array| {
+                    array
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>()
+                });
+            if let Some(packages) = list {
+                return Ok(Some(packages));
             }
         }
         Ok(None)
@@ -665,6 +823,29 @@ fn parse_tarball_ref_from_object_key(prefix: &str, key: &str) -> Option<TarballR
         package,
         filename: filename.to_string(),
     })
+}
+
+#[cfg(feature = "s3")]
+fn parse_package_from_metadata_object_key(prefix: &str, key: &str) -> Option<String> {
+    let rest = key.strip_prefix(prefix)?.trim_matches('/');
+    if rest.is_empty() || !rest.ends_with("/package.json") {
+        return None;
+    }
+    let package_raw = rest.strip_suffix("/package.json")?;
+    if package_raw.is_empty() {
+        return None;
+    }
+
+    let decoded = urlencoding::decode(package_raw)
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|_| package_raw.to_string());
+    if decoded.contains('/') {
+        return Some(decoded);
+    }
+    if decoded.contains("__") {
+        return Some(decoded.replace("__", "/"));
+    }
+    Some(decoded)
 }
 
 #[cfg(feature = "s3")]
@@ -763,7 +944,9 @@ fn is_not_found<E>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
 
 #[cfg(all(test, feature = "s3"))]
 mod tests {
-    use super::{TarballRef, parse_tarball_ref_from_object_key};
+    use super::{
+        TarballRef, parse_package_from_metadata_object_key, parse_tarball_ref_from_object_key,
+    };
 
     #[test]
     fn parses_rustaccio_legacy_key_layout() {
@@ -802,5 +985,19 @@ mod tests {
                 filename: "pkg-1.2.3.tgz".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn parses_verdaccio_package_metadata_layout() {
+        let key = "registry/@scope/pkg/package.json";
+        let parsed = parse_package_from_metadata_object_key("registry/", key);
+        assert_eq!(parsed.as_deref(), Some("@scope/pkg"));
+    }
+
+    #[test]
+    fn parses_verdaccio_encoded_package_metadata_layout() {
+        let key = "registry/%40scope%2fpkg/package.json";
+        let parsed = parse_package_from_metadata_object_key("registry/", key);
+        assert_eq!(parsed.as_deref(), Some("@scope/pkg"));
     }
 }

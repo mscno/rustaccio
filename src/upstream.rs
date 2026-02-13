@@ -1,4 +1,4 @@
-use crate::error::RegistryError;
+use crate::{constants::API_ERROR_SERVER_TIME_OUT, error::RegistryError};
 use axum::http::{Method, StatusCode};
 use reqwest::Client;
 use serde_json::Value;
@@ -29,13 +29,30 @@ impl Upstream {
     pub async fn fetch_package(&self, package_name: &str) -> Result<Option<Value>, RegistryError> {
         let encoded = urlencoding::encode(package_name);
         let url = format!("{}/{}", self.base_url, encoded);
-        let resp = self.client.get(url).send().await.map_err(|_| {
-            warn!("uplink package request failed");
-            RegistryError::http(StatusCode::BAD_GATEWAY, "uplink is offline")
-        })?;
+        let resp = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(map_uplink_request_err)?;
         if resp.status() == StatusCode::NOT_FOUND {
             debug!("package not found upstream");
             return Ok(None);
+        }
+        if resp.status() == StatusCode::NOT_MODIFIED {
+            debug!("package not modified upstream");
+            return Ok(None);
+        }
+        if matches!(
+            resp.status(),
+            StatusCode::REQUEST_TIMEOUT
+                | StatusCode::GATEWAY_TIMEOUT
+                | StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            return Err(RegistryError::http(
+                StatusCode::SERVICE_UNAVAILABLE,
+                API_ERROR_SERVER_TIME_OUT,
+            ));
         }
         if !resp.status().is_success() {
             warn!(
@@ -63,12 +80,25 @@ impl Upstream {
         } else {
             format!("{}/-/v1/search?{}", self.base_url, query)
         };
-        let resp = self.client.get(url).send().await.map_err(|_| {
-            warn!("uplink search request failed");
-            RegistryError::http(StatusCode::BAD_GATEWAY, "uplink is offline")
-        })?;
+        let resp = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(map_uplink_request_err)?;
         if resp.status() == StatusCode::NOT_FOUND {
             return Ok(Vec::new());
+        }
+        if matches!(
+            resp.status(),
+            StatusCode::REQUEST_TIMEOUT
+                | StatusCode::GATEWAY_TIMEOUT
+                | StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            return Err(RegistryError::http(
+                StatusCode::SERVICE_UNAVAILABLE,
+                API_ERROR_SERVER_TIME_OUT,
+            ));
         }
         if !resp.status().is_success() {
             warn!(
@@ -93,13 +123,26 @@ impl Upstream {
 
     #[instrument(skip(self), fields(upstream = %self.base_url))]
     pub async fn fetch_tarball(&self, tarball_url: &str) -> Result<Option<Vec<u8>>, RegistryError> {
-        let resp = self.client.get(tarball_url).send().await.map_err(|_| {
-            warn!("uplink tarball request failed");
-            RegistryError::http(StatusCode::BAD_GATEWAY, "uplink is offline")
-        })?;
+        let resp = self
+            .client
+            .get(tarball_url)
+            .send()
+            .await
+            .map_err(map_uplink_request_err)?;
 
         if resp.status() == StatusCode::NOT_FOUND {
             return Ok(None);
+        }
+        if matches!(
+            resp.status(),
+            StatusCode::REQUEST_TIMEOUT
+                | StatusCode::GATEWAY_TIMEOUT
+                | StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            return Err(RegistryError::http(
+                StatusCode::SERVICE_UNAVAILABLE,
+                API_ERROR_SERVER_TIME_OUT,
+            ));
         }
 
         if !resp.status().is_success() {
@@ -166,10 +209,7 @@ impl Upstream {
             .request(req_method, url)
             .send()
             .await
-            .map_err(|_| {
-                warn!("uplink passthrough request failed");
-                RegistryError::http(StatusCode::BAD_GATEWAY, "uplink is offline")
-            })?;
+            .map_err(map_uplink_request_err)?;
         if resp.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -234,4 +274,12 @@ impl Upstream {
             filename
         )
     }
+}
+
+fn map_uplink_request_err(err: reqwest::Error) -> RegistryError {
+    warn!(error = %err, "uplink request failed");
+    if err.is_timeout() {
+        return RegistryError::http(StatusCode::SERVICE_UNAVAILABLE, API_ERROR_SERVER_TIME_OUT);
+    }
+    RegistryError::http(StatusCode::BAD_GATEWAY, "uplink is offline")
 }

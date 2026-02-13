@@ -339,6 +339,16 @@ fn pkg_manifest(pkg: &str, version: &str, tarball_filename: &str, data: &[u8]) -
     })
 }
 
+fn looks_like_verdaccio_revision(value: &str) -> bool {
+    let Some((counter, suffix)) = value.split_once('-') else {
+        return false;
+    };
+    !counter.is_empty()
+        && counter.chars().all(|c| c.is_ascii_digit())
+        && suffix.len() == 32
+        && suffix.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 async fn create_user(app: &axum::Router, name: &str, password: &str) -> String {
     let req = Request::builder()
         .method(Method::PUT)
@@ -1589,6 +1599,7 @@ async fn owner_and_star_flows() {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    assert!(looks_like_verdaccio_revision(&rev));
     let maintainers = body
         .get("maintainers")
         .and_then(Value::as_array)
@@ -1743,6 +1754,82 @@ async fn scoped_and_encoded_package_routes() {
 }
 
 #[tokio::test]
+async fn install_v1_manifest_strips_non_install_fields() {
+    let dir = TempDir::new().expect("dir");
+    let app = test_app(dir.path().to_path_buf(), None).await;
+    let token = create_user(&app, "shape-user", "secret").await;
+
+    let mut manifest = pkg_manifest("shapepkg", "1.0.0", "shapepkg-1.0.0.tgz", b"shape");
+    manifest["versions"]["1.0.0"]["dependencies"] = json!({ "dep-a": "^1.0.0" });
+    manifest["versions"]["1.0.0"]["keywords"] = json!(["should-be-removed"]);
+    manifest["versions"]["1.0.0"]["author"] = json!({ "name": "remove-me" });
+
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri("/shapepkg")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&manifest).expect("payload")))
+        .expect("request");
+    assert_eq!(send(&app, req).await.status(), StatusCode::CREATED);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/shapepkg")
+        .header(header::ACCEPT, "application/vnd.npm.install-v1+json")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert!(body.get("users").is_none());
+    assert!(body.get("_attachments").is_none());
+    assert!(body.get("readme").is_none());
+    assert!(body.get("time").is_some_and(Value::is_object));
+    assert!(body.get("modified").and_then(Value::as_str).is_some());
+
+    let version = body["versions"]["1.0.0"]
+        .as_object()
+        .expect("version object");
+    for key in version.keys() {
+        assert!(matches!(
+            key.as_str(),
+            "name"
+                | "version"
+                | "deprecated"
+                | "bin"
+                | "dist"
+                | "engines"
+                | "funding"
+                | "directories"
+                | "dependencies"
+                | "devDependencies"
+                | "peerDependencies"
+                | "optionalDependencies"
+                | "bundleDependencies"
+                | "cpu"
+                | "os"
+                | "peerDependenciesMeta"
+                | "acceptDependencies"
+                | "_hasShrinkwrap"
+                | "hasInstallScript"
+        ));
+    }
+    assert_eq!(
+        version
+            .get("dependencies")
+            .and_then(Value::as_object)
+            .and_then(|deps| deps.get("dep-a"))
+            .and_then(Value::as_str),
+        Some("^1.0.0")
+    );
+    assert!(version.get("keywords").is_none());
+    assert!(version.get("author").is_none());
+    assert!(version.get("readme").is_none());
+}
+
+#[tokio::test]
 async fn user_and_publish_error_paths() {
     let dir = TempDir::new().expect("dir");
     let app = test_app(dir.path().to_path_buf(), None).await;
@@ -1776,7 +1863,9 @@ async fn user_and_publish_error_paths() {
         .uri("/-/all")
         .body(Body::empty())
         .expect("request");
-    assert_eq!(send(&app, req).await.status(), StatusCode::NOT_FOUND);
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await, json!({}));
 
     let req = Request::builder()
         .method(Method::DELETE)
@@ -1812,6 +1901,8 @@ async fn user_and_publish_error_paths() {
         .expect("request");
     let resp = send(&app, req).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = json_body(resp).await;
+    assert_eq!(body["error"].as_str(), Some("no such file available"));
 
     let req = Request::builder()
         .method(Method::GET)
@@ -1826,6 +1917,62 @@ async fn user_and_publish_error_paths() {
         body["error"].as_str(),
         Some("authorization required to access package dead")
     );
+}
+
+#[tokio::test]
+async fn local_database_routes_return_local_packages_and_since_filter() {
+    let dir = TempDir::new().expect("dir");
+    let app = test_app(dir.path().to_path_buf(), None).await;
+    let token = create_user(&app, "local-index", "secret").await;
+
+    for (name, version, filename, bytes) in [
+        (
+            "aaa-local",
+            "1.0.0",
+            "aaa-local-1.0.0.tgz",
+            b"aaa".as_slice(),
+        ),
+        (
+            "zzz-local",
+            "2.0.0",
+            "zzz-local-2.0.0.tgz",
+            b"zzz".as_slice(),
+        ),
+    ] {
+        let manifest = pkg_manifest(name, version, filename, bytes);
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/{name}"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&manifest).expect("payload")))
+            .expect("request");
+        assert_eq!(send(&app, req).await.status(), StatusCode::CREATED);
+    }
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/-/all")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["aaa-local"]["name"].as_str(), Some("aaa-local"));
+    assert_eq!(body["aaa-local"]["version"].as_str(), Some("1.0.0"));
+    assert_eq!(body["zzz-local"]["name"].as_str(), Some("zzz-local"));
+    assert_eq!(body["zzz-local"]["version"].as_str(), Some("2.0.0"));
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/-/all/since?since=aaa-local")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert!(body.get("aaa-local").is_none());
+    assert_eq!(body["zzz-local"]["version"].as_str(), Some("2.0.0"));
 }
 
 #[tokio::test]
@@ -2288,6 +2435,7 @@ async fn acl_authenticated_access_filters_package_and_search() {
             publish: vec!["$authenticated".to_string()],
             unpublish: vec!["$authenticated".to_string()],
             proxy: None,
+            uplinks_look: true,
         },
         PackageRule {
             pattern: "**".to_string(),
@@ -2295,6 +2443,7 @@ async fn acl_authenticated_access_filters_package_and_search() {
             publish: vec!["$authenticated".to_string()],
             unpublish: vec!["$authenticated".to_string()],
             proxy: None,
+            uplinks_look: true,
         },
     ];
     let app = test_app_with_rules(dir.path().to_path_buf(), None, rules).await;
@@ -2344,6 +2493,7 @@ async fn acl_user_specific_publish_permission() {
             publish: vec!["jota".to_string()],
             unpublish: vec!["jota".to_string()],
             proxy: None,
+            uplinks_look: true,
         },
         PackageRule::open("**"),
     ];
@@ -2381,6 +2531,7 @@ async fn acl_anonymous_publish_allowed() {
         publish: vec!["$anonymous".to_string()],
         unpublish: vec!["$anonymous".to_string()],
         proxy: None,
+        uplinks_look: true,
     }];
     let app = test_app_with_rules(dir.path().to_path_buf(), None, rules).await;
 
@@ -2443,6 +2594,7 @@ async fn acl_proxy_rule_selects_named_uplink() {
             publish: vec!["$authenticated".to_string()],
             unpublish: vec!["$authenticated".to_string()],
             proxy: Some("b".to_string()),
+            uplinks_look: true,
         },
         PackageRule {
             pattern: "**".to_string(),
@@ -2450,6 +2602,7 @@ async fn acl_proxy_rule_selects_named_uplink() {
             publish: vec!["$authenticated".to_string()],
             unpublish: vec!["$authenticated".to_string()],
             proxy: Some("a".to_string()),
+            uplinks_look: true,
         },
     ];
 
@@ -2463,6 +2616,245 @@ async fn acl_proxy_rule_selects_named_uplink() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
     assert_eq!(body["name"].as_str(), Some("special"));
+}
+
+#[tokio::test]
+async fn uplinks_look_false_with_cache_keeps_local_manifest() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/locked"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "_id": "locked",
+            "name": "locked",
+            "dist-tags": { "latest": "9.0.0" },
+            "versions": {
+                "9.0.0": {
+                    "name": "locked",
+                    "version": "9.0.0",
+                    "dist": { "tarball": format!("{}/locked/-/locked-9.0.0.tgz", upstream.uri()) }
+                }
+            }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let dir = TempDir::new().expect("dir");
+    let mut uplinks = HashMap::new();
+    uplinks.insert("default".to_string(), upstream.uri());
+    let rules = vec![PackageRule {
+        pattern: "locked".to_string(),
+        access: vec!["$all".to_string()],
+        publish: vec!["$authenticated".to_string()],
+        unpublish: vec!["$authenticated".to_string()],
+        proxy: Some("default".to_string()),
+        uplinks_look: false,
+    }];
+    let app = test_app_with_explicit_uplinks(dir.path().to_path_buf(), uplinks, rules, true).await;
+    let token = create_user(&app, "locked-owner", "secret").await;
+
+    let manifest = pkg_manifest("locked", "8.0.0", "locked-8.0.0.tgz", b"local-only");
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri("/locked")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&manifest).expect("payload")))
+        .expect("request");
+    assert_eq!(send(&app, req).await.status(), StatusCode::CREATED);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/locked")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["dist-tags"]["latest"].as_str(), Some("8.0.0"));
+    assert!(body["versions"].get("8.0.0").is_some());
+    assert!(body["versions"].get("9.0.0").is_none());
+
+    let requests = upstream
+        .received_requests()
+        .await
+        .expect("received requests");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() != "/locked"),
+        "uplinksLook=false should prevent remote manifest sync"
+    );
+}
+
+#[tokio::test]
+async fn uplinks_look_false_without_cache_skips_upstream_fetch() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/locked-miss"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "_id": "locked-miss",
+            "name": "locked-miss",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "locked-miss",
+                    "version": "1.0.0",
+                    "dist": { "tarball": format!("{}/locked-miss/-/locked-miss-1.0.0.tgz", upstream.uri()) }
+                }
+            }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let dir = TempDir::new().expect("dir");
+    let mut uplinks = HashMap::new();
+    uplinks.insert("default".to_string(), upstream.uri());
+    let rules = vec![PackageRule {
+        pattern: "locked-miss".to_string(),
+        access: vec!["$all".to_string()],
+        publish: vec!["$authenticated".to_string()],
+        unpublish: vec!["$authenticated".to_string()],
+        proxy: Some("default".to_string()),
+        uplinks_look: false,
+    }];
+    let app = test_app_with_explicit_uplinks(dir.path().to_path_buf(), uplinks, rules, true).await;
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/locked-miss")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = json_body(resp).await;
+    assert_eq!(body["error"].as_str(), Some("no such package available"));
+
+    let requests = upstream
+        .received_requests()
+        .await
+        .expect("received requests");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() != "/locked-miss"),
+        "uplinksLook=false should skip upstream requests when package is uncached"
+    );
+}
+
+#[tokio::test]
+async fn manifest_fetch_falls_back_to_next_uplink_on_transient_error() {
+    let uplink_a = MockServer::start().await;
+    let uplink_b = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/flaky"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&uplink_a)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/flaky"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "_id": "flaky",
+            "name": "flaky",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "flaky",
+                    "version": "1.0.0",
+                    "description": "from-fallback",
+                    "dist": { "tarball": format!("{}/flaky/-/flaky-1.0.0.tgz", uplink_b.uri()) }
+                }
+            }
+        })))
+        .mount(&uplink_b)
+        .await;
+
+    let dir = TempDir::new().expect("dir");
+    let mut uplinks = HashMap::new();
+    uplinks.insert("a".to_string(), uplink_a.uri());
+    uplinks.insert("b".to_string(), uplink_b.uri());
+    let rules = vec![PackageRule {
+        pattern: "**".to_string(),
+        access: vec!["$all".to_string()],
+        publish: vec!["$authenticated".to_string()],
+        unpublish: vec!["$authenticated".to_string()],
+        proxy: Some("a".to_string()),
+        uplinks_look: true,
+    }];
+    let app = test_app_with_explicit_uplinks(dir.path().to_path_buf(), uplinks, rules, true).await;
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/flaky")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["versions"]["1.0.0"]["description"].as_str(),
+        Some("from-fallback")
+    );
+
+    let requests_a = uplink_a
+        .received_requests()
+        .await
+        .expect("received requests a");
+    let requests_b = uplink_b
+        .received_requests()
+        .await
+        .expect("received requests b");
+    assert!(
+        requests_a
+            .iter()
+            .any(|request| request.url.path() == "/flaky")
+    );
+    assert!(
+        requests_b
+            .iter()
+            .any(|request| request.url.path() == "/flaky")
+    );
+}
+
+#[tokio::test]
+async fn manifest_fetch_returns_503_when_all_uplinks_are_down() {
+    let uplink_a = MockServer::start().await;
+    let uplink_b = MockServer::start().await;
+
+    for upstream in [&uplink_a, &uplink_b] {
+        Mock::given(method("GET"))
+            .and(path("/downpkg"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(upstream)
+            .await;
+    }
+
+    let dir = TempDir::new().expect("dir");
+    let mut uplinks = HashMap::new();
+    uplinks.insert("a".to_string(), uplink_a.uri());
+    uplinks.insert("b".to_string(), uplink_b.uri());
+    let rules = vec![PackageRule {
+        pattern: "**".to_string(),
+        access: vec!["$all".to_string()],
+        publish: vec!["$authenticated".to_string()],
+        unpublish: vec!["$authenticated".to_string()],
+        proxy: Some("a".to_string()),
+        uplinks_look: true,
+    }];
+    let app = test_app_with_explicit_uplinks(dir.path().to_path_buf(), uplinks, rules, true).await;
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/downpkg")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["error"].as_str(),
+        Some("one of the uplinks is down, refuse to serve request")
+    );
 }
 
 #[tokio::test]
@@ -2729,6 +3121,86 @@ async fn generic_unmatched_routes_passthrough_to_default_uplink() {
     );
 }
 
+#[tokio::test]
+async fn generic_unmatched_routes_passthrough_falls_back_after_transient_error() {
+    let uplink_a = MockServer::start().await;
+    let uplink_b = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/-/v1/keys"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&uplink_a)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/-/v1/keys"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "keys": [{ "id": "fallback" }]
+        })))
+        .mount(&uplink_b)
+        .await;
+
+    let dir = TempDir::new().expect("dir");
+    let mut uplinks = HashMap::new();
+    uplinks.insert("a".to_string(), uplink_a.uri());
+    uplinks.insert("b".to_string(), uplink_b.uri());
+    let app = test_app_with_explicit_uplinks(
+        dir.path().to_path_buf(),
+        uplinks,
+        vec![PackageRule::open("**")],
+        true,
+    )
+    .await;
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/-/v1/keys")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["keys"][0]["id"].as_str(), Some("fallback"));
+}
+
+#[tokio::test]
+async fn generic_unmatched_routes_passthrough_returns_503_when_all_uplinks_fail() {
+    let uplink_a = MockServer::start().await;
+    let uplink_b = MockServer::start().await;
+
+    for upstream in [&uplink_a, &uplink_b] {
+        Mock::given(method("GET"))
+            .and(path("/-/v1/keys"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(upstream)
+            .await;
+    }
+
+    let dir = TempDir::new().expect("dir");
+    let mut uplinks = HashMap::new();
+    uplinks.insert("a".to_string(), uplink_a.uri());
+    uplinks.insert("b".to_string(), uplink_b.uri());
+    let app = test_app_with_explicit_uplinks(
+        dir.path().to_path_buf(),
+        uplinks,
+        vec![PackageRule::open("**")],
+        true,
+    )
+    .await;
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/-/v1/keys")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["error"].as_str(),
+        Some("one of the uplinks is down, refuse to serve request")
+    );
+}
+
 fn s3_test_config(data_dir: PathBuf, endpoint: String) -> Config {
     Config {
         bind: "127.0.0.1:0".parse().expect("bind"),
@@ -2940,6 +3412,86 @@ async fn s3_mode_persists_shared_state_snapshot_on_mutation() {
 }
 
 #[tokio::test]
+async fn s3_mode_writes_verdaccio_package_sidecar_on_publish() {
+    let s3 = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().starts_with("/registry-test")
+                && request
+                    .url
+                    .query_pairs()
+                    .any(|(k, v)| k == "list-type" && v == "2")
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_s3_list_xml()))
+        .mount(&s3)
+        .await;
+    Mock::given(method("GET"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().starts_with("/registry-test/")
+                && request.url.path().contains("__rustaccio_meta")
+                && request.url.path().ends_with("state.json")
+        })
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&s3)
+        .await;
+    Mock::given(method("PUT"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().starts_with("/registry-test/")
+                && request.url.path().contains("__rustaccio_meta")
+                && request.url.path().ends_with("state.json")
+        })
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&s3)
+        .await;
+    Mock::given(method("PUT"))
+        .and(|request: &wiremock::Request| request.url.path().ends_with(".tgz"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&s3)
+        .await;
+    Mock::given(method("PUT"))
+        .and(|request: &wiremock::Request| {
+            request
+                .url
+                .path()
+                .contains("/registry/sidecar-pkg/package.json")
+        })
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&s3)
+        .await;
+
+    let dir = TempDir::new().expect("dir");
+    let cfg = s3_test_config(dir.path().to_path_buf(), s3.uri());
+    let state = runtime::build_state(&cfg, None).await.expect("state");
+    let app = build_router(state);
+    let token = create_user(&app, "sidecar-writer", "secret").await;
+
+    let manifest = pkg_manifest("sidecar-pkg", "1.0.0", "sidecar-pkg-1.0.0.tgz", b"payload");
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri("/sidecar-pkg")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&manifest).expect("payload")))
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let requests = s3.received_requests().await.expect("received requests");
+    let verdaccio_sidecar_put = requests.iter().any(|request| {
+        request.method.as_str() == "PUT"
+            && request
+                .url
+                .path()
+                .contains("/registry/sidecar-pkg/package.json")
+    });
+    assert!(
+        verdaccio_sidecar_put,
+        "publish should write package sidecar metadata in Verdaccio-compatible layout"
+    );
+}
+
+#[tokio::test]
 async fn s3_mode_indexes_tarballs_without_snapshot_for_search_and_browse() {
     let s3 = MockServer::start().await;
     let tarball_key = "registry/s3-scan/s3-scan-1.2.3.tgz";
@@ -2964,16 +3516,23 @@ async fn s3_mode_indexes_tarballs_without_snapshot_for_search_and_browse() {
         .mount(&s3)
         .await;
 
-    let tarball = npm_tarball_with_package_json(&json!({
+    let package_sidecar = json!({
         "name": "s3-scan",
         "version": "1.2.3",
-        "description": "indexed from tarball package.json",
+        "description": "indexed from sidecar package.json",
         "keywords": ["scan", "s3"],
-        "author": { "name": "scan-bot", "email": "bot@example.com" }
-    }));
+        "author": { "name": "scan-bot", "email": "bot@example.com" },
+        "versions": {
+            "1.2.3": {
+                "name": "s3-scan",
+                "version": "1.2.3",
+                "description": "indexed from sidecar package.json",
+            }
+        }
+    });
     Mock::given(method("GET"))
-        .and(|request: &wiremock::Request| request.url.path().contains("s3-scan-1.2.3.tgz"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball))
+        .and(|request: &wiremock::Request| request.url.path().contains("s3-scan/package.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(package_sidecar))
         .mount(&s3)
         .await;
 
@@ -3013,10 +3572,8 @@ async fn s3_mode_indexes_tarballs_without_snapshot_for_search_and_browse() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
     assert_eq!(body["name"].as_str(), Some("s3-scan"));
-    assert_eq!(
-        body["versions"]["1.2.3"]["description"].as_str(),
-        Some("indexed from tarball package.json")
-    );
+    assert_eq!(body["versions"]["1.2.3"]["name"].as_str(), Some("s3-scan"));
+    assert_eq!(body["versions"]["1.2.3"]["version"].as_str(), Some("1.2.3"));
 }
 
 #[tokio::test]

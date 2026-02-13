@@ -1,7 +1,8 @@
 use crate::{
     app::AppState,
     constants::{
-        ANONYMOUS_USER, API_ERROR_ONLY_OWNER, HEADER_JSON, HEADER_JSON_INSTALL, HEADER_OCTET,
+        ANONYMOUS_USER, API_ERROR_ONLY_OWNER, API_ERROR_SERVER_TIME_OUT, HEADER_JSON,
+        HEADER_JSON_INSTALL, HEADER_OCTET,
     },
     error::RegistryError,
     models::AuthIdentity,
@@ -69,12 +70,20 @@ pub async fn dispatch(
         ));
     }
 
-    if path == "/-/all" || path == "/-/all/since" {
-        return Ok(json_response(
-            StatusCode::NOT_FOUND,
-            json!({"error": "not found, endpoint was removed"}),
-            HEADER_JSON,
-        ));
+    if method == Method::POST && path == "/-/admin/reindex" {
+        ensure_admin_authenticated(auth_user.as_deref())?;
+        let body = state.store.reindex_from_backend().await?;
+        return Ok(json_response(StatusCode::OK, body, HEADER_JSON));
+    }
+
+    if method == Method::GET && path == "/-/admin/storage-health" {
+        ensure_admin_authenticated(auth_user.as_deref())?;
+        let body = state.store.storage_health().await?;
+        return Ok(json_response(StatusCode::OK, body, HEADER_JSON));
+    }
+
+    if method == Method::GET && (path == "/-/all" || path == "/-/all/since") {
+        return Ok(local_database_response(&state, query.as_deref()).await);
     }
 
     if path == "/-/v1/search" && method == Method::GET {
@@ -83,20 +92,26 @@ pub async fn dispatch(
 
     if path == "/-/npm/v1/security/advisories/bulk" && method == Method::POST {
         let payload = parse_json_body(&read_body(req, state.max_body_size).await?)?;
-        if let Some(upstream) = select_default_uplink(&state)
-            && let Some(body) = upstream.post_security_advisories_bulk(&payload).await?
-        {
-            return Ok(json_response(StatusCode::OK, body, HEADER_JSON));
+        for upstream in select_default_uplinks(&state) {
+            match upstream.post_security_advisories_bulk(&payload).await {
+                Ok(Some(body)) => return Ok(json_response(StatusCode::OK, body, HEADER_JSON)),
+                Ok(None) => continue,
+                Err(err) if is_uplink_transient_error(&err) => continue,
+                Err(err) => return Err(err),
+            }
         }
         return Ok(json_response(StatusCode::OK, json!({}), HEADER_JSON));
     }
 
     if path == "/-/npm/v1/security/audits/quick" && method == Method::POST {
         let payload = parse_json_body(&read_body(req, state.max_body_size).await?)?;
-        if let Some(upstream) = select_default_uplink(&state)
-            && let Some(body) = upstream.post_security_audits_quick(&payload).await?
-        {
-            return Ok(json_response(StatusCode::OK, body, HEADER_JSON));
+        for upstream in select_default_uplinks(&state) {
+            match upstream.post_security_audits_quick(&payload).await {
+                Ok(Some(body)) => return Ok(json_response(StatusCode::OK, body, HEADER_JSON)),
+                Ok(None) => continue,
+                Err(err) if is_uplink_transient_error(&err) => continue,
+                Err(err) => return Err(err),
+            }
         }
         return Ok(json_response(
             StatusCode::OK,
@@ -107,10 +122,13 @@ pub async fn dispatch(
 
     if path == "/-/npm/v1/security/audits" && method == Method::POST {
         let payload = parse_json_body(&read_body(req, state.max_body_size).await?)?;
-        if let Some(upstream) = select_default_uplink(&state)
-            && let Some(body) = upstream.post_security_audits(&payload).await?
-        {
-            return Ok(json_response(StatusCode::OK, body, HEADER_JSON));
+        for upstream in select_default_uplinks(&state) {
+            match upstream.post_security_audits(&payload).await {
+                Ok(Some(body)) => return Ok(json_response(StatusCode::OK, body, HEADER_JSON)),
+                Ok(None) => continue,
+                Err(err) if is_uplink_transient_error(&err) => continue,
+                Err(err) => return Err(err),
+            }
         }
         return Ok(json_response(
             StatusCode::OK,
@@ -457,12 +475,30 @@ pub async fn dispatch(
         .await;
     }
 
-    if let Some(upstream) = select_default_uplink(&state)
-        && let Some(proxy) = upstream
+    let mut upstream_error = false;
+    for upstream in select_default_uplinks(&state) {
+        match upstream
             .passthrough_request(&method, &path, query.as_deref())
-            .await?
-    {
-        return Ok(proxy_response(proxy));
+            .await
+        {
+            Ok(Some(proxy)) if is_transient_uplink_status(proxy.status) => {
+                upstream_error = true;
+                continue;
+            }
+            Ok(Some(proxy)) => return Ok(proxy_response(proxy)),
+            Ok(None) => continue,
+            Err(err) if is_uplink_transient_error(&err) => {
+                upstream_error = true;
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    if upstream_error {
+        return Err(RegistryError::http(
+            StatusCode::SERVICE_UNAVAILABLE,
+            API_ERROR_SERVER_TIME_OUT,
+        ));
     }
 
     warn!("route not found");
@@ -732,24 +768,38 @@ async fn handle_get_tarball(
         }
     }
 
-    if let Some(upstream) = select_uplink_for_package(state, package_name) {
+    let mut upstream_error = false;
+    for upstream in select_uplinks_for_package(state, package_name) {
         let url = state
             .store
             .upstream_tarball_url(package_name, filename)
             .await
             .unwrap_or_else(|| upstream.default_tarball_url(package_name, filename));
 
-        if let Some(bytes) = upstream.fetch_tarball(&url).await? {
-            state
-                .store
-                .set_upstream_tarball_url(package_name, filename, url)
-                .await?;
-            state
-                .store
-                .cache_tarball(package_name, filename, &bytes)
-                .await?;
-            return Ok(bytes_response(StatusCode::OK, bytes));
+        match upstream.fetch_tarball(&url).await {
+            Ok(Some(bytes)) => {
+                state
+                    .store
+                    .set_upstream_tarball_url(package_name, filename, url)
+                    .await?;
+                state
+                    .store
+                    .cache_tarball(package_name, filename, &bytes)
+                    .await?;
+                return Ok(bytes_response(StatusCode::OK, bytes));
+            }
+            Ok(None) => continue,
+            Err(err) if is_uplink_transient_error(&err) => {
+                upstream_error = true;
+            }
+            Err(err) => return Err(err),
         }
+    }
+    if upstream_error {
+        return Err(RegistryError::http(
+            StatusCode::SERVICE_UNAVAILABLE,
+            API_ERROR_SERVER_TIME_OUT,
+        ));
     }
 
     Ok(bytes_response(StatusCode::NOT_FOUND, Vec::new()))
@@ -766,25 +816,45 @@ async fn ensure_package_cached(
         return Ok(());
     }
 
-    let Some(upstream) = select_uplink_for_package(state, package_name) else {
+    let uplinks = select_uplinks_for_package(state, package_name);
+    if uplinks.is_empty() {
         debug!("no upstream configured for package");
         return Ok(());
-    };
-    let Some(manifest) = upstream.fetch_package(package_name).await? else {
-        debug!("package missing on upstream");
-        return Ok(());
-    };
+    }
 
-    let base = request_registry_base_url(headers, state.trust_proxy, &state.url_prefix);
-    let (normalized, upstream_map) =
+    let mut had_upstream_error = false;
+    for upstream in uplinks {
+        let Some(manifest) = (match upstream.fetch_package(package_name).await {
+            Ok(manifest) => manifest,
+            Err(err) if is_uplink_transient_error(&err) => {
+                had_upstream_error = true;
+                continue;
+            }
+            Err(err) => return Err(err),
+        }) else {
+            continue;
+        };
+
+        let base = request_registry_base_url(headers, state.trust_proxy, &state.url_prefix);
+        let (normalized, upstream_map) =
+            state
+                .store
+                .normalize_package_response(&manifest, package_name, &base);
         state
             .store
-            .normalize_package_response(&manifest, package_name, &base);
-    state
-        .store
-        .upsert_upstream_package(package_name, normalized, upstream_map)
-        .await?;
-    debug!("cached package manifest from upstream");
+            .upsert_upstream_package(package_name, normalized, upstream_map)
+            .await?;
+        debug!("cached package manifest from upstream");
+        return Ok(());
+    }
+
+    if had_upstream_error {
+        return Err(RegistryError::http(
+            StatusCode::SERVICE_UNAVAILABLE,
+            API_ERROR_SERVER_TIME_OUT,
+        ));
+    }
+    debug!("package missing on upstream");
     Ok(())
 }
 
@@ -829,8 +899,12 @@ async fn handle_search(
         }
     }
 
-    for upstream in state.uplinks.values() {
-        let remote = upstream.fetch_search(query.unwrap_or_default()).await?;
+    for upstream in select_default_uplinks(state) {
+        let remote = match upstream.fetch_search(query.unwrap_or_default()).await {
+            Ok(remote) => remote,
+            Err(err) if is_uplink_transient_error(&err) => continue,
+            Err(err) => return Err(err),
+        };
         for item in remote {
             let package_name = item
                 .get("package")
@@ -1070,24 +1144,116 @@ fn auth_identity_primary_name(identity: Option<&AuthIdentity>) -> Option<&str> {
         .or_else(|| identity.groups.first().map(String::as_str))
 }
 
-fn select_uplink_for_package<'a>(
+fn select_uplinks_for_package<'a>(
     state: &'a AppState,
     package_name: &str,
-) -> Option<&'a crate::upstream::Upstream> {
-    if let Some(proxy_name) = state.acl.proxy_for(package_name) {
-        return state.uplinks.get(proxy_name);
+) -> Vec<&'a crate::upstream::Upstream> {
+    if !state.acl.uplinks_look_for(package_name) {
+        return Vec::new();
     }
-    state
-        .uplinks
-        .get("default")
-        .or_else(|| state.uplinks.values().next())
+
+    let mut selected_names = Vec::new();
+    if let Some(proxy_name) = state.acl.proxy_for(package_name) {
+        selected_names.push(proxy_name.to_string());
+    }
+    if !selected_names.iter().any(|name| name == "default") {
+        selected_names.push("default".to_string());
+    }
+
+    let mut remaining: Vec<String> = state.uplinks.keys().cloned().collect();
+    remaining.sort();
+    for name in remaining {
+        if !selected_names.iter().any(|selected| selected == &name) {
+            selected_names.push(name);
+        }
+    }
+
+    selected_names
+        .into_iter()
+        .filter_map(|name| state.uplinks.get(&name))
+        .collect()
 }
 
-fn select_default_uplink(state: &AppState) -> Option<&crate::upstream::Upstream> {
-    state
-        .uplinks
-        .get("default")
-        .or_else(|| state.uplinks.values().next())
+fn select_default_uplinks(state: &AppState) -> Vec<&crate::upstream::Upstream> {
+    let mut selected_names = vec!["default".to_string()];
+    let mut remaining: Vec<String> = state.uplinks.keys().cloned().collect();
+    remaining.sort();
+    for name in remaining {
+        if !selected_names.iter().any(|selected| selected == &name) {
+            selected_names.push(name);
+        }
+    }
+
+    selected_names
+        .into_iter()
+        .filter_map(|name| state.uplinks.get(&name))
+        .collect()
+}
+
+fn is_uplink_transient_error(err: &RegistryError) -> bool {
+    match err {
+        RegistryError::Http { status, .. } => is_transient_uplink_status(*status),
+        RegistryError::Internal => false,
+    }
+}
+
+fn is_transient_uplink_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+            | StatusCode::REQUEST_TIMEOUT
+    )
+}
+
+async fn local_database_response(state: &AppState, query: Option<&str>) -> Response<Body> {
+    let params = query_params(query);
+    let start_key = params
+        .get("since")
+        .or_else(|| params.get("startkey"))
+        .cloned();
+
+    let mut rows: Vec<(String, Value)> = state
+        .store
+        .all_packages()
+        .await
+        .into_iter()
+        .filter_map(|record| {
+            let name = record
+                .manifest
+                .get("name")
+                .and_then(Value::as_str)?
+                .to_string();
+            let latest = record
+                .manifest
+                .get("dist-tags")
+                .and_then(|tags| tags.get("latest"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Some((
+                name.clone(),
+                json!({
+                    "name": name,
+                    "version": latest,
+                }),
+            ))
+        })
+        .collect();
+    rows.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    let mut out = serde_json::Map::new();
+    for (name, row) in rows {
+        if let Some(start) = &start_key
+            && name <= *start
+        {
+            continue;
+        }
+        out.insert(name, row);
+    }
+
+    json_response(StatusCode::OK, Value::Object(out), HEADER_JSON)
 }
 
 fn empty_quick_audit_response() -> Value {
@@ -1308,6 +1474,16 @@ fn ensure_local_auth_routes_enabled(state: &AppState) -> Result<(), RegistryErro
         return Err(RegistryError::http(StatusCode::NOT_FOUND, "not found"));
     }
     Ok(())
+}
+
+fn ensure_admin_authenticated(user: Option<&str>) -> Result<(), RegistryError> {
+    if user.is_some() {
+        return Ok(());
+    }
+    Err(RegistryError::http(
+        StatusCode::UNAUTHORIZED,
+        "authorization required",
+    ))
 }
 
 async fn read_body(req: Request<Body>, max_body_size: usize) -> Result<Vec<u8>, RegistryError> {

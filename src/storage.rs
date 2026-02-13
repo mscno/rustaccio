@@ -25,7 +25,6 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::http::StatusCode;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
-use flate2::read::GzDecoder;
 use password_hash::{SaltString, rand_core::OsRng};
 use rand::RngCore;
 use serde_json::{Map, Value, json};
@@ -33,11 +32,9 @@ use sha2::{Digest, Sha256};
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
-    io::{Cursor, Read},
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tar::Archive;
 use tokio::sync::RwLock;
 use tracing::{debug, instrument, warn};
 use uuid::Uuid;
@@ -137,9 +134,34 @@ impl Store {
         tarball_backend: &TarballBackend,
     ) -> Result<bool, RegistryError> {
         let references = tarball_backend.list().await?;
-        if references.is_empty() {
+        let discovered_packages = tarball_backend.list_packages().await?;
+        let legacy_packages = tarball_backend
+            .load_legacy_package_index()
+            .await?
+            .unwrap_or_default();
+
+        let mut tarballs_by_package: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for reference in references {
+            let Some(version) = Self::infer_version_from_filename(&reference.filename) else {
+                continue;
+            };
+            tarballs_by_package
+                .entry(reference.package)
+                .or_default()
+                .push((reference.filename, version));
+        }
+
+        let mut package_names = HashSet::new();
+        package_names.extend(discovered_packages);
+        package_names.extend(legacy_packages.iter().cloned());
+        package_names.extend(tarballs_by_package.keys().cloned());
+
+        if package_names.is_empty() {
             return Ok(false);
         }
+
+        let mut ordered_packages = package_names.into_iter().collect::<Vec<_>>();
+        ordered_packages.sort();
 
         let now_ms = Self::now_ms();
         let now_rfc3339 = Utc::now().to_rfc3339();
@@ -147,30 +169,39 @@ impl Store {
         let mut indexed_packages = 0usize;
         let mut indexed_versions = 0usize;
         let mut metadata_enriched_versions = 0usize;
+        let before_package_count = state.packages.len();
+        state.packages.retain(|package, record| {
+            record.cached_from_uplink || ordered_packages.binary_search(package).is_ok()
+        });
+        let removed_stale_packages = before_package_count.saturating_sub(state.packages.len());
+        if removed_stale_packages > 0 {
+            changed = true;
+        }
         let mut package_metadata_cache: HashMap<String, Option<Value>> = HashMap::new();
 
-        for reference in references {
-            let Some(version) = Self::infer_version_from_filename(&reference.filename) else {
-                continue;
-            };
-            if !package_metadata_cache.contains_key(&reference.package) {
-                let package_metadata = tarball_backend
-                    .read_package_metadata(&reference.package)
-                    .await?;
-                package_metadata_cache.insert(reference.package.clone(), package_metadata);
+        for package_name in ordered_packages {
+            if !package_metadata_cache.contains_key(&package_name) {
+                let package_metadata = tarball_backend.read_package_metadata(&package_name).await?;
+                package_metadata_cache.insert(package_name.clone(), package_metadata);
             }
             let package_metadata = package_metadata_cache
-                .get(&reference.package)
+                .get(&package_name)
                 .and_then(|value| value.as_ref());
+            let package_tarballs = tarballs_by_package
+                .remove(&package_name)
+                .unwrap_or_default();
 
-            if !state.packages.contains_key(&reference.package) {
+            if !state.packages.contains_key(&package_name) {
+                let manifest = package_metadata
+                    .cloned()
+                    .filter(Value::is_object)
+                    .unwrap_or_else(|| {
+                        Value::Object(Self::inferred_manifest_shell(&package_name, &now_rfc3339))
+                    });
                 state.packages.insert(
-                    reference.package.clone(),
+                    package_name.clone(),
                     PackageRecord {
-                        manifest: Value::Object(Self::inferred_manifest_shell(
-                            &reference.package,
-                            &now_rfc3339,
-                        )),
+                        manifest,
                         upstream_tarballs: HashMap::new(),
                         updated_at: now_ms,
                         cached_from_uplink: false,
@@ -180,85 +211,147 @@ impl Store {
                 changed = true;
             }
 
-            let Some(record) = state.packages.get_mut(&reference.package) else {
+            let Some(record) = state.packages.get_mut(&package_name) else {
                 continue;
             };
+            let mut record_changed = false;
             if record.cached_from_uplink {
                 record.cached_from_uplink = false;
-                changed = true;
+                record_changed = true;
             }
-            if !record.manifest.is_object() {
-                record.manifest = Value::Object(Self::inferred_manifest_shell(
-                    &reference.package,
-                    &now_rfc3339,
-                ));
-                changed = true;
+            if let Some(metadata) = package_metadata.and_then(Value::as_object) {
+                if !record.manifest.is_object() {
+                    record.manifest = Value::Object(Map::new());
+                    record_changed = true;
+                }
+                if let Some(manifest) = record.manifest.as_object_mut() {
+                    for (key, value) in metadata {
+                        if manifest.get(key) != Some(value) {
+                            manifest.insert(key.clone(), value.clone());
+                            record_changed = true;
+                        }
+                    }
+                }
+            } else if !record.manifest.is_object() {
+                record.manifest =
+                    Value::Object(Self::inferred_manifest_shell(&package_name, &now_rfc3339));
+                record_changed = true;
             }
 
             let Some(manifest) = record.manifest.as_object_mut() else {
                 continue;
             };
-            let mut record_changed = false;
 
-            manifest.insert("_id".to_string(), Value::String(reference.package.clone()));
-            manifest.insert("name".to_string(), Value::String(reference.package.clone()));
+            if manifest.get("_id").and_then(Value::as_str) != Some(package_name.as_str()) {
+                manifest.insert("_id".to_string(), Value::String(package_name.clone()));
+                record_changed = true;
+            }
+            if manifest.get("name").and_then(Value::as_str) != Some(package_name.as_str()) {
+                manifest.insert("name".to_string(), Value::String(package_name.clone()));
+                record_changed = true;
+            }
             if !manifest.contains_key("_rev") {
-                manifest.insert("_rev".to_string(), Value::String("1-rustaccio".to_string()));
+                manifest.insert("_rev".to_string(), Value::String(Self::initial_revision()));
                 record_changed = true;
             }
             if let Some(metadata) = package_metadata
-                && Self::merge_startup_manifest_metadata(manifest, metadata, &reference.package)
+                && Self::merge_startup_manifest_metadata(manifest, metadata, &package_name)
             {
                 record_changed = true;
             }
 
-            let versions = Self::ensure_object_field(manifest, "versions");
-            if !versions.contains_key(&version) {
-                let mut startup_metadata =
-                    Self::startup_metadata_for_version(package_metadata, &version).cloned();
-                if startup_metadata.is_none() {
-                    startup_metadata = Self::read_tarball_package_metadata(
-                        tarball_backend,
-                        &reference.package,
-                        &reference.filename,
-                    )
-                    .await;
-                }
-                versions.insert(
-                    version.clone(),
-                    Self::inferred_version_manifest(
-                        &reference.package,
-                        &version,
-                        &reference.filename,
-                        startup_metadata.as_ref(),
-                    ),
-                );
-                if let Some(metadata) = startup_metadata {
-                    if Self::merge_startup_manifest_metadata(
-                        manifest,
-                        &metadata,
-                        &reference.package,
-                    ) {
-                        metadata_enriched_versions += 1;
+            {
+                let versions = Self::ensure_object_field(manifest, "versions");
+                for (filename, version) in &package_tarballs {
+                    let was_known = versions.contains_key(version);
+                    let payload = versions
+                        .entry(version.clone())
+                        .or_insert_with(|| Value::Object(Map::new()));
+                    if !payload.is_object() {
+                        *payload = Value::Object(Map::new());
+                        record_changed = true;
+                    }
+                    if let Some(sidecar_version) =
+                        Self::startup_metadata_for_version(package_metadata, version)
+                    {
+                        if let (Some(target), Some(source)) =
+                            (payload.as_object_mut(), sidecar_version.as_object())
+                        {
+                            for (key, value) in source {
+                                if target.get(key) != Some(value) {
+                                    target.insert(key.clone(), value.clone());
+                                    record_changed = true;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(target) = payload.as_object_mut() {
+                        let expected_id = format!("{package_name}@{version}");
+                        if target.get("_id").and_then(Value::as_str) != Some(expected_id.as_str()) {
+                            target.insert("_id".to_string(), Value::String(expected_id));
+                            record_changed = true;
+                        }
+                        if target.get("name").and_then(Value::as_str) != Some(package_name.as_str())
+                        {
+                            target.insert("name".to_string(), Value::String(package_name.clone()));
+                            record_changed = true;
+                        }
+                        if target.get("version").and_then(Value::as_str) != Some(version.as_str()) {
+                            target.insert("version".to_string(), Value::String(version.clone()));
+                            record_changed = true;
+                        }
+
+                        let expected_tarball = Self::inferred_tarball_url(&package_name, filename);
+                        let dist = target
+                            .entry("dist".to_string())
+                            .or_insert_with(|| Value::Object(Map::new()));
+                        if !dist.is_object() {
+                            *dist = Value::Object(Map::new());
+                            record_changed = true;
+                        }
+                        if let Some(dist_obj) = dist.as_object_mut()
+                            && dist_obj.get("tarball").and_then(Value::as_str)
+                                != Some(expected_tarball.as_str())
+                        {
+                            dist_obj.insert("tarball".to_string(), Value::String(expected_tarball));
+                            record_changed = true;
+                        }
+                    }
+                    if !was_known {
+                        indexed_versions += 1;
+                        if Self::startup_metadata_for_version(package_metadata, version).is_some() {
+                            metadata_enriched_versions += 1;
+                        }
                     }
                 }
-                indexed_versions += 1;
-                record_changed = true;
             }
 
+            let version_keys = manifest
+                .get("versions")
+                .and_then(Value::as_object)
+                .map(|versions| versions.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let latest_version = manifest
+                .get("versions")
+                .and_then(Value::as_object)
+                .and_then(Self::select_latest_version);
+
             let attachments = Self::ensure_object_field(manifest, "_attachments");
-            if !attachments.contains_key(&reference.filename) {
-                attachments.insert(reference.filename.clone(), json!({ "version": version }));
-                record_changed = true;
+            for (filename, version) in &package_tarballs {
+                let expected_attachment = json!({ "version": version });
+                if attachments.get(filename) != Some(&expected_attachment) {
+                    attachments.insert(filename.clone(), expected_attachment);
+                    record_changed = true;
+                }
             }
 
             let dist_tags = Self::ensure_object_field(manifest, "dist-tags");
-            let update_latest = match dist_tags.get("latest").and_then(Value::as_str) {
-                Some(current) => Self::compare_versions(&version, current).is_gt(),
-                None => true,
-            };
-            if update_latest {
-                dist_tags.insert("latest".to_string(), Value::String(version.clone()));
+            let latest_valid = dist_tags
+                .get("latest")
+                .and_then(Value::as_str)
+                .is_some_and(|tag| version_keys.iter().any(|version| version == tag));
+            if !latest_valid && let Some(latest) = latest_version {
+                dist_tags.insert("latest".to_string(), Value::String(latest));
                 record_changed = true;
             }
 
@@ -282,22 +375,30 @@ impl Store {
                 time.insert("created".to_string(), Value::String(now_rfc3339.clone()));
                 record_changed = true;
             }
-            if !time.contains_key(&version) {
-                time.insert(version.clone(), Value::String(now_rfc3339.clone()));
-                record_changed = true;
+            for version in version_keys {
+                if !time.contains_key(&version) {
+                    time.insert(version, Value::String(now_rfc3339.clone()));
+                    record_changed = true;
+                }
             }
-            time.insert("modified".to_string(), Value::String(now_rfc3339.clone()));
+            if !time.contains_key("modified") {
+                time.insert("modified".to_string(), Value::String(now_rfc3339.clone()));
+                record_changed = true;
+            } else if record_changed {
+                time.insert("modified".to_string(), Value::String(now_rfc3339.clone()));
+            }
 
             if record_changed {
                 record.updated_at = now_ms;
                 changed = true;
             }
         }
-
         debug!(
             indexed_packages,
             indexed_versions,
             metadata_enriched_versions,
+            legacy_seed_packages = legacy_packages.len(),
+            removed_stale_packages,
             changed,
             "indexed tarball backend during startup"
         );
@@ -308,7 +409,7 @@ impl Store {
         let mut manifest = Map::new();
         manifest.insert("_id".to_string(), Value::String(package_name.to_string()));
         manifest.insert("name".to_string(), Value::String(package_name.to_string()));
-        manifest.insert("_rev".to_string(), Value::String("1-rustaccio".to_string()));
+        manifest.insert("_rev".to_string(), Value::String(Self::initial_revision()));
         manifest.insert("versions".to_string(), Value::Object(Map::new()));
         manifest.insert("dist-tags".to_string(), Value::Object(Map::new()));
         manifest.insert("_attachments".to_string(), Value::Object(Map::new()));
@@ -343,36 +444,6 @@ impl Store {
             package_name_to_encoded(package_name),
             filename
         )
-    }
-
-    fn inferred_version_manifest(
-        package_name: &str,
-        version: &str,
-        filename: &str,
-        tarball_metadata: Option<&Value>,
-    ) -> Value {
-        let mut payload = tarball_metadata
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        payload.insert(
-            "_id".to_string(),
-            Value::String(format!("{package_name}@{version}")),
-        );
-        payload.insert("name".to_string(), Value::String(package_name.to_string()));
-        payload.insert("version".to_string(), Value::String(version.to_string()));
-
-        let mut dist = payload
-            .get("dist")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        dist.insert(
-            "tarball".to_string(),
-            Value::String(Self::inferred_tarball_url(package_name, filename)),
-        );
-        payload.insert("dist".to_string(), Value::Object(dist));
-        Value::Object(payload)
     }
 
     fn merge_startup_manifest_metadata(
@@ -439,40 +510,18 @@ impl Store {
         None
     }
 
-    async fn read_tarball_package_metadata(
-        tarball_backend: &TarballBackend,
-        package_name: &str,
-        filename: &str,
-    ) -> Option<Value> {
-        let bytes = tarball_backend
-            .get(package_name, filename)
-            .await
-            .ok()
-            .flatten()?;
-        Self::extract_package_json_from_tarball(&bytes)
-    }
-
-    fn extract_package_json_from_tarball(bytes: &[u8]) -> Option<Value> {
-        let cursor = Cursor::new(bytes);
-        let decoder = GzDecoder::new(cursor);
-        let mut archive = Archive::new(decoder);
-        let mut entries = archive.entries().ok()?;
-
-        while let Some(next) = entries.next() {
-            let mut entry = next.ok()?;
-            let path = entry.path().ok()?.to_string_lossy().to_string();
-            if path == "package/package.json" || path.ends_with("/package.json") {
-                let mut package_json = Vec::new();
-                entry.read_to_end(&mut package_json).ok()?;
-                let value = serde_json::from_slice::<Value>(&package_json).ok()?;
-                if value.is_object() {
-                    return Some(value);
+    fn select_latest_version(versions: &Map<String, Value>) -> Option<String> {
+        let mut latest: Option<String> = None;
+        for version in versions.keys() {
+            match latest.as_deref() {
+                Some(current) if Self::compare_versions(version, current).is_gt() => {
+                    latest = Some(version.clone());
                 }
-                return None;
+                None => latest = Some(version.clone()),
+                _ => {}
             }
         }
-
-        None
+        latest
     }
 
     fn infer_version_from_filename(filename: &str) -> Option<String> {
@@ -599,6 +648,39 @@ impl Store {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn sync_all_package_sidecars_from_snapshot(
+        &self,
+        snapshot: &PersistedState,
+    ) -> Result<usize, RegistryError> {
+        let mut synced = 0usize;
+        for (package_name, record) in &snapshot.packages {
+            if record.cached_from_uplink || !record.manifest.is_object() {
+                continue;
+            }
+            self.tarball_backend
+                .write_package_metadata(package_name, &record.manifest)
+                .await?;
+            synced += 1;
+        }
+        Ok(synced)
+    }
+
+    async fn sync_package_sidecar_from_snapshot(
+        &self,
+        snapshot: &PersistedState,
+        package_name: &str,
+    ) -> Result<(), RegistryError> {
+        let Some(record) = snapshot.packages.get(package_name) else {
+            return Ok(());
+        };
+        if record.cached_from_uplink || !record.manifest.is_object() {
+            return Ok(());
+        }
+        self.tarball_backend
+            .write_package_metadata(package_name, &record.manifest)
+            .await
     }
 
     fn prune_ephemeral_uplink_cache_entries(state: &mut PersistedState) {
@@ -1093,10 +1175,15 @@ impl Store {
             .and_then(|n| n.parse::<u64>().ok())
             .unwrap_or(0)
             + 1;
-        manifest.insert(
-            "_rev".to_string(),
-            Value::String(format!("{next}-rustaccio")),
-        );
+        manifest.insert("_rev".to_string(), Value::String(Self::revision(next)));
+    }
+
+    fn initial_revision() -> String {
+        Self::revision(1)
+    }
+
+    fn revision(counter: u64) -> String {
+        format!("{counter}-{}", Self::random_token_hex(16))
     }
 
     fn remove_attachment_data(value: &Value) -> Value {
@@ -1313,6 +1400,8 @@ impl Store {
             };
 
             self.persist_snapshot(&snapshot).await?;
+            self.sync_package_sidecar_from_snapshot(&snapshot, package_name)
+                .await?;
             debug!("updated package owner/star metadata");
             return Ok(API_MESSAGE_PKG_CHANGED.to_string());
         }
@@ -1354,6 +1443,8 @@ impl Store {
             };
 
             self.persist_snapshot(&snapshot).await?;
+            self.sync_package_sidecar_from_snapshot(&snapshot, package_name)
+                .await?;
             debug!("applied metadata-only publish update");
             return Ok(API_MESSAGE_PKG_CHANGED.to_string());
         }
@@ -1475,7 +1566,7 @@ impl Store {
                 }
 
                 Self::ensure_manifest_defaults(&mut manifest, package_name, username);
-                manifest.insert("_rev".to_string(), Value::String("1-rustaccio".to_string()));
+                manifest.insert("_rev".to_string(), Value::String(Self::initial_revision()));
 
                 state.packages.insert(
                     package_name.to_string(),
@@ -1493,6 +1584,8 @@ impl Store {
         };
 
         self.persist_snapshot(&snapshot_and_message.0).await?;
+        self.sync_package_sidecar_from_snapshot(&snapshot_and_message.0, package_name)
+            .await?;
         debug!(
             message = snapshot_and_message.1.as_str(),
             "published package manifest"
@@ -1603,6 +1696,8 @@ impl Store {
         };
 
         self.persist_snapshot(&snapshot).await?;
+        self.sync_package_sidecar_from_snapshot(&snapshot, package_name)
+            .await?;
         debug!("removed tarball");
         Ok(API_MESSAGE_TARBALL_REMOVED.to_string())
     }
@@ -1641,6 +1736,8 @@ impl Store {
         };
 
         self.persist_snapshot(&snapshot.0).await?;
+        self.sync_package_sidecar_from_snapshot(&snapshot.0, package_name)
+            .await?;
         Ok(snapshot.1)
     }
 
@@ -1729,6 +1826,168 @@ impl Store {
             .collect()
     }
 
+    pub async fn reindex_from_backend(&self) -> Result<Value, RegistryError> {
+        let (snapshot, changed, before_packages, after_packages) = {
+            let mut state = self.state.write().await;
+            let before_packages = state.packages.len();
+            let changed =
+                Self::hydrate_from_tarball_backend(&mut state, &self.tarball_backend).await?;
+            let after_packages = state.packages.len();
+            (state.clone(), changed, before_packages, after_packages)
+        };
+        if changed {
+            self.persist_snapshot(&snapshot).await?;
+        }
+        let sidecars_synced = if changed {
+            self.sync_all_package_sidecars_from_snapshot(&snapshot)
+                .await?
+        } else {
+            0
+        };
+
+        Ok(json!({
+            "ok": true,
+            "changed": changed,
+            "packagesBefore": before_packages,
+            "packagesAfter": after_packages,
+            "sidecarsSynced": sidecars_synced,
+        }))
+    }
+
+    pub async fn storage_health(&self) -> Result<Value, RegistryError> {
+        let references = self.tarball_backend.list().await?;
+        let backend_packages = self.tarball_backend.list_packages().await?;
+        let legacy_index_package_count = self
+            .tarball_backend
+            .load_legacy_package_index()
+            .await?
+            .map(|packages| packages.len())
+            .unwrap_or(0);
+
+        let mut backend_tarballs: HashMap<String, HashSet<String>> = HashMap::new();
+        for reference in references {
+            if Self::infer_version_from_filename(&reference.filename).is_none() {
+                continue;
+            }
+            backend_tarballs
+                .entry(reference.package)
+                .or_default()
+                .insert(reference.filename);
+        }
+
+        let backend_package_set = backend_packages.into_iter().collect::<HashSet<_>>();
+        let mut sidecar_packages = HashSet::new();
+        for package in &backend_package_set {
+            if self
+                .tarball_backend
+                .read_package_metadata(package)
+                .await?
+                .is_some()
+            {
+                sidecar_packages.insert(package.clone());
+            }
+        }
+
+        let (state_package_set, state_attachments) = {
+            let state = self.state.read().await;
+            let mut packages = HashSet::new();
+            let mut attachments: HashMap<String, HashSet<String>> = HashMap::new();
+            for (package, record) in &state.packages {
+                if record.cached_from_uplink {
+                    continue;
+                }
+                packages.insert(package.clone());
+                let filenames = record
+                    .manifest
+                    .get("_attachments")
+                    .and_then(Value::as_object)
+                    .map(|object| {
+                        object
+                            .keys()
+                            .filter(|filename| {
+                                Self::infer_version_from_filename(filename).is_some()
+                            })
+                            .cloned()
+                            .collect::<HashSet<_>>()
+                    })
+                    .unwrap_or_default();
+                attachments.insert(package.clone(), filenames);
+            }
+            (packages, attachments)
+        };
+
+        let mut tarballs_without_sidecar = backend_tarballs
+            .keys()
+            .filter(|package| !sidecar_packages.contains(*package))
+            .cloned()
+            .collect::<Vec<_>>();
+        tarballs_without_sidecar.sort();
+
+        let mut sidecars_without_tarballs = sidecar_packages
+            .iter()
+            .filter(|package| backend_tarballs.get(*package).is_none_or(HashSet::is_empty))
+            .cloned()
+            .collect::<Vec<_>>();
+        sidecars_without_tarballs.sort();
+
+        let mut tarballs_missing_from_manifest = Vec::new();
+        for (package, files) in &backend_tarballs {
+            let Some(manifest_files) = state_attachments.get(package) else {
+                for file in files {
+                    tarballs_missing_from_manifest.push(format!("{package}/-/{}", file));
+                }
+                continue;
+            };
+            for file in files {
+                if !manifest_files.contains(file) {
+                    tarballs_missing_from_manifest.push(format!("{package}/-/{}", file));
+                }
+            }
+        }
+        tarballs_missing_from_manifest.sort();
+
+        let mut manifest_attachments_missing_blob = Vec::new();
+        for (package, files) in &state_attachments {
+            let Some(backend_files) = backend_tarballs.get(package) else {
+                for file in files {
+                    manifest_attachments_missing_blob.push(format!("{package}/-/{}", file));
+                }
+                continue;
+            };
+            for file in files {
+                if !backend_files.contains(file) {
+                    manifest_attachments_missing_blob.push(format!("{package}/-/{}", file));
+                }
+            }
+        }
+        manifest_attachments_missing_blob.sort();
+
+        let mut stale_state_packages = state_package_set
+            .iter()
+            .filter(|package| !backend_package_set.contains(*package))
+            .cloned()
+            .collect::<Vec<_>>();
+        stale_state_packages.sort();
+
+        Ok(json!({
+            "ok": true,
+            "summary": {
+                "backendPackages": backend_package_set.len(),
+                "backendTarballs": backend_tarballs.values().map(HashSet::len).sum::<usize>(),
+                "sidecarPackages": sidecar_packages.len(),
+                "statePackages": state_package_set.len(),
+                "legacyVerdaccioIndexPackages": legacy_index_package_count,
+            },
+            "problems": {
+                "tarballsWithoutSidecar": tarballs_without_sidecar,
+                "sidecarsWithoutTarballs": sidecars_without_tarballs,
+                "tarballsMissingFromManifest": tarballs_missing_from_manifest,
+                "manifestAttachmentsMissingBlob": manifest_attachments_missing_blob,
+                "staleStatePackages": stale_state_packages,
+            }
+        }))
+    }
+
     pub async fn starred_packages(&self, user_key: &str) -> Vec<String> {
         let state = self.state.read().await;
         let mut rows = Vec::new();
@@ -1792,6 +2051,40 @@ impl Store {
             obj.remove("_attachments");
             obj.remove("_uplinks");
             obj.remove("_distfiles");
+            obj.remove("readme");
+            if let Some(versions) = obj.get_mut("versions").and_then(Value::as_object_mut) {
+                for version in versions.values_mut() {
+                    if let Some(version_obj) = version.as_object_mut() {
+                        version_obj.retain(|key, _| {
+                            matches!(
+                                key.as_str(),
+                                "name"
+                                    | "version"
+                                    | "deprecated"
+                                    | "bin"
+                                    | "dist"
+                                    | "engines"
+                                    | "funding"
+                                    | "directories"
+                                    | "dependencies"
+                                    | "devDependencies"
+                                    | "peerDependencies"
+                                    | "optionalDependencies"
+                                    | "bundleDependencies"
+                                    | "cpu"
+                                    | "os"
+                                    | "peerDependenciesMeta"
+                                    | "acceptDependencies"
+                                    | "_hasShrinkwrap"
+                                    | "hasInstallScript"
+                            )
+                        });
+                    }
+                }
+            }
+            if !obj.contains_key("time") {
+                obj.insert("time".to_string(), Value::Object(Map::new()));
+            }
             obj.insert(
                 "modified".to_string(),
                 Value::String(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
