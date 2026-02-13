@@ -798,11 +798,23 @@ fn parse_package_rule(
 }
 
 fn parse_principals(value: Option<StringOrVec>, default_value: Vec<String>) -> Vec<String> {
-    match value {
-        Some(StringOrVec::One(v)) => vec![v],
-        Some(StringOrVec::Many(v)) => v,
-        None => default_value,
+    let principals = match value {
+        Some(StringOrVec::One(v)) => split_principals(&v),
+        Some(StringOrVec::Many(values)) => values
+            .into_iter()
+            .flat_map(|value| split_principals(&value))
+            .collect(),
+        None => return default_value,
+    };
+    if principals.is_empty() {
+        default_value
+    } else {
+        principals
     }
+}
+
+fn split_principals(raw: &str) -> Vec<String> {
+    raw.split_whitespace().map(ToOwned::to_owned).collect()
 }
 
 fn parse_proxy(value: Option<StringOrVec>) -> Option<String> {
@@ -935,6 +947,37 @@ publish:
         assert!(cfg.publish_check_owners);
         assert_eq!(cfg.auth_plugin.backend, AuthBackend::Local);
         assert_eq!(cfg.tarball_storage.backend, TarballStorageBackend::Local);
+    }
+
+    #[test]
+    fn parses_whitespace_separated_acl_principals() {
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        writeln!(
+            file,
+            r#"
+packages:
+  '@geoman-io/*':
+    access: geo-admin read-only
+    publish: geo-admin read-only
+    unpublish: geo-admin read-only
+"#
+        )
+        .expect("write");
+
+        let cfg = Config::from_yaml_file(file.path().to_path_buf()).expect("parse");
+        assert_eq!(cfg.acl_rules.len(), 1);
+        assert_eq!(
+            cfg.acl_rules[0].access,
+            vec!["geo-admin".to_string(), "read-only".to_string()]
+        );
+        assert_eq!(
+            cfg.acl_rules[0].publish,
+            vec!["geo-admin".to_string(), "read-only".to_string()]
+        );
+        assert_eq!(
+            cfg.acl_rules[0].unpublish,
+            vec!["geo-admin".to_string(), "read-only".to_string()]
+        );
     }
 
     #[test]
