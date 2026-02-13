@@ -1,7 +1,8 @@
 use crate::{constants::API_ERROR_SERVER_TIME_OUT, error::RegistryError};
 use axum::http::{Method, StatusCode};
-use reqwest::Client;
+use reqwest::{Client, redirect::Policy};
 use serde_json::Value;
+use std::{sync::OnceLock, time::Duration};
 use tracing::{debug, instrument, warn};
 
 #[derive(Debug, Clone)]
@@ -21,7 +22,7 @@ impl Upstream {
     pub fn new(base_url: String) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: Client::new(),
+            client: shared_client(),
         }
     }
 
@@ -274,6 +275,56 @@ impl Upstream {
             filename
         )
     }
+}
+
+fn shared_client() -> Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .connect_timeout(Duration::from_secs(env_u64(
+                    "RUSTACCIO_UPSTREAM_CONNECT_TIMEOUT_SECS",
+                    3,
+                )))
+                .timeout(Duration::from_secs(env_u64(
+                    "RUSTACCIO_UPSTREAM_TIMEOUT_SECS",
+                    20,
+                )))
+                .pool_idle_timeout(Duration::from_secs(env_u64(
+                    "RUSTACCIO_UPSTREAM_POOL_IDLE_TIMEOUT_SECS",
+                    30,
+                )))
+                .pool_max_idle_per_host(env_usize(
+                    "RUSTACCIO_UPSTREAM_POOL_MAX_IDLE_PER_HOST",
+                    4,
+                    1,
+                    1024,
+                ))
+                .tcp_keepalive(Duration::from_secs(env_u64(
+                    "RUSTACCIO_UPSTREAM_TCP_KEEPALIVE_SECS",
+                    30,
+                )))
+                .http1_only()
+                .redirect(Policy::limited(5))
+                .build()
+                .unwrap_or_else(|_| Client::new())
+        })
+        .clone()
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(key: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
 }
 
 fn map_uplink_request_err(err: reqwest::Error) -> RegistryError {

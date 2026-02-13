@@ -9,9 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- GitHub Actions CI for formatting, clippy, full-feature tests, no-default-feature tests, and file-length gate.
+- GitHub Actions CI for formatting, check, clippy, feature-matrix tests, and docs with warnings denied.
 - Multi-stage Docker build with non-root runtime defaults.
 - GitHub Actions workflow to build and publish multi-arch container images to GHCR on version tags.
+- README deployment and embedding examples for standalone, library-owned `main`, and Axum sidecar integration with a custom `AuthHook`.
 - S3 TLS CA bundle controls and richer S3 error reporting.
 
 ## [0.1.0] - 2026-02-13

@@ -1,13 +1,19 @@
+#[cfg(feature = "s3")]
+use crate::config::S3TarballStorageConfig;
 use crate::{
-    config::{Config, S3TarballStorageConfig, TarballStorageBackend},
+    config::{Config, TarballStorageBackend},
     error::RegistryError,
 };
 #[cfg(feature = "s3")]
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use axum::http::StatusCode;
 use serde_json::Value;
-use std::{collections::HashSet, path::PathBuf};
-use tracing::{debug, instrument, warn};
+#[cfg(feature = "s3")]
+use std::collections::HashSet;
+use std::path::PathBuf;
+#[cfg(feature = "s3")]
+use tracing::warn;
+use tracing::{debug, instrument};
 
 #[cfg(feature = "s3")]
 const DEFAULT_CA_BUNDLE_PATHS: [&str; 2] =
@@ -131,11 +137,11 @@ impl TarballBackend {
         }
     }
 
-    pub async fn save_shared_state_snapshot(&self, content: &[u8]) -> Result<(), RegistryError> {
+    pub async fn save_shared_state_snapshot(&self, _content: &[u8]) -> Result<(), RegistryError> {
         match self {
             Self::Local(_) => Ok(()),
             #[cfg(feature = "s3")]
-            Self::S3(backend) => backend.put_state_snapshot(content).await,
+            Self::S3(backend) => backend.put_state_snapshot(_content).await,
         }
     }
 

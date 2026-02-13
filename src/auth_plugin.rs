@@ -7,7 +7,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use axum::http::StatusCode;
-use reqwest::Client;
+use reqwest::{Client, redirect::Policy};
 use serde_json::{Value, json};
 use std::time::Duration;
 use tracing::{debug, error, instrument, warn};
@@ -35,8 +35,16 @@ impl HttpAuthPlugin {
             ));
         }
 
+        let timeout = Duration::from_millis(cfg.timeout_ms.max(250));
+        let connect_timeout = timeout.min(Duration::from_secs(3));
         let client = Client::builder()
-            .timeout(Duration::from_millis(cfg.timeout_ms))
+            .connect_timeout(connect_timeout)
+            .timeout(timeout)
+            .pool_idle_timeout(Duration::from_secs(15))
+            .pool_max_idle_per_host(2)
+            .tcp_keepalive(Duration::from_secs(30))
+            .http1_only()
+            .redirect(Policy::limited(3))
             .build()
             .map_err(|_| RegistryError::Internal)?;
 
@@ -146,18 +154,12 @@ impl HttpAuthPlugin {
         let Some(endpoint) = &self.request_auth_endpoint else {
             debug!(
                 method,
-                path,
-                "external request-auth endpoint not configured; skipping external auth"
+                path, "external request-auth endpoint not configured; skipping external auth"
             );
             return Ok(None);
         };
         let url = format!("{}{}", self.base_url, endpoint);
-        debug!(
-            endpoint,
-            method,
-            path,
-            "attempting external request-auth"
-        );
+        debug!(endpoint, method, path, "attempting external request-auth");
         let response = self
             .client
             .post(url)
@@ -170,10 +172,7 @@ impl HttpAuthPlugin {
             .await
             .map_err(|err| {
                 error!(endpoint, error = ?err, "external request-auth call failed");
-                RegistryError::http(
-                    StatusCode::BAD_GATEWAY,
-                    "external request auth unavailable",
-                )
+                RegistryError::http(StatusCode::BAD_GATEWAY, "external request auth unavailable")
             })?;
 
         if response.status() == StatusCode::UNAUTHORIZED
@@ -210,26 +209,26 @@ impl HttpAuthPlugin {
             return Err(RegistryError::http(StatusCode::BAD_GATEWAY, message));
         }
 
-        let payload = response
-            .json::<Value>()
-            .await
-            .map_err(|err| {
-                error!(
-                    endpoint,
-                    method,
-                    path,
-                    error = ?err,
-                    "external request-auth returned invalid JSON payload"
-                );
-                RegistryError::http(StatusCode::BAD_GATEWAY, "external request auth bad payload")
-            })?;
+        let payload = response.json::<Value>().await.map_err(|err| {
+            error!(
+                endpoint,
+                method,
+                path,
+                error = ?err,
+                "external request-auth returned invalid JSON payload"
+            );
+            RegistryError::http(StatusCode::BAD_GATEWAY, "external request auth bad payload")
+        })?;
 
         if payload
             .get("authenticated")
             .and_then(Value::as_bool)
             .is_some_and(|authenticated| !authenticated)
         {
-            debug!(endpoint, method, path, "request auth returned authenticated=false");
+            debug!(
+                endpoint,
+                method, path, "request auth returned authenticated=false"
+            );
             return Ok(None);
         }
 
@@ -266,7 +265,10 @@ impl HttpAuthPlugin {
         }
 
         if username.is_none() && groups.is_empty() {
-            debug!(endpoint, method, path, "request auth returned empty identity");
+            debug!(
+                endpoint,
+                method, path, "request auth returned empty identity"
+            );
             return Ok(None);
         }
 
@@ -331,7 +333,10 @@ impl HttpAuthPlugin {
         package_name: &str,
     ) -> Result<Option<bool>, RegistryError> {
         let Some(endpoint) = endpoint else {
-            debug!(package_name, "external allow endpoint not configured; skipping allow hook");
+            debug!(
+                package_name,
+                "external allow endpoint not configured; skipping allow hook"
+            );
             return Ok(None);
         };
 
@@ -395,18 +400,15 @@ impl HttpAuthPlugin {
             return Err(RegistryError::http(status, message));
         }
 
-        let payload = response
-            .json::<Value>()
-            .await
-            .map_err(|err| {
-                error!(
-                    endpoint,
-                    package_name,
-                    error = ?err,
-                    "external allow hook returned invalid JSON payload"
-                );
-                RegistryError::http(StatusCode::BAD_GATEWAY, "external allow hook bad payload")
-            })?;
+        let payload = response.json::<Value>().await.map_err(|err| {
+            error!(
+                endpoint,
+                package_name,
+                error = ?err,
+                "external allow hook returned invalid JSON payload"
+            );
+            RegistryError::http(StatusCode::BAD_GATEWAY, "external allow hook bad payload")
+        })?;
 
         if let Some(allowed) = payload.get("allowed").and_then(Value::as_bool) {
             debug!(endpoint, package_name, allowed, "allow endpoint decision");
@@ -419,8 +421,7 @@ impl HttpAuthPlugin {
 
         debug!(
             endpoint,
-            package_name,
-            "allow endpoint did not return a decision"
+            package_name, "allow endpoint did not return a decision"
         );
         Ok(None)
     }

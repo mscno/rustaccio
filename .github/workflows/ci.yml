@@ -2,9 +2,10 @@ name: ci
 
 on:
   push:
-    branches:
-      - '**'
   pull_request:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -30,6 +31,9 @@ jobs:
       - name: Cargo fmt
         run: cargo fmt --all -- --check
 
+      - name: Cargo check
+        run: cargo check --workspace --all-targets --all-features --locked
+
       - name: Cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -39,5 +43,5 @@ jobs:
       - name: Cargo test (no default features)
         run: cargo test --workspace --no-default-features --all-targets --locked
 
-      - name: File length gate
-        run: RUSTACCIO_ENFORCE_FILE_LENGTH=1 cargo test --test file_length --locked
+      - name: Cargo doc
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked

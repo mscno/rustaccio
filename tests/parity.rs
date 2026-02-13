@@ -2,21 +2,27 @@ use axum::{
     body::Body,
     http::{Method, Request, StatusCode, header},
 };
+#[cfg(feature = "s3")]
 use flate2::{Compression, write::GzEncoder};
 use http_body_util::BodyExt;
 use rustaccio::{
     acl::{Acl, PackageRule},
     app::{AppState, build_router},
     config::{
-        AuthBackend, AuthPluginConfig, Config, HttpAuthPluginConfig, S3TarballStorageConfig,
-        TarballStorageBackend, TarballStorageConfig,
+        AuthBackend, AuthPluginConfig, Config, HttpAuthPluginConfig, TarballStorageBackend,
+        TarballStorageConfig,
     },
     runtime,
     storage::Store,
     upstream::Upstream,
 };
+#[cfg(feature = "s3")]
+use rustaccio::config::S3TarballStorageConfig;
 use serde_json::{Value, json};
-use std::{collections::HashMap, io::Write, path::PathBuf, sync::Arc};
+#[cfg(feature = "s3")]
+use std::io::Write;
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
+#[cfg(feature = "s3")]
 use tar::Builder as TarBuilder;
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -3201,6 +3207,7 @@ async fn generic_unmatched_routes_passthrough_returns_503_when_all_uplinks_fail(
     );
 }
 
+#[cfg(feature = "s3")]
 fn s3_test_config(data_dir: PathBuf, endpoint: String) -> Config {
     Config {
         bind: "127.0.0.1:0".parse().expect("bind"),
@@ -3241,6 +3248,7 @@ fn s3_test_config(data_dir: PathBuf, endpoint: String) -> Config {
     }
 }
 
+#[cfg(feature = "s3")]
 fn empty_s3_list_xml() -> &'static str {
     r#"<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -3252,6 +3260,7 @@ fn empty_s3_list_xml() -> &'static str {
 </ListBucketResult>"#
 }
 
+#[cfg(feature = "s3")]
 fn s3_list_xml(keys: &[&str]) -> String {
     let contents = keys
         .iter()
@@ -3268,6 +3277,7 @@ fn s3_list_xml(keys: &[&str]) -> String {
     )
 }
 
+#[cfg(feature = "s3")]
 fn npm_tarball_with_package_json(package_json: &Value) -> Vec<u8> {
     let mut tar_bytes = Vec::new();
     {
@@ -3288,6 +3298,7 @@ fn npm_tarball_with_package_json(package_json: &Value) -> Vec<u8> {
 }
 
 #[tokio::test]
+#[cfg(feature = "s3")]
 async fn s3_mode_loads_shared_state_snapshot() {
     let s3 = MockServer::start().await;
 
@@ -3357,6 +3368,7 @@ async fn s3_mode_loads_shared_state_snapshot() {
 }
 
 #[tokio::test]
+#[cfg(feature = "s3")]
 async fn s3_mode_persists_shared_state_snapshot_on_mutation() {
     let s3 = MockServer::start().await;
 
@@ -3412,6 +3424,7 @@ async fn s3_mode_persists_shared_state_snapshot_on_mutation() {
 }
 
 #[tokio::test]
+#[cfg(feature = "s3")]
 async fn s3_mode_writes_verdaccio_package_sidecar_on_publish() {
     let s3 = MockServer::start().await;
 
@@ -3492,6 +3505,7 @@ async fn s3_mode_writes_verdaccio_package_sidecar_on_publish() {
 }
 
 #[tokio::test]
+#[cfg(feature = "s3")]
 async fn s3_mode_indexes_tarballs_without_snapshot_for_search_and_browse() {
     let s3 = MockServer::start().await;
     let tarball_key = "registry/s3-scan/s3-scan-1.2.3.tgz";
@@ -3577,6 +3591,7 @@ async fn s3_mode_indexes_tarballs_without_snapshot_for_search_and_browse() {
 }
 
 #[tokio::test]
+#[cfg(feature = "s3")]
 async fn s3_mode_prefers_package_sidecar_metadata_over_startup_tarball_downloads() {
     let s3 = MockServer::start().await;
     let package = "@geoman-io/maplibre-geoman-free";
@@ -3692,6 +3707,7 @@ async fn s3_mode_prefers_package_sidecar_metadata_over_startup_tarball_downloads
 }
 
 #[tokio::test]
+#[cfg(feature = "s3")]
 async fn s3_mode_indexes_verdaccio_scoped_dash_layout_tarballs() {
     let s3 = MockServer::start().await;
     let key = "registry/@geoman-io/leaflet-geoman-free/-/leaflet-geoman-free-1.0.0.tgz";

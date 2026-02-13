@@ -273,15 +273,13 @@ impl Store {
                     }
                     if let Some(sidecar_version) =
                         Self::startup_metadata_for_version(package_metadata, version)
-                    {
-                        if let (Some(target), Some(source)) =
+                        && let (Some(target), Some(source)) =
                             (payload.as_object_mut(), sidecar_version.as_object())
-                        {
-                            for (key, value) in source {
-                                if target.get(key) != Some(value) {
-                                    target.insert(key.clone(), value.clone());
-                                    record_changed = true;
-                                }
+                    {
+                        for (key, value) in source {
+                            if target.get(key) != Some(value) {
+                                target.insert(key.clone(), value.clone());
+                                record_changed = true;
                             }
                         }
                     }
@@ -740,7 +738,10 @@ impl Store {
         path: &str,
     ) -> Result<Option<AuthIdentity>, RegistryError> {
         if let Some(hook) = &self.auth_hook {
-            debug!(method, path, "attempting request auth via embedded auth hook");
+            debug!(
+                method,
+                path, "attempting request auth via embedded auth hook"
+            );
             if let Some(identity) = hook.authenticate_request(token, method, path).await? {
                 debug!(
                     method,
@@ -754,7 +755,10 @@ impl Store {
             }
         }
         if let Some(plugin) = &self.auth_plugin {
-            debug!(method, path, "attempting request auth via external auth plugin");
+            debug!(
+                method,
+                path, "attempting request auth via external auth plugin"
+            );
             if let Some(identity) = plugin.authenticate_request(token, method, path).await? {
                 debug!(
                     method,
@@ -768,15 +772,20 @@ impl Store {
             }
         }
 
-        let local_identity = self
-            .username_from_auth_token(token)
-            .await
-            .map(|username| AuthIdentity {
-                username: Some(username),
-                groups: Vec::new(),
-            });
+        let local_identity =
+            self.username_from_auth_token(token)
+                .await
+                .map(|username| AuthIdentity {
+                    username: Some(username),
+                    groups: Vec::new(),
+                });
         if local_identity.is_some() {
-            debug!(method, path, source = "local_token_store", "request auth accepted");
+            debug!(
+                method,
+                path,
+                source = "local_token_store",
+                "request auth accepted"
+            );
         } else {
             debug!(method, path, "request auth yielded no identity");
         }

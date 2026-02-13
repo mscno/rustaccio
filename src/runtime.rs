@@ -55,6 +55,13 @@ pub async fn run(
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
 
+    if let Some(keep_alive_timeout_secs) = config.keep_alive_timeout_secs {
+        tracing::warn!(
+            keep_alive_timeout_secs,
+            "server.keepAliveTimeout is configured but currently not supported by this axum runtime path"
+        );
+    }
+
     tracing::info!(
         bind = %bind,
         data_dir,
@@ -63,6 +70,7 @@ pub async fn run(
     );
 
     axum::serve(listener, app)
+        .tcp_nodelay(true)
         .await
         .map_err(|_| RegistryError::Internal)
 }

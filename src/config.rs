@@ -160,6 +160,10 @@ impl Config {
         }
     }
 
+    pub fn defaults_for_examples() -> Self {
+        Self::defaults()
+    }
+
     fn apply_env_config_file_if_present(&mut self) {
         let Ok(path) = env::var("RUSTACCIO_CONFIG") else {
             return;
@@ -423,7 +427,7 @@ impl Config {
             .server
             .as_ref()
             .and_then(|server| server.trust_proxy.as_ref())
-            .is_some_and(|value| yaml_truthy(value));
+            .is_some_and(yaml_truthy);
         let keep_alive_timeout_secs = parsed.server.and_then(|server| server.keep_alive_timeout);
         let log_level = parsed
             .log
@@ -484,6 +488,14 @@ impl Config {
             tarball_storage,
         })
     }
+}
+
+pub fn default_http_auth_config_for_examples() -> HttpAuthPluginConfig {
+    default_http_auth_config()
+}
+
+pub fn default_s3_storage_config_for_examples() -> S3TarballStorageConfig {
+    default_s3_storage_config()
 }
 
 fn default_http_auth_config() -> HttpAuthPluginConfig {

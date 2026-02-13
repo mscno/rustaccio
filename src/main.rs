@@ -1,8 +1,10 @@
+#![forbid(unsafe_code)]
+
 use rustaccio::{
     config::Config,
     runtime::{run_from_env, run_standalone},
 };
-use std::path::PathBuf;
+use std::{path::PathBuf, thread};
 
 const USAGE: &str = "\
 Usage: rustaccio [OPTIONS]
@@ -48,8 +50,42 @@ where
     Ok(options)
 }
 
-#[tokio::main]
-async fn main() {
+fn parse_env_usize(key: &str, default: usize, min: usize, max: usize) -> usize {
+    let parsed = std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default);
+    parsed.clamp(min, max)
+}
+
+fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    let available_parallelism = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    let worker_threads_default = available_parallelism.clamp(2, 8);
+    let worker_threads = parse_env_usize(
+        "RUSTACCIO_TOKIO_WORKER_THREADS",
+        worker_threads_default,
+        1,
+        128,
+    );
+    let max_blocking_threads = parse_env_usize("RUSTACCIO_TOKIO_MAX_BLOCKING_THREADS", 64, 8, 512);
+    let thread_stack_size = parse_env_usize(
+        "RUSTACCIO_TOKIO_THREAD_STACK_SIZE",
+        1024 * 1024,
+        256 * 1024,
+        16 * 1024 * 1024,
+    );
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(worker_threads)
+        .max_blocking_threads(max_blocking_threads)
+        .thread_stack_size(thread_stack_size)
+        .build()
+}
+
+fn main() {
     let options = match parse_cli_args(std::env::args().skip(1)) {
         Ok(options) => options,
         Err(err) => {
@@ -63,17 +99,27 @@ async fn main() {
         return;
     }
 
-    let run_result = if let Some(config_path) = options.config_path {
-        match Config::from_env_with_config_file(config_path) {
-            Ok(config) => run_standalone(config).await,
-            Err(err) => {
-                eprintln!("invalid --config value: {err}");
-                std::process::exit(2);
-            }
+    let runtime = match build_runtime() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("failed to initialize tokio runtime: {err}");
+            std::process::exit(2);
         }
-    } else {
-        run_from_env().await
     };
+
+    let run_result = runtime.block_on(async {
+        if let Some(config_path) = options.config_path {
+            match Config::from_env_with_config_file(config_path) {
+                Ok(config) => run_standalone(config).await,
+                Err(err) => {
+                    eprintln!("invalid --config value: {err}");
+                    std::process::exit(2);
+                }
+            }
+        } else {
+            run_from_env().await
+        }
+    });
 
     if let Err(err) = run_result {
         eprintln!("server error: {err}");

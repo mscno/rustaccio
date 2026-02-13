@@ -982,8 +982,7 @@ async fn resolve_auth_identity(
             else {
                 warn!(
                     method = method.as_str(),
-                    path,
-                    "authorization token rejected by auth backends"
+                    path, "authorization token rejected by auth backends"
                 );
                 return Err(unauthorized_message_for_path(path));
             };

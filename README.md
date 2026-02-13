@@ -22,31 +22,51 @@ cargo run -- --config ./config.yml
 npm config set registry http://127.0.0.1:4873/
 ```
 
-## Run
+## Deployment
 
-Run with defaults (no config file):
+Standalone with defaults (no config file):
 
 ```bash
 cargo run
 ```
 
-Run with YAML config:
+Standalone with explicit config file:
 
 ```bash
 cargo run -- --config ./config.yml
 ```
 
-Run with help:
+Standalone help:
 
 ```bash
 cargo run -- --help
 ```
 
+Release binary:
+
+```bash
+cargo build --release
+./target/release/rustaccio --config ./config.yml
+```
+
+Container (local build + run):
+
+```bash
+docker build -t rustaccio:local .
+docker run --rm -p 4873:4873 \
+  -v "$(pwd)/.rustaccio-data:/var/lib/rustaccio/data" \
+  -v "$(pwd)/config.yml:/etc/rustaccio/config.yml:ro" \
+  -e RUSTACCIO_CONFIG=/etc/rustaccio/config.yml \
+  rustaccio:local
+```
+
 `--config` loads the given YAML file and fails fast if the file cannot be read or parsed.
 `RUSTACCIO_CONFIG` remains available as an environment-variable alternative.
-Merge precedence is: defaults < `RUSTACCIO_CONFIG` file < `--config` file < environment variables.
+Unified merge precedence is:
 
-`main` now delegates to library runtime (`rustaccio::runtime::run_from_env()`), so the same code path is used for standalone and embedded usage.
+`defaults < RUSTACCIO_CONFIG file < --config file < environment variables`.
+
+`main` delegates to library runtime (`rustaccio::runtime::run_from_env()`), so standalone and embedded usage share the same config/runtime path.
 
 Environment variables:
 
@@ -65,9 +85,18 @@ Environment variables:
 - `RUSTACCIO_URL_PREFIX` (default `/`)
 - `RUSTACCIO_TRUST_PROXY` (default `false`)
 - `RUSTACCIO_KEEP_ALIVE_TIMEOUT` (seconds, optional)
+- `RUSTACCIO_REQUEST_TIMEOUT_SECS` (default `30`, clamps `1..=300`)
 - `RUSTACCIO_LOG_LEVEL` (default `info`)
 - `RUSTACCIO_LOG_FORMAT` (`pretty`, `compact`, or `json`, default `pretty`)
 - `RUST_LOG` (optional full tracing filter; overrides default `rustaccio=<level>,tower_http=info`)
+- `RUSTACCIO_TOKIO_WORKER_THREADS` (default `min(max(available_parallelism, 2), 8)`)
+- `RUSTACCIO_TOKIO_MAX_BLOCKING_THREADS` (default `64`)
+- `RUSTACCIO_TOKIO_THREAD_STACK_SIZE` (bytes, default `1048576`)
+- `RUSTACCIO_UPSTREAM_CONNECT_TIMEOUT_SECS` (default `3`)
+- `RUSTACCIO_UPSTREAM_TIMEOUT_SECS` (default `20`)
+- `RUSTACCIO_UPSTREAM_POOL_IDLE_TIMEOUT_SECS` (default `30`)
+- `RUSTACCIO_UPSTREAM_POOL_MAX_IDLE_PER_HOST` (default `4`)
+- `RUSTACCIO_UPSTREAM_TCP_KEEPALIVE_SECS` (default `30`)
 - `RUSTACCIO_AUTH_BACKEND` (`local` or `http`, default `local`)
 - `RUSTACCIO_AUTH_HTTP_BASE_URL` (required for `http` auth backend)
 - `RUSTACCIO_AUTH_HTTP_ADDUSER_ENDPOINT` (default `/adduser`)
@@ -90,8 +119,14 @@ Environment variables:
 
 Build features:
 
-- `s3` feature enables native S3 tarball backend support (enabled by default).
-- Disable with `--no-default-features` if you want local-only tarball storage.
+- `s3` feature enables native S3 tarball backend support (disabled by default for a leaner production binary).
+- Enable with `--features s3` when you need S3 tarball storage.
+
+## CI and Releases
+
+- Rust CI is in `.github/workflows/ci.yml` and runs `fmt`, `check`, `clippy -D warnings`, tests (`all-features` and `no-default-features`), and docs with `-D warnings`.
+- Container publish is in `.github/workflows/docker-publish.yml` and pushes multi-arch images to `ghcr.io/<owner>/<repo>` on version tags (`vX.Y.Z`).
+- Keep a Changelog format changelog lives in `CHANGELOG.md`.
 
 ## Test
 
@@ -114,17 +149,110 @@ RUSTACCIO_ENFORCE_FILE_LENGTH=1 cargo test --test file_length
 
 ## Library Embedding
 
-You can use `rustaccio` as a library and inject your own in-process auth implementation:
+### User-Owned `main` with `--config`
+
+If you want your own binary entrypoint but keep rustaccio runtime/config behavior:
 
 ```rust
-use rustaccio::{auth::AuthHook, config::Config, runtime};
+use rustaccio::{config::Config, runtime};
+use std::{error::Error, path::PathBuf};
+
+fn parse_config_arg() -> Option<PathBuf> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--config" || arg == "-c" {
+            return args.next().map(PathBuf::from);
+        }
+        if let Some(value) = arg.strip_prefix("--config=") {
+            return Some(PathBuf::from(value));
+        }
+    }
+    None
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let cfg = if let Some(path) = parse_config_arg() {
+        Config::from_env_with_config_file(path)
+            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?
+    } else {
+        Config::from_env()
+    };
+
+    runtime::run_standalone(cfg).await?;
+    Ok(())
+}
+```
+
+### Custom `AuthHook` Implementation
+
+```rust
+use async_trait::async_trait;
+use rustaccio::{auth::AuthHook, error::RegistryError, models::AuthIdentity};
+
+#[derive(Default)]
+struct CompanyAuthHook;
+
+#[async_trait]
+impl AuthHook for CompanyAuthHook {
+    async fn authenticate_request(
+        &self,
+        token: &str,
+        _method: &str,
+        _path: &str,
+    ) -> Result<Option<AuthIdentity>, RegistryError> {
+        if token == "internal-token" {
+            return Ok(Some(AuthIdentity {
+                username: Some("ci-bot".to_string()),
+                groups: vec!["publishers".to_string()],
+            }));
+        }
+        Ok(None)
+    }
+
+    async fn allow_publish(
+        &self,
+        identity: Option<AuthIdentity>,
+        _package_name: &str,
+    ) -> Result<Option<bool>, RegistryError> {
+        let can_publish = identity
+            .as_ref()
+            .map(|id| id.groups.iter().any(|g| g == "publishers"))
+            .unwrap_or(false);
+        Ok(Some(can_publish))
+    }
+}
+```
+
+### Integrate into an Existing Axum Server
+
+```rust
+use axum::{Router, routing::get};
+use rustaccio::{app::build_router, runtime};
 use std::sync::Arc;
 
-// implement AuthHook in your crate
-let cfg = Config::from_env();
-let custom_hook: Arc<dyn AuthHook> = Arc::new(MyHook::default());
-runtime::run(cfg, Some(custom_hook)).await?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut cfg = rustaccio::config::Config::from_env();
+
+    // Router::nest("/registry", ...) strips the prefix before dispatch.
+    // Keep url_prefix as "/" in this mode.
+    cfg.url_prefix = "/".to_string();
+
+    let state = runtime::build_state(&cfg, Some(Arc::new(CompanyAuthHook::default()))).await?;
+    let registry_router = build_router(state);
+
+    let app = Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .nest("/registry", registry_router);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
 ```
+
+If you instead run rustaccio at the root path (not nested) behind a reverse proxy prefix, set `RUSTACCIO_URL_PREFIX` (for example `/registry`) so generated URLs include that prefix.
 
 Key APIs:
 - `rustaccio::auth::AuthHook`
