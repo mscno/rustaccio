@@ -2,6 +2,8 @@
 .github
 .env
 .rustaccio-data
+config.example.yml
+config.yml
 target
 node_modules
 verdaccio

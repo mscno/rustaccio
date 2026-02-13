@@ -60,6 +60,8 @@ docker run --rm -p 4873:4873 \
   rustaccio:local
 ```
 
+The Docker image compiles `rustaccio` with `--features s3` by default.
+
 `--config` loads the given YAML file and fails fast if the file cannot be read or parsed.
 `RUSTACCIO_CONFIG` remains available as an environment-variable alternative.
 Unified merge precedence is:
