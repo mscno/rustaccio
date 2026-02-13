@@ -1,5 +1,7 @@
 # rustaccio
 
+![Rustaccio logo](docs/logo.png)
+
 A Rust/Tokio/Axum npm registry proxy inspired by Verdaccio core behavior.
 
 ## Compatibility Policy
@@ -57,6 +59,8 @@ Container (local build + run):
 
 ```bash
 docker build -t rustaccio:local .
+# Lower memory pressure on constrained builders (slower compile):
+docker build --build-arg CARGO_BUILD_JOBS=1 -t rustaccio:local .
 docker run --rm -p 4873:4873 \
   -v "$(pwd)/.rustaccio-data:/var/lib/rustaccio/data" \
   -v "$(pwd)/config.yml:/etc/rustaccio/config.yml:ro" \
@@ -65,6 +69,7 @@ docker run --rm -p 4873:4873 \
 ```
 
 The Docker image compiles `rustaccio` with `--features s3` by default.
+The image does not include `config.example.yml`; mount your own config and set `RUSTACCIO_CONFIG`.
 
 `--config` loads the given YAML file and fails fast if the file cannot be read or parsed.
 `RUSTACCIO_CONFIG` remains available as an environment-variable alternative.

@@ -14,10 +14,7 @@ RUN cargo build --release --locked --features s3 -j "${CARGO_BUILD_JOBS}"
 
 FROM debian:bookworm-slim AS runtime
 
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends tini \
-  && rm -rf /var/lib/apt/lists/* \
-  && useradd --system --no-log-init --create-home --uid 10001 --home-dir /var/lib/rustaccio rustaccio
+RUN useradd --system --no-log-init --create-home --uid 10001 --home-dir /var/lib/rustaccio rustaccio
 
 WORKDIR /var/lib/rustaccio
 
@@ -30,5 +27,4 @@ ENV RUSTACCIO_DATA_DIR=/var/lib/rustaccio/data
 EXPOSE 4873
 USER rustaccio
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["rustaccio"]
+ENTRYPOINT ["/usr/local/bin/rustaccio"]
