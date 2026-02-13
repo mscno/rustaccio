@@ -1,4 +1,5 @@
 use crate::{
+    auth::AuthHook,
     auth_plugin::HttpAuthPlugin,
     config::AuthBackend,
     config::Config,
@@ -15,8 +16,8 @@ use crate::{
     },
     error::RegistryError,
     models::{
-        AuthTokenRecord, LoginSessionRecord, NpmTokenRecord, PackageRecord, PersistedState,
-        UserRecord,
+        AuthIdentity, AuthTokenRecord, LoginSessionRecord, NpmTokenRecord, PackageRecord,
+        PersistedState, UserRecord,
     },
     tarball_backend::TarballBackend,
 };
@@ -31,22 +32,38 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tokio::sync::RwLock;
+use tracing::{debug, instrument, warn};
 use uuid::Uuid;
 
-#[derive(Debug)]
+#[derive(Default)]
+pub struct StoreOptions {
+    pub auth_hook: Option<Arc<dyn AuthHook>>,
+}
+
 pub struct Store {
     state: RwLock<PersistedState>,
     state_file: PathBuf,
     tarball_backend: TarballBackend,
     auth_plugin: Option<HttpAuthPlugin>,
+    auth_hook: Option<Arc<dyn AuthHook>>,
     password_min_length: usize,
     login_session_ttl_seconds: i64,
 }
 
 impl Store {
+    #[instrument(skip(config), fields(data_dir = %config.data_dir.display(), auth_backend = ?config.auth_plugin.backend))]
     pub async fn open(config: &Config) -> Result<Self, RegistryError> {
+        Self::open_with_options(config, StoreOptions::default()).await
+    }
+
+    #[instrument(skip(config, options), fields(data_dir = %config.data_dir.display(), auth_backend = ?config.auth_plugin.backend, embedded_auth_hook = options.auth_hook.is_some()))]
+    pub async fn open_with_options(
+        config: &Config,
+        options: StoreOptions,
+    ) -> Result<Self, RegistryError> {
         tokio::fs::create_dir_all(&config.data_dir).await?;
         let tarball_backend = TarballBackend::from_config(config).await?;
 
@@ -75,14 +92,17 @@ impl Store {
             }
         };
 
-        Ok(Self {
+        let store = Self {
             state: RwLock::new(state),
             state_file,
             tarball_backend,
             auth_plugin,
+            auth_hook: options.auth_hook,
             password_min_length: config.password_min_length,
             login_session_ttl_seconds: config.login_session_ttl_seconds,
-        })
+        };
+        debug!("store initialized");
+        Ok(store)
     }
 
     fn now_ms() -> i64 {
@@ -154,6 +174,92 @@ impl Store {
             .map(|record| record.user.clone())
     }
 
+    pub async fn authenticate_request(
+        &self,
+        token: &str,
+        method: &str,
+        path: &str,
+    ) -> Result<Option<AuthIdentity>, RegistryError> {
+        if let Some(hook) = &self.auth_hook
+            && let Some(identity) = hook.authenticate_request(token, method, path).await?
+        {
+            return Ok(Some(identity));
+        }
+        if let Some(plugin) = &self.auth_plugin
+            && let Some(identity) = plugin.authenticate_request(token, method, path).await?
+        {
+            return Ok(Some(identity));
+        }
+        Ok(self
+            .username_from_auth_token(token)
+            .await
+            .map(|username| AuthIdentity {
+                username: Some(username),
+                groups: Vec::new(),
+            }))
+    }
+
+    pub async fn allow_access(
+        &self,
+        identity: Option<&AuthIdentity>,
+        package_name: &str,
+    ) -> Result<Option<bool>, RegistryError> {
+        if let Some(hook) = &self.auth_hook
+            && let Some(allowed) = hook.allow_access(identity.cloned(), package_name).await?
+        {
+            return Ok(Some(allowed));
+        }
+        if let Some(plugin) = &self.auth_plugin
+            && let Some(allowed) = plugin.allow_access(identity.cloned(), package_name).await?
+        {
+            return Ok(Some(allowed));
+        }
+        Ok(None)
+    }
+
+    pub async fn allow_publish(
+        &self,
+        identity: Option<&AuthIdentity>,
+        package_name: &str,
+    ) -> Result<Option<bool>, RegistryError> {
+        if let Some(hook) = &self.auth_hook
+            && let Some(allowed) = hook.allow_publish(identity.cloned(), package_name).await?
+        {
+            return Ok(Some(allowed));
+        }
+        if let Some(plugin) = &self.auth_plugin
+            && let Some(allowed) = plugin
+                .allow_publish(identity.cloned(), package_name)
+                .await?
+        {
+            return Ok(Some(allowed));
+        }
+        Ok(None)
+    }
+
+    pub async fn allow_unpublish(
+        &self,
+        identity: Option<&AuthIdentity>,
+        package_name: &str,
+    ) -> Result<Option<bool>, RegistryError> {
+        if let Some(hook) = &self.auth_hook
+            && let Some(allowed) = hook
+                .allow_unpublish(identity.cloned(), package_name)
+                .await?
+        {
+            return Ok(Some(allowed));
+        }
+        if let Some(plugin) = &self.auth_plugin
+            && let Some(allowed) = plugin
+                .allow_unpublish(identity.cloned(), package_name)
+                .await?
+        {
+            return Ok(Some(allowed));
+        }
+        Ok(None)
+    }
+
+    #[instrument(skip(self, password), fields(username = name))]
     pub async fn create_user(&self, name: &str, password: &str) -> Result<String, RegistryError> {
         if password.len() < self.password_min_length {
             return Err(RegistryError::http(
@@ -162,7 +268,31 @@ impl Store {
             ));
         }
 
+        if let Some(hook) = &self.auth_hook {
+            debug!("delegating user creation to embedded auth hook");
+            hook.add_user(name, password, self.password_min_length)
+                .await?;
+
+            let snapshot = {
+                let mut state = self.state.write().await;
+                let token = Self::random_token_hex(24);
+                state.auth_tokens.insert(
+                    token.clone(),
+                    AuthTokenRecord {
+                        user: name.to_string(),
+                        created_at: Self::now_ms(),
+                    },
+                );
+                (state.clone(), token)
+            };
+
+            self.persist_snapshot(&snapshot.0).await?;
+            debug!("created user via embedded auth hook");
+            return Ok(snapshot.1);
+        }
+
         if let Some(plugin) = &self.auth_plugin {
+            debug!("delegating user creation to auth plugin");
             plugin
                 .add_user(name, password, self.password_min_length)
                 .await?;
@@ -181,6 +311,7 @@ impl Store {
             };
 
             self.persist_snapshot(&snapshot.0).await?;
+            debug!("created user via auth plugin");
             return Ok(snapshot.1);
         }
 
@@ -216,11 +347,17 @@ impl Store {
         };
 
         self.persist_snapshot(&snapshot.0).await?;
+        debug!("created local user");
         Ok(snapshot.1)
     }
 
+    #[instrument(skip(self, password), fields(username = name))]
     pub async fn login_user(&self, name: &str, password: &str) -> Result<String, RegistryError> {
-        if let Some(plugin) = &self.auth_plugin {
+        if let Some(hook) = &self.auth_hook {
+            debug!("delegating login to embedded auth hook");
+            hook.authenticate(name, password).await?;
+        } else if let Some(plugin) = &self.auth_plugin {
+            debug!("delegating login to auth plugin");
             plugin.authenticate(name, password).await?;
         } else {
             let state = self.state.read().await;
@@ -247,6 +384,7 @@ impl Store {
         };
 
         self.persist_snapshot(&snapshot.0).await?;
+        debug!("user login succeeded");
         Ok(snapshot.1)
     }
 
@@ -255,6 +393,9 @@ impl Store {
         name: &str,
         password: &str,
     ) -> Result<(), RegistryError> {
+        if let Some(hook) = &self.auth_hook {
+            return hook.authenticate(name, password).await;
+        }
         if let Some(plugin) = &self.auth_plugin {
             return plugin.authenticate(name, password).await;
         }
@@ -269,12 +410,18 @@ impl Store {
         verify_password(&user.password_hash, password)
     }
 
+    #[instrument(skip(self, old, new), fields(username = name))]
     pub async fn change_password(
         &self,
         name: &str,
         old: &str,
         new: &str,
     ) -> Result<(), RegistryError> {
+        if let Some(hook) = &self.auth_hook {
+            return hook
+                .change_password(name, old, new, self.password_min_length)
+                .await;
+        }
         if let Some(plugin) = &self.auth_plugin {
             return plugin
                 .change_password(name, old, new, self.password_min_length)
@@ -304,9 +451,11 @@ impl Store {
         };
 
         self.persist_snapshot(&snapshot).await?;
+        debug!("password changed");
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub async fn create_login_session(&self) -> Result<String, RegistryError> {
         let session_id = Uuid::new_v4().to_string();
         let snapshot = {
@@ -321,6 +470,7 @@ impl Store {
             state.clone()
         };
         self.persist_snapshot(&snapshot).await?;
+        debug!("created login session");
         Ok(session_id)
     }
 
@@ -345,6 +495,7 @@ impl Store {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(session_id))]
     pub async fn poll_login_session(
         &self,
         session_id: &str,
@@ -373,12 +524,14 @@ impl Store {
 
         let oldest = Self::now_ms() - (self.login_session_ttl_seconds * 1000);
         if snapshot_result.2 < oldest {
+            warn!("login session token expired");
             return Err(RegistryError::http(
                 StatusCode::UNAUTHORIZED,
                 API_ERROR_SESSION_TOKEN_EXPIRED,
             ));
         }
 
+        debug!("login session completed");
         Ok(Some(snapshot_result.1))
     }
 
@@ -392,6 +545,7 @@ impl Store {
             .collect()
     }
 
+    #[instrument(skip(self, password, cidr_whitelist), fields(username = user, readonly))]
     pub async fn create_npm_token(
         &self,
         user: &str,
@@ -421,9 +575,11 @@ impl Store {
         };
 
         self.persist_snapshot(&snapshot).await?;
+        debug!("created npm token");
         Ok((token, raw_token))
     }
 
+    #[instrument(skip(self), fields(username = user))]
     pub async fn delete_npm_token(&self, user: &str, token_key: &str) -> Result<(), RegistryError> {
         let snapshot = {
             let mut state = self.state.write().await;
@@ -438,6 +594,7 @@ impl Store {
         };
 
         self.persist_snapshot(&snapshot).await?;
+        debug!("deleted npm token");
         Ok(())
     }
 
@@ -646,6 +803,7 @@ impl Store {
         Ok(())
     }
 
+    #[instrument(skip(self, body), fields(package = package_name, username))]
     pub async fn publish_manifest(
         &self,
         package_name: &str,
@@ -677,6 +835,7 @@ impl Store {
             };
 
             self.persist_snapshot(&snapshot).await?;
+            debug!("updated package owner/star metadata");
             return Ok(API_MESSAGE_PKG_CHANGED.to_string());
         }
 
@@ -716,6 +875,7 @@ impl Store {
             };
 
             self.persist_snapshot(&snapshot).await?;
+            debug!("applied metadata-only publish update");
             return Ok(API_MESSAGE_PKG_CHANGED.to_string());
         }
 
@@ -852,9 +1012,14 @@ impl Store {
         };
 
         self.persist_snapshot(&snapshot_and_message.0).await?;
+        debug!(
+            message = snapshot_and_message.1.as_str(),
+            "published package manifest"
+        );
         Ok(snapshot_and_message.1)
     }
 
+    #[instrument(skip(self), fields(package = package_name))]
     pub async fn remove_package(&self, package_name: &str) -> Result<String, RegistryError> {
         let snapshot = {
             let mut state = self.state.write().await;
@@ -870,9 +1035,11 @@ impl Store {
         let _ = self.tarball_backend.delete_package(package_name).await;
 
         self.persist_snapshot(&snapshot).await?;
+        debug!("removed package");
         Ok(API_MESSAGE_PKG_REMOVED.to_string())
     }
 
+    #[instrument(skip(self), fields(package = package_name, filename))]
     pub async fn remove_tarball(
         &self,
         package_name: &str,
@@ -945,6 +1112,7 @@ impl Store {
         };
 
         self.persist_snapshot(&snapshot).await?;
+        debug!("removed tarball");
         Ok(API_MESSAGE_TARBALL_REMOVED.to_string())
     }
 
@@ -1005,6 +1173,7 @@ impl Store {
         state.packages.get(package_name).cloned()
     }
 
+    #[instrument(skip(self, manifest, upstream_tarballs), fields(package = package_name, upstream_tarball_count = upstream_tarballs.len()))]
     pub async fn upsert_upstream_package(
         &self,
         package_name: &str,
@@ -1025,6 +1194,7 @@ impl Store {
         };
 
         self.persist_snapshot(&snapshot).await?;
+        debug!("upserted upstream package cache");
         Ok(())
     }
 
@@ -1057,6 +1227,7 @@ impl Store {
         Ok(())
     }
 
+    #[instrument(skip(self, content), fields(package = package_name, filename, bytes = content.len()))]
     pub async fn cache_tarball(
         &self,
         package_name: &str,

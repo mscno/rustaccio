@@ -4,6 +4,7 @@ use crate::{
 };
 use axum::http::StatusCode;
 use std::path::PathBuf;
+use tracing::{debug, instrument, warn};
 
 #[derive(Debug, Clone)]
 pub enum TarballBackend {
@@ -13,11 +14,13 @@ pub enum TarballBackend {
 }
 
 impl TarballBackend {
+    #[instrument(skip(config), fields(backend = ?config.tarball_storage.backend, data_dir = %config.data_dir.display()))]
     pub async fn from_config(config: &Config) -> Result<Self, RegistryError> {
         match config.tarball_storage.backend {
             TarballStorageBackend::Local => {
                 let root = config.data_dir.join("tarballs");
                 tokio::fs::create_dir_all(&root).await?;
+                debug!(root = %root.display(), "initialized local tarball backend");
                 Ok(Self::Local(LocalTarballBackend::new(root)))
             }
             TarballStorageBackend::S3 => {
@@ -102,6 +105,7 @@ impl LocalTarballBackend {
         self.root.join(Self::package_dir(package)).join(filename)
     }
 
+    #[instrument(skip(self, content), fields(package, filename, bytes = content.len()))]
     pub async fn put(
         &self,
         package: &str,
@@ -112,10 +116,12 @@ impl LocalTarballBackend {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::write(path, content).await?;
+        tokio::fs::write(&path, content).await?;
+        debug!(path = %path.display(), "wrote tarball to local storage");
         Ok(())
     }
 
+    #[instrument(skip(self), fields(package, filename))]
     pub async fn get(
         &self,
         package: &str,
@@ -123,24 +129,30 @@ impl LocalTarballBackend {
     ) -> Result<Option<Vec<u8>>, RegistryError> {
         let path = self.tarball_path(package, filename);
         if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            debug!(path = %path.display(), "local tarball missing");
             return Ok(None);
         }
+        debug!(path = %path.display(), "reading local tarball");
         Ok(Some(tokio::fs::read(path).await?))
     }
 
+    #[instrument(skip(self), fields(package, filename))]
     pub async fn delete(&self, package: &str, filename: &str) -> Result<bool, RegistryError> {
         let path = self.tarball_path(package, filename);
         if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
             return Ok(false);
         }
         tokio::fs::remove_file(path).await?;
+        debug!("deleted local tarball");
         Ok(true)
     }
 
+    #[instrument(skip(self), fields(package))]
     pub async fn delete_package(&self, package: &str) -> Result<(), RegistryError> {
         let path = self.root.join(Self::package_dir(package));
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
             let _ = tokio::fs::remove_dir_all(path).await;
+            debug!("deleted local package tarball directory");
         }
         Ok(())
     }
@@ -156,6 +168,7 @@ pub struct S3TarballBackend {
 
 #[cfg(feature = "s3")]
 impl S3TarballBackend {
+    #[instrument(skip(cfg), fields(bucket = cfg.bucket, region = cfg.region, endpoint = cfg.endpoint.as_deref().unwrap_or("<aws-default>")))]
     pub async fn new(cfg: &S3TarballStorageConfig) -> Result<Self, RegistryError> {
         if cfg.bucket.trim().is_empty() {
             return Err(RegistryError::http(
@@ -203,6 +216,7 @@ impl S3TarballBackend {
         format!("{}{}/", self.prefix, package.replace('/', "__"))
     }
 
+    #[instrument(skip(self), fields(key))]
     async fn exists(&self, key: &str) -> Result<bool, RegistryError> {
         match self
             .client
@@ -214,10 +228,14 @@ impl S3TarballBackend {
         {
             Ok(_) => Ok(true),
             Err(err) if is_not_found(&err) => Ok(false),
-            Err(_) => Err(RegistryError::Internal),
+            Err(_) => {
+                warn!("s3 head_object failed");
+                Err(RegistryError::Internal)
+            }
         }
     }
 
+    #[instrument(skip(self, content), fields(package, filename, bytes = content.len()))]
     pub async fn put(
         &self,
         package: &str,
@@ -232,9 +250,11 @@ impl S3TarballBackend {
             .send()
             .await
             .map_err(|_| RegistryError::Internal)?;
+        debug!("uploaded tarball to s3");
         Ok(())
     }
 
+    #[instrument(skip(self), fields(package, filename))]
     pub async fn get(
         &self,
         package: &str,
@@ -251,7 +271,10 @@ impl S3TarballBackend {
         {
             Ok(response) => response,
             Err(err) if is_not_found(&err) => return Ok(None),
-            Err(_) => return Err(RegistryError::Internal),
+            Err(_) => {
+                warn!("s3 get_object failed");
+                return Err(RegistryError::Internal);
+            }
         };
 
         let bytes = response
@@ -259,9 +282,12 @@ impl S3TarballBackend {
             .collect()
             .await
             .map_err(|_| RegistryError::Internal)?;
-        Ok(Some(bytes.into_bytes().to_vec()))
+        let bytes = bytes.into_bytes();
+        debug!(bytes = bytes.len(), "downloaded tarball from s3");
+        Ok(Some(bytes.to_vec()))
     }
 
+    #[instrument(skip(self), fields(package, filename))]
     pub async fn delete(&self, package: &str, filename: &str) -> Result<bool, RegistryError> {
         let key = self.key(package, filename);
         if !self.exists(&key).await? {
@@ -275,9 +301,11 @@ impl S3TarballBackend {
             .send()
             .await
             .map_err(|_| RegistryError::Internal)?;
+        debug!("deleted tarball from s3");
         Ok(true)
     }
 
+    #[instrument(skip(self), fields(package))]
     pub async fn delete_package(&self, package: &str) -> Result<(), RegistryError> {
         let mut continuation: Option<String> = None;
         let prefix = self.package_prefix(package);

@@ -1,3 +1,4 @@
+use crate::models::AuthIdentity;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,21 +46,21 @@ impl Acl {
             .or_else(|| self.rules.last())
     }
 
-    pub fn can_access(&self, package: &str, user: Option<&str>) -> bool {
+    pub fn can_access(&self, package: &str, identity: Option<&AuthIdentity>) -> bool {
         self.rule_for(package)
-            .map(|rule| permits(&rule.access, user))
+            .map(|rule| permits(&rule.access, identity))
             .unwrap_or(true)
     }
 
-    pub fn can_publish(&self, package: &str, user: Option<&str>) -> bool {
+    pub fn can_publish(&self, package: &str, identity: Option<&AuthIdentity>) -> bool {
         self.rule_for(package)
-            .map(|rule| permits(&rule.publish, user))
+            .map(|rule| permits(&rule.publish, identity))
             .unwrap_or(false)
     }
 
-    pub fn can_unpublish(&self, package: &str, user: Option<&str>) -> bool {
+    pub fn can_unpublish(&self, package: &str, identity: Option<&AuthIdentity>) -> bool {
         self.rule_for(package)
-            .map(|rule| permits(&rule.unpublish, user))
+            .map(|rule| permits(&rule.unpublish, identity))
             .unwrap_or(false)
     }
 
@@ -69,16 +70,21 @@ impl Acl {
     }
 }
 
-fn permits(principals: &[String], user: Option<&str>) -> bool {
+fn permits(principals: &[String], identity: Option<&AuthIdentity>) -> bool {
     if principals.is_empty() {
         return false;
     }
 
     principals.iter().any(|principal| match principal.as_str() {
         "$all" | "all" | "@all" => true,
-        "$anonymous" | "@anonymous" => user.is_none(),
-        "$authenticated" | "@authenticated" => user.is_some(),
-        other => user == Some(other),
+        "$anonymous" | "@anonymous" => identity.is_none(),
+        "$authenticated" | "@authenticated" => identity.is_some(),
+        other => identity
+            .map(|id| {
+                id.username.as_deref() == Some(other)
+                    || id.groups.iter().any(|group| group == other)
+            })
+            .unwrap_or(false),
     })
 }
 

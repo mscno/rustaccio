@@ -1,0 +1,474 @@
+{
+  "users": {},
+  "auth_tokens": {},
+  "npm_tokens": [],
+  "login_sessions": {},
+  "packages": {
+    "web": {
+      "manifest": {
+        "_id": "web",
+        "_rev": "37-f4747d2122c7c3ed051ff337235d1ed7",
+        "author": {
+          "name": "Tim Caswell"
+        },
+        "description": "A small and fast web/http library for nodejs. (replaces the built-in http module)",
+        "dist-tags": {
+          "latest": "0.0.2"
+        },
+        "license": "MIT",
+        "maintainers": [
+          {
+            "email": "tim@creationix.com",
+            "name": "creationix"
+          }
+        ],
+        "name": "web",
+        "readme": "ERROR: No README.md file found!",
+        "repository": {
+          "type": "git",
+          "url": "git://github.com/creationix/node-web.git"
+        },
+        "time": {
+          "0.0.0": "2012-09-13T05:12:51.358Z",
+          "0.0.1": "2013-01-31T17:18:19.733Z",
+          "0.0.2": "2013-01-31T19:50:36.663Z",
+          "created": "2012-09-13T05:12:45.210Z",
+          "modified": "2025-10-26T21:43:13.001Z"
+        },
+        "users": {
+          "abdelinfo": true,
+          "albertomedina369258147": true,
+          "alon.weissfeld": true,
+          "b.abdellatif": true,
+          "cesar_orozco": true,
+          "defcon41": true,
+          "gameesus": true,
+          "jhunior_d2": true,
+          "lunatico23": true,
+          "okjodom": true,
+          "opesicka": true,
+          "scull7": true
+        },
+        "versions": {
+          "0.0.0": {
+            "_id": "web@0.0.0",
+            "_npmUser": {
+              "email": "tim@creationix.com",
+              "name": "creationix"
+            },
+            "_npmVersion": "1.1.59",
+            "author": {
+              "name": "Tim Caswell"
+            },
+            "dependencies": {},
+            "description": "A small and fast web/http library for nodejs. (replaces the built-in http module)",
+            "devDependencies": {},
+            "directories": {},
+            "dist": {
+              "integrity": "sha512-2FfDwy5dADuNdq8mLKeCs/nyM2MrRDpmivvYHHjsDOuObCGQDKhH/a3mppicYk9EEkOsiAbs1+IXK7qa4SKEKg==",
+              "shasum": "fdb58b2882280f4449bc0f447d4504d27f8e1fae",
+              "signatures": [
+                {
+                  "keyid": "SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA",
+                  "sig": "MEQCIHjfX7/sMmjkH58HTQHJW++Bb76j9gEFGWjftRi/PVtXAiAVXt00HSc80GWVbvKIifHZAlkjlePPwrLCDYqKqv3reg=="
+                }
+              ],
+              "tarball": "http://127.0.0.1:4873/web/-/web-0.0.0.tgz"
+            },
+            "license": "MIT",
+            "main": "web.js",
+            "maintainers": [
+              {
+                "email": "tim@creationix.com",
+                "name": "creationix"
+              }
+            ],
+            "name": "web",
+            "readme": "ERROR: No README.md file found!",
+            "repository": {
+              "type": "git",
+              "url": "git://github.com/creationix/node-web.git"
+            },
+            "scripts": {
+              "test": "echo \"Error: no test specified\" && exit 1"
+            },
+            "version": "0.0.0"
+          },
+          "0.0.1": {
+            "_from": ".",
+            "_id": "web@0.0.1",
+            "_npmUser": {
+              "email": "tim@creationix.com",
+              "name": "creationix"
+            },
+            "_npmVersion": "1.2.2",
+            "author": {
+              "name": "Tim Caswell"
+            },
+            "dependencies": {},
+            "description": "A small and fast web/http library for nodejs. (replaces the built-in http module)",
+            "devDependencies": {},
+            "directories": {},
+            "dist": {
+              "integrity": "sha512-y3IW+gAfEwxR6yj+ePc63cBDHNnxgKIEetxz6qqabnIf++9vdAzwKfmfNpykXtQl2C+Tu3g1WaK3bXGDPnTRgg==",
+              "shasum": "73962ed3a2aaa4e4c3f79a9397e24050ecd1129c",
+              "signatures": [
+                {
+                  "keyid": "SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA",
+                  "sig": "MEUCIB0co6f1TuX7zm8Tn8SG/ouMvScFFJX+EOo9TpeI/gZ1AiEA8Ku+3GgSWZ4TVJGDq+l00tfIEA68L69ZWoxx1TgBPbI="
+                }
+              ],
+              "tarball": "http://127.0.0.1:4873/web/-/web-0.0.1.tgz"
+            },
+            "license": "MIT",
+            "main": "web.js",
+            "maintainers": [
+              {
+                "email": "tim@creationix.com",
+                "name": "creationix"
+              }
+            ],
+            "name": "web",
+            "readme": "# Web\n\nWeb is a new node module designed for building web applications.  It's intended to replace the built-in `http` module as well as middle-ware systems like connect and stack.\n\nAs the creator of the connect/stack interface, I've learned a lot over the years about what I could have done better.  Also the built-in `http` module in node itself has gotten bloated and complex since we've learned as we've gone on.  Features can be added a lot easier than they can be removed.  As a result, there are many different optional interfaces in the node HTTP interface.\n\nThe new interface for web app layers found in `web` is closer modeled after the ideas in wsgi, rack, jsgi, strata.js and friends.  This allows for easy module composition and a simple but powerful interface through which layers can work together to build a complex web application.\n\n## The Old Interface\n\nIn the old node interface as exposed by the `http` module, you create an HTTP server and pass it an HTTP request handler function.\n\nUsage looks like:\n\n```js\n// Old \"http\" handler interface built-in to node.js\nfunction handler(request, response) {\n  // request.method is \"GET\", \"PUT\", \"POST\", etc..\n  // request.url is \"/foo/bar?and=stuff\" ...\n  // and other interesting properties.\n  // Also request itself is a readable node stream\n  // representing the http request body.\n\n  // response.writeHead(code, headers)\n  // response.write(data)\n  // response.end(optionalData)\n  // and *many* other interfaces and alternate methods for setting\n  // headers and code.\n  // also the response object is a writable node stream representing\n  // the response body.\n}\n\n// Create a TCP server that parses HTTP protocol and\n// calls the handler function on each request.\nvar server = http.createServer(handler);\nserver.listen(8080);\n```\n\nThis interface alone is not easy to wrap application layers and so middle-ware dispatchers like connect and stack were invented to ease the pain.  They still have several problems however.\n\nConsidering it's history, this module has a pretty good API, but there is only so much you can do if you're learning as you go and are unable to break backwards compatibility.  Cruft will accumulate even under the watchful eye of the best maintainers.\n\n## The New Way\n\nThe new interface is changed slightly.\n\nFirstly, instead of a `response` object that's both response stream and object full of random methods, there is a `respond` function that accepts status code, headers, and body.\n\nSecond, it's not bound to the `net` module anymore.  I believe that parsing HTTP and listening on a real network socket should be two different responsibilities.  If you separate the two, then it's much easier to create mock servers that listen on fake sockets or exotic real servers that aren't TCP based.\n\n```js\nvar app = function (request, respond) {\n  // request.method is \"GET\", \"POST\", \"PUT\", etc..\n  // request.url is { pathname: \"/foo/bar\", query: \"and=stuff\" ...}\n  // request is still the request stream, but I'm thinking of moving\n  // it to a .body property.\n\n  // respond(code, headers, body) is a function\n  // body can be a string or a writable stream.\n}\n\n// This handler function expects a raw TCP connection\n// It handles HTTP parsing internally\nvar handler = require('web').socketHandler(app);\n\n// To serve the HTTP app over TCP, we only need to connect to a TCP server.\nvar server = require('net').createServer(handler);\nserver.listen(8080);\n```\n\n",
+            "readmeFilename": "README.md",
+            "repository": {
+              "type": "git",
+              "url": "git://github.com/creationix/node-web.git"
+            },
+            "scripts": {
+              "test": "echo \"Error: no test specified\" && exit 1"
+            },
+            "version": "0.0.1"
+          },
+          "0.0.2": {
+            "_from": ".",
+            "_id": "web@0.0.2",
+            "_npmUser": {
+              "email": "tim@creationix.com",
+              "name": "creationix"
+            },
+            "_npmVersion": "1.2.2",
+            "author": {
+              "name": "Tim Caswell"
+            },
+            "dependencies": {},
+            "description": "A small and fast web/http library for nodejs. (replaces the built-in http module)",
+            "devDependencies": {},
+            "directories": {},
+            "dist": {
+              "integrity": "sha512-DDf86rBor7Hn4uRgXbCxcOKyP8aiokvkd648k/xjKUO4hQSLvupfDC3dHCBXQ4lJFxYW62/CEWpSINbSQRr57A==",
+              "shasum": "d9e227387306db8c4b239f0f4bae7fc14b4c117a",
+              "signatures": [
+                {
+                  "keyid": "SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA",
+                  "sig": "MEUCIQCSVVBzWdltLwRYWoScl766hukDBkI1RyZCe+NSBYEvHAIgG2JnbQ9Vz060r72kIdQc6IGcT+euUtt7dqrOoEHgdi8="
+                }
+              ],
+              "tarball": "http://127.0.0.1:4873/web/-/web-0.0.2.tgz"
+            },
+            "license": "MIT",
+            "main": "web.js",
+            "maintainers": [
+              {
+                "email": "tim@creationix.com",
+                "name": "creationix"
+              }
+            ],
+            "name": "web",
+            "readme": "# Web\n\nWeb is a new node module designed for building web applications.  It's intended to replace the built-in `http` module as well as middle-ware systems like connect and stack.\n\nAs the creator of the connect/stack interface, I've learned a lot over the years about what I could have done better.  Also the built-in `http` module in node itself has gotten bloated and complex since we've learned as we've gone on.  Features can be added a lot easier than they can be removed.  As a result, there are many different optional interfaces in the node HTTP interface.\n\nThe new interface for web app layers found in `web` is closer modeled after the ideas in wsgi, rack, jsgi, strata.js and friends.  This allows for easy module composition and a simple but powerful interface through which layers can work together to build a complex web application.\n\n## The Old Interface\n\nIn the old node interface as exposed by the `http` module, you create an HTTP server and pass it an HTTP request handler function.\n\nUsage looks like:\n\n```js\n// Old \"http\" handler interface built-in to node.js\nfunction handler(request, response) {\n  // request.method is \"GET\", \"PUT\", \"POST\", etc..\n  // request.url is \"/foo/bar?and=stuff\" ...\n  // and other interesting properties.\n  // Also request itself is a readable node stream\n  // representing the http request body.\n\n  // response.writeHead(code, headers)\n  // response.write(data)\n  // response.end(optionalData)\n  // and *many* other interfaces and alternate methods for setting\n  // headers and code.\n  // also the response object is a writable node stream representing\n  // the response body.\n}\n\n// Create a TCP server that parses HTTP protocol and\n// calls the handler function on each request.\nvar server = http.createServer(handler);\nserver.listen(8080);\n```\n\nThis interface alone is not easy to wrap application layers and so middle-ware dispatchers like connect and stack were invented to ease the pain.  They still have several problems however.\n\nConsidering it's history, this module has a pretty good API, but there is only so much you can do if you're learning as you go and are unable to break backwards compatibility.  Cruft will accumulate even under the watchful eye of the best maintainers.\n\n## The New Way\n\nThe new interface is changed slightly.\n\nFirstly, instead of a `response` object that's both response stream and object full of random methods, there is a `respond` function that accepts status code, headers, and body.\n\nSecond, it's not bound to the `net` module anymore.  I believe that parsing HTTP and listening on a real network socket should be two different responsibilities.  If you separate the two, then it's much easier to create mock servers that listen on fake sockets or exotic real servers that aren't TCP based.\n\n```js\nvar app = function (request, respond) {\n  // request.method is \"GET\", \"POST\", \"PUT\", etc..\n  // request.url is the raw request path \"/foo/bar?and=stuff\"\n  // request.headers is the raw array of request headers.\n  // request.body is the request body as a stream.\n\n  // respond(code, headers, body) is a function\n  // body can be a string or a writable stream.\n}\n\n// This handler function expects a raw TCP connection\n// It handles HTTP parsing internally\nvar handler = require('web').socketHandler(app);\n\n// To serve the HTTP app over TCP, we only need to connect to a TCP server.\nvar server = require('net').createServer(handler);\nserver.listen(8080);\n```\n\n## Built-in Middleware System\n\nUnlike the `http` module, `web` makes it trivial to stack app layers.  There is no need for a library because all that's needed is a simple function.  Any function that implements the `(request, respond)` interface is a valid web application.\n\n### Basic Logger Layer\n\nSuppose you wanted to add a layer that logged all request and the response code the app gave them.\n\nThis can be done simple as:\n\n```js\nfunction logger(app) {\n  // Any per-layer startup logic would go here.\n  // We only need the app closure reference, so there is nothing else to do\n\n  return function(req, res) {\n\n    // Per request logic during the inward path would go here.  Since\n    // we want to wait till the response code is generated, there is nothing\n    // to do.\n\n    // Forward to the next layer inward.\n    app(req, function (code, headers, body) {\n\n      // Here we've intercepted the response function and can do stuff on the\n      // way back out of the layers.  We want to log the request and response.\n\n      console.log(req.method + \" \" + req.url.path + \" \" + code);\n\n      // Forward to the layers outward.\n      res(code, headers, body);\n    });\n  };\n}\n\n// Then to use this layer, we just wrap out app.\napp = logger(app);\n```\n\nAs you can see, there are places to do logic at several steps in a request and server lifetime.\n\n\n## Request Object\n\nThe request object contains the following properties.\n\n### req.method\n\nThis is the HTTP method in the request.  It can have values like \"GET\", \"POST\", \"PUT\", \"DELETE\", and any other value the node http parser supports.\n\n\n### req.headers\n\nThis is a hash of the headers with keys lowercases for easy access.\n\nIt can be used as:\n\n```js\nif (req.headers[\"content-type\"] === \"application/json\") { ... }\n```\n\n### req.url\n\nThis is the result of node's url.parse on the http request url.\n`req.url.path` contains the original raw string if desired.\n`req.url.pathname` is the path alone without query strings.\n\n### req.versionMajor, req.versionMinor\n\nThese two properties tell you the version of the http request.  They are usually either (1, 0) or (1, 1) for HTTP 1.0 and HTTP 1.1.\n\n### req.shouldKeepAlive\n\nThis is a hint set by node's http parser to tell the middleware if it should\nkeepalive the connection.\n\n### req.upgrade\n\nThis is another hint set by node's http parser.  It's true for upgrade request like websocket connections.\n\n\n### req.body\n\nThis property is set by the web library.  It's a readable node stream for the request body.\n\n### req.rawHeaders\n\nThis is a raw array of alternating key/value pairs.  For example, the headers from a curl request look like:\n\n```js\nreq.rawHeaders = [\n  'User-Agent', 'curl/7.26.0',\n  'Host',       'localhost:8080',\n  'Accept',     '*/*' ]\n```\n\n## Post response processing.\n\nThe built-in response function does a bit of post-processing after your app is\ndone to help your app be a proper http server.  These post-processing filters can be configured in the socketHandler function's options argument.\n\n### options.autoDate = true\n\nThis options adds a `Date` header with the current date as required by the HTTP spec if your response does not have a `Date` header.\n\n### options.autoServer = \"node.js \" + process.version\n\nAdds a `Server` header with the running version of node if you don't have a `Server` header.  Set to some falsy value to disable or set to a new string to replace.\n\n### options.autoContentLength = true\n\nIf your body is a known size (not streaming) and you leave out the `Content-Length` header, this will add one for you.\n\n### options.autoChunked = true\n\nIf you leave out a `Content-Length` header and your body is streaming, it will replace your stream with a chunked encoded stream and set the proper `Transfer-Encoding: chunked` header for you.\n\n### options.autoConnection = true\n\nThis will try to detect what the `Connection` header should be.  Usually either `close` or `keep-alive`.  Also it will update `req.shouldKeepAlive` which controls the tcp level connection behavior.\n\n",
+            "readmeFilename": "README.md",
+            "repository": {
+              "type": "git",
+              "url": "git://github.com/creationix/node-web.git"
+            },
+            "scripts": {
+              "test": "echo \"Error: no test specified\" && exit 1"
+            },
+            "version": "0.0.2"
+          }
+        }
+      },
+      "upstream_tarballs": {
+        "web-0.0.1.tgz": "https://registry.npmjs.org/web/-/web-0.0.1.tgz",
+        "web-0.0.2.tgz": "https://registry.npmjs.org/web/-/web-0.0.2.tgz",
+        "web-0.0.0.tgz": "https://registry.npmjs.org/web/-/web-0.0.0.tgz"
+      },
+      "updated_at": 1771017228325
+    },
+    "geoman": {
+      "manifest": {
+        "_id": "geoman",
+        "_rev": "2-8d0bb3b560569dee9dea2191043283b6",
+        "author": {
+          "name": "moxhe"
+        },
+        "bugs": {
+          "url": "https://github.com/HexMox/geoman/issues"
+        },
+        "description": "a scaffolding tool by nodejs, alternative to yeoman",
+        "dist-tags": {
+          "latest": "0.1.0-alpha.2"
+        },
+        "homepage": "https://github.com/HexMox/geoman",
+        "keywords": [
+          "scaffolding"
+        ],
+        "license": "MIT",
+        "maintainers": [
+          {
+            "email": "hex_mox@foxmail.com",
+            "name": "hexmox"
+          }
+        ],
+        "name": "geoman",
+        "readme": "<!-- ![这里放LOGO](上传的LOGO的图链接)\n\n![这里是各种badge](badge的链接)\n![这里是各种badge](badge的链接)\n![这里是各种badge](badge的链接) -->\n\na scaffolding tool by nodejs, alternative to yeoman.\n\n## Usage\n\n> npm install -D geoman\n\n> npx geoman <generator>:<task> [dir]\n\n## Features\n\nComing soon...\n\n## Roadmap\n\n* support `filters` option\n* support using npm package to generate\n* support composing generators\n* smarter shims-options and base-options merge\n\n## Getting started\n\n1. write or find your generator\n2. run your generator\n\n## Contributing\n\nComing soon...\n<!-- Anyone can help make this project better - check out our Contributing guide! -->\n\n## Contributors\n",
+        "readmeFilename": "README.md",
+        "repository": {
+          "type": "git",
+          "url": "git+https://github.com/HexMox/geoman.git"
+        },
+        "time": {
+          "0.1.0-alpha.1": "2020-09-23T09:12:38.419Z",
+          "0.1.0-alpha.2": "2020-09-23T09:20:15.760Z",
+          "created": "2020-09-23T09:12:38.225Z",
+          "modified": "2022-05-03T13:59:22.593Z"
+        },
+        "versions": {
+          "0.1.0-alpha.1": {
+            "_hasShrinkwrap": false,
+            "_id": "geoman@0.1.0-alpha.1",
+            "_nodeVersion": "12.16.2",
+            "_npmOperationalInternal": {
+              "host": "s3://npm-registry-packages",
+              "tmp": "tmp/geoman_0.1.0-alpha.1_1600852358225_0.8390441136883069"
+            },
+            "_npmUser": {
+              "email": "hex_mox@foxmail.com",
+              "name": "hexmox"
+            },
+            "_npmVersion": "6.14.1",
+            "author": {
+              "name": "moxhe"
+            },
+            "bin": {
+              "goman": "dist/bin.js"
+            },
+            "bugs": {
+              "url": "https://github.com/HexMox/goman/issues"
+            },
+            "dependencies": {
+              "commander": "^6.1.0",
+              "debug": "^4.1.1",
+              "gulp": "^4.0.2",
+              "gulp-rename": "^2.0.0",
+              "gulp-template": "^5.0.0",
+              "inquirer": "^7.3.3",
+              "lodash": "^4.17.20",
+              "shelljs": "^0.8.4"
+            },
+            "description": "a scaffolding tool by nodejs, alternative to yeoman",
+            "devDependencies": {
+              "@commitlint/config-conventional": "^8.3.4",
+              "@types/debug": "^4.1.5",
+              "@types/gulp": "^4.0.6",
+              "@types/gulp-rename": "0.0.33",
+              "@types/gulp-template": "^5.0.1",
+              "@types/inquirer": "^7.3.1",
+              "@types/jest": "^26.0.13",
+              "@types/lodash": "^4.14.161",
+              "@types/node": "^14.6.2",
+              "@types/shelljs": "^0.8.8",
+              "@typescript-eslint/eslint-plugin": "^4.0.1",
+              "@typescript-eslint/parser": "^4.0.1",
+              "commitlint": "^9.1.2",
+              "eslint": "^7.8.0",
+              "eslint-config-imweb": "^0.2.19",
+              "eslint-config-prettier": "^6.11.0",
+              "husky": "^4.2.5",
+              "jest": "^26.4.2",
+              "lint-staged": "^10.2.13",
+              "prettier-eslint": "^11.0.0",
+              "prettier-eslint-cli": "^5.0.0",
+              "ts-jest": "^26.3.0",
+              "typescript": "^4.0.2"
+            },
+            "directories": {},
+            "dist": {
+              "fileCount": 28,
+              "integrity": "sha512-aDkf25qs78EKZEdGfG16ll7OTQ20eXe0Sf2Z0TIa/cE52bmPNmIiJAKnnPoXKTOcUdzVZ3pW7MGFwvMdleqr6Q==",
+              "npm-signature": "-----BEGIN PGP SIGNATURE-----\r\nVersion: OpenPGP.js v3.0.13\r\nComment: https://openpgpjs.org\r\n\r\nwsFcBAEBCAAQBQJfaxGGCRA9TVsSAnZWagAArwoP/jovHkfs0Gmwusk3yP0X\nKQHfpMHJlrwKFlK31CLrW0wa7DohNIWdPkueBcJHPRIiCgcpkrzYUiY5+HwN\ncNZqMeOMvjjs3CatN/gAXIHEc92d9x1lcg9DTepqG+BD+wRanEZ3ay7eKC60\nWBowqXeNXaQRVpn9pntBzbJz2kYR4HDPqjpLKUeRDFtREf2l2EudjLYSAGvm\njEKSzV1xFqlKHTzohYZo26HjM6Py+ijV07/sZF6hyWbLydjqUuxjsonEmpS+\nbHNd5PyWjPyyKE0hBavScAUTIw7k+MmRG6nw+7m27a3/L4XIFW68/R2Rzpam\naaVTDEvlhswdj0qEOrKEdbkvMY4qbqafODOv3habmzPm8KK6g+oSxTdgcr56\nSts3EtS6Ao9VY7fdQRd4T8ssb3oxjsjV1ausYfcHd3qR0l2VDkShv5vIvZKL\nP26TTWcZJDjaROvteIY7U7mDkBCxOuRkn5vcUZ0GUlEM+x/6+guz1av71IMY\nTHgXvQyCw2zZuoGq3KS56W0FM1aGBQImwnxfRsQBiCO/jnZwrp+0k+9BgTky\nbETPrnEe0xg1/uRyb1RQO+t0kwUNhSzOig3JnMThDfbpPZGugfoipVmShpHT\nxKt6V+aG5fB3svxaq/kLmehjiW2ms+5n6ixQZva9DMUymY4XjjKiHowND1Jg\ndjDY\r\n=wnTV\r\n-----END PGP SIGNATURE-----\r\n",
+              "shasum": "a9a799b209ce812b63375cac2bee51fb436fd7ae",
+              "signatures": [
+                {
+                  "keyid": "SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA",
+                  "sig": "MEUCIHuEGiAyQyxb2eEITQ9kRH0x/QsChCALeNcyZyCKMCjZAiEArUhg3RYXVg4ZkhI1XJIoUAhCztikws50EPuU/EJBGSQ="
+                }
+              ],
+              "tarball": "http://127.0.0.1:4873/geoman/-/geoman-0.1.0-alpha.1.tgz",
+              "unpackedSize": 26622
+            },
+            "gitHead": "ff97485f427a458fb17d44901d3f3b3c3a28e916",
+            "homepage": "https://github.com/HexMox/goman#readme",
+            "husky": {
+              "hooks": {
+                "commit-msg": "commitlint -E HUSKY_GIT_PARAMS",
+                "pre-commit": "lint-staged",
+                "pre-push": "npm test"
+              }
+            },
+            "keywords": [
+              "scaffolding"
+            ],
+            "license": "MIT",
+            "lint-staged": {
+              "*.{ts,tsx}": [
+                "prettier-eslint --single-quote --write",
+                "eslint --fix",
+                "git add"
+              ]
+            },
+            "main": "./dist/index.js",
+            "maintainers": [
+              {
+                "email": "hex_mox@foxmail.com",
+                "name": "hexmox"
+              }
+            ],
+            "name": "geoman",
+            "repository": {
+              "type": "git",
+              "url": "git+https://github.com/HexMox/goman.git"
+            },
+            "scripts": {
+              "build": "tsc -p tsconfig.json",
+              "dist": "npm publish --registry=https://registry.npmjs.org/",
+              "prepublish": "npm run build",
+              "start": "tsc -w -p tsconfig.json",
+              "test": "jest"
+            },
+            "version": "0.1.0-alpha.1"
+          },
+          "0.1.0-alpha.2": {
+            "_hasShrinkwrap": false,
+            "_id": "geoman@0.1.0-alpha.2",
+            "_nodeVersion": "12.16.2",
+            "_npmOperationalInternal": {
+              "host": "s3://npm-registry-packages",
+              "tmp": "tmp/geoman_0.1.0-alpha.2_1600852815617_0.4623739297545919"
+            },
+            "_npmUser": {
+              "email": "hex_mox@foxmail.com",
+              "name": "hexmox"
+            },
+            "_npmVersion": "6.14.1",
+            "author": {
+              "name": "moxhe"
+            },
+            "bin": {
+              "geoman": "dist/bin.js"
+            },
+            "bugs": {
+              "url": "https://github.com/HexMox/geoman/issues"
+            },
+            "dependencies": {
+              "commander": "^6.1.0",
+              "debug": "^4.1.1",
+              "gulp": "^4.0.2",
+              "gulp-rename": "^2.0.0",
+              "gulp-template": "^5.0.0",
+              "inquirer": "^7.3.3",
+              "lodash": "^4.17.20",
+              "shelljs": "^0.8.4"
+            },
+            "description": "a scaffolding tool by nodejs, alternative to yeoman",
+            "devDependencies": {
+              "@commitlint/config-conventional": "^8.3.4",
+              "@types/debug": "^4.1.5",
+              "@types/gulp": "^4.0.6",
+              "@types/gulp-rename": "0.0.33",
+              "@types/gulp-template": "^5.0.1",
+              "@types/inquirer": "^7.3.1",
+              "@types/jest": "^26.0.13",
+              "@types/lodash": "^4.14.161",
+              "@types/node": "^14.6.2",
+              "@types/shelljs": "^0.8.8",
+              "@typescript-eslint/eslint-plugin": "^4.0.1",
+              "@typescript-eslint/parser": "^4.0.1",
+              "commitlint": "^9.1.2",
+              "eslint": "^7.8.0",
+              "eslint-config-imweb": "^0.2.19",
+              "eslint-config-prettier": "^6.11.0",
+              "husky": "^4.2.5",
+              "jest": "^26.4.2",
+              "lint-staged": "^10.2.13",
+              "prettier-eslint": "^11.0.0",
+              "prettier-eslint-cli": "^5.0.0",
+              "ts-jest": "^26.3.0",
+              "typescript": "^4.0.2"
+            },
+            "directories": {},
+            "dist": {
+              "fileCount": 28,
+              "integrity": "sha512-46oDLMDJAA40wWdufP/YENAbzYYlp7k4OTJB0TuoKviiddQVvArDcHB62e1ULpKb2s93AXAChgXgjrOBsCe4DA==",
+              "npm-signature": "-----BEGIN PGP SIGNATURE-----\r\nVersion: OpenPGP.js v3.0.13\r\nComment: https://openpgpjs.org\r\n\r\nwsFcBAEBCAAQBQJfaxNRCRA9TVsSAnZWagAASNMP+wRKJD/74dLRmR38DKFl\nhmMwCQHHGvgnQqBFy7X5CP9rExUD/cWP1kFchRPrGBd7mblW4aqaA0iZpDSX\n9ewt318mtzy1jXaWY1vntgG1nwxGHMP0VlWcnzlHwKeYSyBP+6BU0Zjdsw0U\n7KQ99tYZpk/sNjptmU0yQpy0+nTBLO8lx0kVdCi+4Wp1Z4hT/7uRTZrsJLvY\nrKPmBDDTnbY6UjAbsnRCxTbH4As2Y51aB/ah/fJj/YGoGHsAOmeQGuvUC8hn\nAzMeZEoA2wA7/WwiA+CLrHRP54kBTm4cz0limfj/qoWAVNqhwZXyY6hibIZZ\nFsLIDUUT+2a3AefSrHUwWgPhNt0xh5XLKbPtV7bNEbkW8rihq2yhSmVqaJqN\nfWybMal9Vi6BHmZoF21lqkUF90r95LeL56Usk3pcRw+H5SJ468gvpbY9ywtx\nSXGtnEqcmeRQbS5iTCFms0i9aoSd/SwaOmJgkwZ89DbGKWoGxmk8ItqmSmri\n+eHvRvygvS1j8Zfk+jQlV1qHOAOzeabxvGWoWCK3APigLWQuT1+vULb+9ovx\nsuarkBIxL0cxA0eJcKkr7FVGsYTV/TEDwCx7SRRs1tB56V/6tTsPw5nfydu6\ntt/n1p5u9xKu+ssrzKd6lFnqOybF+QECVPZ6m5+VKK4HEYSEPbr/smGErFnF\nY+JO\r\n=GGE7\r\n-----END PGP SIGNATURE-----\r\n",
+              "shasum": "7709129612873f25baf9bd5bfe428c89bdcf91a5",
+              "signatures": [
+                {
+                  "keyid": "SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA",
+                  "sig": "MEYCIQC6ECUSskRNYtMudTtns9QzvLTxrRUx12BimjqY4ubRcgIhAO5/6XpLSuBfMsjwi7uwzELRIv/0O0rRGsalYlCKl635"
+                }
+              ],
+              "tarball": "http://127.0.0.1:4873/geoman/-/geoman-0.1.0-alpha.2.tgz",
+              "unpackedSize": 26638
+            },
+            "gitHead": "5d2b962aef751d58ede68ef8b8eacdf3d00499e5",
+            "homepage": "https://github.com/HexMox/geoman",
+            "husky": {
+              "hooks": {
+                "commit-msg": "commitlint -E HUSKY_GIT_PARAMS",
+                "pre-commit": "lint-staged",
+                "pre-push": "npm test"
+              }
+            },
+            "keywords": [
+              "scaffolding"
+            ],
+            "license": "MIT",
+            "lint-staged": {
+              "*.{ts,tsx}": [
+                "prettier-eslint --single-quote --write",
+                "eslint --fix",
+                "git add"
+              ]
+            },
+            "main": "./dist/index.js",
+            "maintainers": [
+              {
+                "email": "hex_mox@foxmail.com",
+                "name": "hexmox"
+              }
+            ],
+            "name": "geoman",
+            "repository": {
+              "type": "git",
+              "url": "git+https://github.com/HexMox/geoman.git"
+            },
+            "scripts": {
+              "build": "tsc -p tsconfig.json",
+              "dist": "npm publish --registry=https://registry.npmjs.org/",
+              "prepublish": "npm run build",
+              "start": "tsc -w -p tsconfig.json",
+              "test": "jest"
+            },
+            "version": "0.1.0-alpha.2"
+          }
+        }
+      },
+      "upstream_tarballs": {
+        "geoman-0.1.0-alpha.1.tgz": "https://registry.npmjs.org/geoman/-/geoman-0.1.0-alpha.1.tgz",
+        "geoman-0.1.0-alpha.2.tgz": "https://registry.npmjs.org/geoman/-/geoman-0.1.0-alpha.2.tgz"
+      },
+      "updated_at": 1771017249096
+    }
+  }
+}

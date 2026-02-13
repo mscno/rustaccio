@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{TITLE}}</title>
+  <link rel="stylesheet" href="{{ASSET_BASE}}/-/web/static/styles.css" />
+</head>
+<body>
+  <div id="app" class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo" aria-hidden="true"></div>
+        <a href="{{ASSET_BASE}}/" class="title" id="brandTitle">{{TITLE}}</a>
+      </div>
+
+      <form id="searchForm" class="search" role="search">
+        <input id="searchInput" type="search" placeholder="Search packages" autocomplete="off" />
+      </form>
+
+      <div class="top-actions">
+        <a id="settingsLink" class="link-btn" href="{{ASSET_BASE}}/-/web/settings">Settings</a>
+        <a id="loginLink" class="link-btn" href="{{ASSET_BASE}}/-/web/login">Login</a>
+        <button id="logoutBtn" class="ghost hidden" type="button">Logout</button>
+      </div>
+    </header>
+
+    <div class="layout">
+      <aside class="sidebar">
+        <div class="panel">
+          <h2 class="panel-title">Account</h2>
+          <div id="accountState" class="muted">Not signed in</div>
+        </div>
+        <div class="panel">
+          <h2 class="panel-title">Registry</h2>
+          <div class="kv"><span>Prefix</span><code id="registryPrefix">/</code></div>
+          <div class="kv"><span>Web Login</span><span id="registryWebLogin">false</span></div>
+          <div class="kv"><span>External Auth</span><span id="registryExternalAuth">false</span></div>
+        </div>
+      </aside>
+
+      <main class="content">
+        <div id="flash" class="flash hidden"></div>
+        <section id="viewRoot"></section>
+      </main>
+    </div>
+  </div>
+
+  <script>
+    window.__RUSTACCIO_CONFIG__ = {{CONFIG_JSON}};
+  </script>
+  <script src="{{ASSET_BASE}}/-/web/static/app.js"></script>
+</body>
+</html>

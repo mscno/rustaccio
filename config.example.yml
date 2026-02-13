@@ -1,0 +1,72 @@
+listen:
+  - 127.0.0.1:4873
+
+storage: ./.rustaccio-data
+
+uplinks:
+  npmjs:
+    url: https://registry.npmjs.org/
+
+packages:
+  "@*/*":
+    access: $all
+    publish: $authenticated
+    unpublish: $authenticated
+    proxy: npmjs
+  "**":
+    access: $all
+    publish: $authenticated
+    unpublish: $authenticated
+    proxy: npmjs
+
+web:
+  enable: true
+  title: Rustaccio
+
+flags:
+  webLogin: false
+
+publish:
+  check_owners: false
+
+middlewares:
+  audit:
+    enabled: true
+
+max_body_size: 50mb
+url_prefix: /
+
+server:
+  keepAliveTimeout: 60
+  # Any trustProxy value enables trusted proxy mode.
+  # trustProxy: true
+
+log:
+  level: info
+
+auth:
+  backend: local
+  external: false
+  # backend: http
+  # http:
+  #   baseUrl: http://127.0.0.1:9000
+  #   addUserEndpoint: /adduser
+  #   loginEndpoint: /authenticate
+  #   changePasswordEndpoint: /change-password
+  #   requestAuthEndpoint: /request-auth
+  #   allowAccessEndpoint: /allow-access
+  #   allowPublishEndpoint: /allow-publish
+  #   allowUnpublishEndpoint: /allow-unpublish
+  #   timeoutMs: 5000
+
+store:
+  backend: local
+  # backend: s3
+  # s3:
+  #   bucket: npm-cache
+  #   region: us-east-1
+  #   endpoint: http://127.0.0.1:9001
+  #   accessKeyId: minio
+  #   secretAccessKey: miniopass
+  #   prefix: tarballs/
+  #   forcePathStyle: true

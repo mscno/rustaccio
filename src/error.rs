@@ -33,6 +33,7 @@ impl IntoResponse for RegistryError {
     fn into_response(self) -> Response {
         match self {
             RegistryError::Http { status, message } => {
+                tracing::warn!(status = status.as_u16(), error = %message, "request failed");
                 let body = serde_json::to_vec(&ErrorBody { error: &message })
                     .unwrap_or_else(|_| b"{\"error\":\"unknown error\"}".to_vec());
                 Response::builder()
@@ -47,6 +48,7 @@ impl IntoResponse for RegistryError {
                     })
             }
             RegistryError::Internal => {
+                tracing::error!("internal server error");
                 let body = serde_json::to_vec(&ErrorBody {
                     error: "unknown error",
                 })
