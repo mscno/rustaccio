@@ -136,6 +136,27 @@ Build features:
 cargo test
 ```
 
+## Git Hooks (lefthook)
+
+Install and enable local pre-commit hooks:
+
+```bash
+brew install lefthook
+lefthook install
+```
+
+Run hooks manually:
+
+```bash
+lefthook run pre-commit
+```
+
+Configured pre-commit checks:
+
+- `cargo fmt --all -- --check`
+- `cargo check --workspace --all-targets --locked`
+- `cargo test --workspace --all-targets --locked --quiet`
+
 Quality gate:
 
 ```bash

@@ -1,0 +1,10 @@
+pre-commit:
+  parallel: false
+  commands:
+    cargo-fmt:
+      run: cargo fmt --all -- --check
+    cargo-check:
+      run: cargo check --workspace --all-targets --locked
+    cargo-test:
+      run: cargo test --workspace --all-targets --locked --quiet
+
