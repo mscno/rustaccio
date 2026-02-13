@@ -2094,7 +2094,7 @@ dependencies = [
 
 [[package]]
 name = "rustaccio"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "async-trait",

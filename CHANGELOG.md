@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-02-14
+
+### Added
+
+- Graceful shutdown handling for standalone runtime on `SIGTERM`/`Ctrl+C`.
+- Additional runtime/config test coverage for timeout parsing, `audit.enabled` route gating, `web.enable` route gating, and invalid `RUSTACCIO_CONFIG` handling.
+- Explicit compatibility policy and documented Verdaccio behavior differences/limits in `README.md`.
+
+### Changed
+
+- CI Rust job timeout increased from 30 to 60 minutes.
+- `Config::from_env()` now returns `Result` and fails fast when `RUSTACCIO_CONFIG` is set but invalid/unreadable.
+- Security audit endpoints now return `404` when audit middleware is disabled.
+- Search endpoint now caps `size` to `250`.
+- Store persistence and sidecar syncing were refactored to reduce unnecessary state cloning and filter uplink-cached package snapshots during serialization.
+- Docker publish workflow now builds with `CARGO_BUILD_JOBS=1` for lower-memory builds.
+- Docker runtime image hardening updated user creation with `useradd --no-log-init`.
+- Dependency surface cleanup:
+  - removed unused direct deps `bytes`, `futures-util`, and `http`
+  - removed unused `reqwest` `stream` feature
+  - moved `flate2` and `tar` to `dev-dependencies`
+  - removed unused `chrono` `serde` feature
+- Repo hygiene updates for local artifacts (`.gitignore`, `.dockerignore`).
+
+### Removed
+
+- Deprecated file-length gate test (`tests/file_length.rs`).
+
 ## [0.2.0] - 2026-02-14
 
 ### Added
