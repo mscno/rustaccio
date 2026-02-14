@@ -9,7 +9,6 @@ permissions:
 
 env:
   SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: sccache
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -32,6 +31,29 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.7
 
+      - name: Configure optional sccache
+        id: sccache
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v sccache >/dev/null 2>&1; then
+            echo "::warning::sccache is unavailable; continuing without compiler cache"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if SCCACHE_NO_DAEMON=1 sccache --start-server >/dev/null 2>&1; then
+            sccache --stop-server >/dev/null 2>&1 || true
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::sccache backend is unavailable; continuing without RUSTC_WRAPPER"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Enable sccache wrapper
+        if: steps.sccache.outputs.enabled == 'true'
+        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+
       - name: Cache
         uses: Swatinem/rust-cache@v2
 
@@ -53,6 +75,10 @@ jobs:
       - name: Cargo doc
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 
+      - name: Show sccache stats
+        if: always() && steps.sccache.outputs.enabled == 'true'
+        run: sccache --show-stats || true
+
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: rust
@@ -70,6 +96,29 @@ jobs:
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.7
+
+      - name: Configure optional sccache
+        id: sccache
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v sccache >/dev/null 2>&1; then
+            echo "::warning::sccache is unavailable; continuing without compiler cache"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if SCCACHE_NO_DAEMON=1 sccache --start-server >/dev/null 2>&1; then
+            sccache --stop-server >/dev/null 2>&1 || true
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::sccache backend is unavailable; continuing without RUSTC_WRAPPER"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Enable sccache wrapper
+        if: steps.sccache.outputs.enabled == 'true'
+        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
       - name: Cache
         uses: Swatinem/rust-cache@v2
@@ -114,3 +163,7 @@ jobs:
           body_path: RELEASE_NOTES.md
           files: dist/rustaccio-linux-amd64
           prerelease: ${{ contains(github.ref_name, '-') }}
+
+      - name: Show sccache stats
+        if: always() && steps.sccache.outputs.enabled == 'true'
+        run: sccache --show-stats || true
