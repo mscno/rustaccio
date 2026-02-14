@@ -101,6 +101,8 @@ async fn seeded_app(
         store,
         acl,
         policy,
+        governance: Arc::new(rustaccio::governance::GovernanceEngine::default()),
+        admin_access: rustaccio::app::AdminAccessConfig::default(),
         uplinks: HashMap::new(),
         web_enabled: cfg.web_enabled,
         web_title: cfg.web_title,
@@ -261,4 +263,59 @@ async fn external_policy_cache_reuses_decision() {
         .filter(|request| request.url.path() == "/authorize")
         .count();
     assert_eq!(decision_calls, 1);
+}
+
+#[tokio::test]
+async fn admin_policy_cache_invalidate_forces_recheck() {
+    let policy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/authorize"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"allowed": true})))
+        .mount(&policy)
+        .await;
+
+    let dir = TempDir::new().expect("dir");
+    let cfg = base_config(
+        dir.path().to_path_buf(),
+        vec![PackageRule {
+            pattern: "**".to_string(),
+            access: vec!["nobody".to_string()],
+            publish: vec!["$authenticated".to_string()],
+            unpublish: vec!["$authenticated".to_string()],
+            proxy: None,
+            uplinks_look: true,
+        }],
+    );
+    let policy_cfg = HttpPolicyConfig {
+        base_url: policy.uri(),
+        decision_endpoint: "/authorize".to_string(),
+        timeout_ms: 1_000,
+        cache_ttl_ms: 60_000,
+        fail_open: false,
+    };
+    let (app, token) = seeded_app(cfg, Some(policy_cfg), "cache-invalidate").await;
+
+    let resp = send(&app, auth_get("/cache-invalidate", &token)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = send(&app, auth_get("/cache-invalidate", &token)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let invalidate_req = Request::builder()
+        .method(Method::POST)
+        .uri("/-/admin/policy-cache/invalidate")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from("{}".to_string()))
+        .expect("request");
+    let invalidate_resp = send(&app, invalidate_req).await;
+    assert_eq!(invalidate_resp.status(), StatusCode::OK);
+
+    let resp = send(&app, auth_get("/cache-invalidate", &token)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let requests = policy.received_requests().await.expect("received requests");
+    let decision_calls = requests
+        .iter()
+        .filter(|request| request.url.path() == "/authorize")
+        .count();
+    assert_eq!(decision_calls, 2);
 }

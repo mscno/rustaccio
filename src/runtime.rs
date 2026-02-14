@@ -1,9 +1,10 @@
 use crate::{
     acl::Acl,
-    app::{AppState, build_router},
+    app::{AdminAccessConfig, AppState, build_router},
     auth::AuthHook,
     config::Config,
     error::RegistryError,
+    governance::GovernanceEngine,
     observability,
     policy::{DefaultPolicyEngine, HttpPolicyConfig},
     storage::{Store, StoreOptions},
@@ -31,6 +32,9 @@ pub async fn build_state(
 ) -> Result<AppState, RegistryError> {
     let store = Arc::new(Store::open_with_options(config, StoreOptions { auth_hook }).await?);
     let acl = Acl::new(config.acl_rules.clone());
+    let governance = Arc::new(GovernanceEngine::from_env().await?);
+    let admin_access = AdminAccessConfig::from_env();
+    validate_saas_guardrails(config, &admin_access)?;
     let policy = if let Some(policy_cfg) = HttpPolicyConfig::from_env() {
         Arc::new(DefaultPolicyEngine::new_with_http(
             store.clone(),
@@ -55,6 +59,8 @@ pub async fn build_state(
         store,
         acl,
         policy,
+        governance,
+        admin_access,
         uplinks,
         web_enabled: config.web_enabled,
         web_title: config.web_title.clone(),
@@ -120,6 +126,58 @@ pub async fn run_from_env() -> Result<(), RegistryError> {
 
 fn startup_log_level(config: &Config) -> &str {
     config.log_level.as_str()
+}
+
+fn validate_saas_guardrails(
+    config: &Config,
+    admin_access: &AdminAccessConfig,
+) -> Result<(), RegistryError> {
+    validate_saas_guardrails_with_mode(saas_mode_enabled_from_env(), config, admin_access)
+}
+
+fn validate_saas_guardrails_with_mode(
+    saas_mode: bool,
+    config: &Config,
+    admin_access: &AdminAccessConfig,
+) -> Result<(), RegistryError> {
+    if !saas_mode {
+        return Ok(());
+    }
+
+    if admin_access.allow_any_authenticated {
+        return Err(RegistryError::http(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "RUSTACCIO_SAAS_MODE=true requires RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false",
+        ));
+    }
+
+    if admin_access.users.is_empty() && admin_access.groups.is_empty() {
+        return Err(RegistryError::http(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "RUSTACCIO_SAAS_MODE=true requires RUSTACCIO_ADMIN_USERS or RUSTACCIO_ADMIN_GROUPS",
+        ));
+    }
+
+    if !config.auth_plugin.external_mode {
+        return Err(RegistryError::http(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "RUSTACCIO_SAAS_MODE=true requires auth.plugin.externalMode=true",
+        ));
+    }
+
+    Ok(())
+}
+
+fn saas_mode_enabled_from_env() -> bool {
+    std::env::var("RUSTACCIO_SAAS_MODE")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
 }
 
 async fn serve_with_keep_alive_timeout(
@@ -258,13 +316,110 @@ fn is_connection_error(error: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::startup_log_level;
-    use crate::config::Config;
+    use super::{startup_log_level, validate_saas_guardrails_with_mode};
+    use crate::{
+        app::AdminAccessConfig,
+        config::{
+            AuthBackend, AuthPluginConfig, Config, TarballStorageBackend, TarballStorageConfig,
+        },
+    };
+
+    fn config_with_external_mode(external_mode: bool) -> Config {
+        Config {
+            bind: "127.0.0.1:4873".parse().expect("bind"),
+            data_dir: std::env::temp_dir(),
+            listen: vec!["127.0.0.1:4873".to_string()],
+            upstream_registry: None,
+            uplinks: std::collections::HashMap::new(),
+            acl_rules: vec![crate::acl::PackageRule::open("**")],
+            web_enabled: true,
+            web_title: "Rustaccio".to_string(),
+            web_login: true,
+            publish_check_owners: false,
+            password_min_length: 3,
+            login_session_ttl_seconds: 600,
+            max_body_size: 50 * 1024 * 1024,
+            audit_enabled: true,
+            url_prefix: "/".to_string(),
+            trust_proxy: false,
+            keep_alive_timeout_secs: None,
+            log_level: "info".to_string(),
+            auth_plugin: AuthPluginConfig {
+                backend: AuthBackend::Local,
+                external_mode,
+                http: None,
+            },
+            tarball_storage: TarballStorageConfig {
+                backend: TarballStorageBackend::Local,
+                s3: None,
+            },
+        }
+    }
 
     #[test]
     fn startup_log_level_uses_config_value() {
         let mut cfg = Config::defaults_for_examples();
         cfg.log_level = "debug".to_string();
         assert_eq!(startup_log_level(&cfg), "debug");
+    }
+
+    #[test]
+    fn saas_guardrails_allow_simple_mode_defaults() {
+        let config = config_with_external_mode(false);
+        let admin = AdminAccessConfig::default();
+        assert!(validate_saas_guardrails_with_mode(false, &config, &admin).is_ok());
+    }
+
+    #[test]
+    fn saas_guardrails_reject_any_authenticated_admin_access() {
+        let config = config_with_external_mode(true);
+        let admin = AdminAccessConfig {
+            allow_any_authenticated: true,
+            users: vec!["ops".to_string()],
+            groups: Vec::new(),
+        };
+        let err = validate_saas_guardrails_with_mode(true, &config, &admin).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("ADMIN_ALLOW_ANY_AUTHENTICATED=false")
+        );
+    }
+
+    #[test]
+    fn saas_guardrails_reject_missing_admin_principals() {
+        let config = config_with_external_mode(true);
+        let admin = AdminAccessConfig {
+            allow_any_authenticated: false,
+            users: Vec::new(),
+            groups: Vec::new(),
+        };
+        let err = validate_saas_guardrails_with_mode(true, &config, &admin).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("ADMIN_USERS or RUSTACCIO_ADMIN_GROUPS")
+        );
+    }
+
+    #[test]
+    fn saas_guardrails_require_external_auth_mode() {
+        let config = config_with_external_mode(false);
+        let admin = AdminAccessConfig {
+            allow_any_authenticated: false,
+            users: vec!["ops".to_string()],
+            groups: Vec::new(),
+        };
+        let err = validate_saas_guardrails_with_mode(true, &config, &admin).expect_err("must fail");
+        assert!(err.to_string().contains("auth.plugin.externalMode=true"));
+    }
+
+    #[test]
+    fn saas_guardrails_accept_external_mode_with_explicit_admins() {
+        let config = config_with_external_mode(true);
+        let admin = AdminAccessConfig {
+            allow_any_authenticated: false,
+            users: vec!["ops".to_string()],
+            groups: vec!["platform-admins".to_string()],
+        };
+        assert!(validate_saas_guardrails_with_mode(true, &config, &admin).is_ok());
     }
 }

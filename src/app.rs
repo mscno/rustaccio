@@ -1,4 +1,7 @@
-use crate::{acl::Acl, api, policy::PolicyEngine, storage::Store, upstream::Upstream};
+use crate::{
+    acl::Acl, api, governance::GovernanceEngine, policy::PolicyEngine, storage::Store,
+    upstream::Upstream,
+};
 use axum::{
     Router,
     http::{HeaderName, StatusCode},
@@ -14,11 +17,49 @@ use tower_http::{
 };
 use tracing::Level;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminAccessConfig {
+    pub allow_any_authenticated: bool,
+    pub users: Vec<String>,
+    pub groups: Vec<String>,
+}
+
+impl Default for AdminAccessConfig {
+    fn default() -> Self {
+        Self {
+            allow_any_authenticated: true,
+            users: Vec::new(),
+            groups: Vec::new(),
+        }
+    }
+}
+
+impl AdminAccessConfig {
+    pub fn from_env() -> Self {
+        let mut cfg = Self::default();
+        if let Some(parsed) = parse_bool_env(
+            "RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED",
+            cfg.allow_any_authenticated,
+        ) {
+            cfg.allow_any_authenticated = parsed;
+        }
+        if let Some(value) = load_env_value("RUSTACCIO_ADMIN_USERS") {
+            cfg.users = parse_principal_list(&value);
+        }
+        if let Some(value) = load_env_value("RUSTACCIO_ADMIN_GROUPS") {
+            cfg.groups = parse_principal_list(&value);
+        }
+        cfg
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
     pub acl: Acl,
     pub policy: Arc<dyn PolicyEngine>,
+    pub governance: Arc<GovernanceEngine>,
+    pub admin_access: AdminAccessConfig,
     pub uplinks: HashMap<String, Upstream>,
     pub web_enabled: bool,
     pub web_title: String,
@@ -75,9 +116,27 @@ fn load_env_value(key: &str) -> Option<String> {
         .or_else(|| settings.get_string(&key.to_ascii_lowercase()).ok())
 }
 
+fn parse_bool_env(key: &str, default: bool) -> Option<bool> {
+    let value = load_env_value(key)?;
+    let parsed = match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => true,
+        "false" | "0" | "no" => false,
+        _ => default,
+    };
+    Some(parsed)
+}
+
+fn parse_principal_list(raw: &str) -> Vec<String> {
+    raw.split([',', ' '])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_request_timeout_secs;
+    use super::{AdminAccessConfig, parse_principal_list, parse_request_timeout_secs};
 
     #[test]
     fn request_timeout_defaults_to_30() {
@@ -89,5 +148,18 @@ mod tests {
     fn request_timeout_is_clamped() {
         assert_eq!(parse_request_timeout_secs(Some("0")), 1);
         assert_eq!(parse_request_timeout_secs(Some("999")), 300);
+    }
+
+    #[test]
+    fn admin_access_defaults_to_any_authenticated() {
+        assert!(AdminAccessConfig::default().allow_any_authenticated);
+    }
+
+    #[test]
+    fn parse_principal_list_supports_commas_and_whitespace() {
+        assert_eq!(
+            parse_principal_list("ops,ci admins"),
+            vec!["ops".to_string(), "ci".to_string(), "admins".to_string()]
+        );
     }
 }

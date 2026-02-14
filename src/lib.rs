@@ -9,6 +9,7 @@ pub mod config;
 pub mod constants;
 pub mod error;
 pub mod examples;
+pub mod governance;
 pub mod models;
 pub mod observability;
 pub mod policy;

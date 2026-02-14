@@ -85,6 +85,10 @@ pub trait PolicyEngine: Send + Sync {
         identity: Option<&AuthIdentity>,
         request: &RequestContext,
     ) -> Result<bool, RegistryError>;
+
+    async fn invalidate_cache(&self) -> Result<(), RegistryError> {
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -148,6 +152,13 @@ impl PolicyEngine for DefaultPolicyEngine {
             PolicyAction::Unpublish => self.acl.can_unpublish(package_name, identity),
         };
         Ok(acl_allowed)
+    }
+
+    async fn invalidate_cache(&self) -> Result<(), RegistryError> {
+        if let Some(http_backend) = &self.http_backend {
+            http_backend.invalidate_cache().await;
+        }
+        Ok(())
     }
 }
 
@@ -354,6 +365,11 @@ impl HttpPolicyBackend {
                 expires_at_ms,
             },
         );
+    }
+
+    async fn invalidate_cache(&self) {
+        let mut cache = self.cache.write().await;
+        cache.clear();
     }
 }
 

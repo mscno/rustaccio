@@ -6,7 +6,7 @@ use axum::{
 use http_body_util::BodyExt;
 use rustaccio::{
     acl::PackageRule,
-    app::build_router,
+    app::{AdminAccessConfig, build_router},
     auth::AuthHook,
     config::{
         AuthBackend, AuthPluginConfig, Config, HttpAuthPluginConfig, TarballStorageBackend,
@@ -38,6 +38,27 @@ impl AuthHook for GroupOnlyHook {
         Ok(Some(AuthIdentity {
             username: None,
             groups: vec!["dev-team".to_string()],
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct NamedHook {
+    username: Option<String>,
+    groups: Vec<String>,
+}
+
+#[async_trait]
+impl AuthHook for NamedHook {
+    async fn authenticate_request(
+        &self,
+        _token: &str,
+        _method: &str,
+        _path: &str,
+    ) -> Result<Option<AuthIdentity>, rustaccio::error::RegistryError> {
+        Ok(Some(AuthIdentity {
+            username: self.username.clone(),
+            groups: self.groups.clone(),
         }))
     }
 }
@@ -75,7 +96,18 @@ fn base_config(data_dir: PathBuf) -> Config {
 }
 
 async fn app_with_config(cfg: &Config, hook: Option<Arc<dyn AuthHook>>) -> axum::Router {
-    let state = runtime::build_state(cfg, hook).await.expect("state");
+    app_with_config_and_admin(cfg, hook, None).await
+}
+
+async fn app_with_config_and_admin(
+    cfg: &Config,
+    hook: Option<Arc<dyn AuthHook>>,
+    admin_access: Option<AdminAccessConfig>,
+) -> axum::Router {
+    let mut state = runtime::build_state(cfg, hook).await.expect("state");
+    if let Some(admin_access) = admin_access {
+        state.admin_access = admin_access;
+    }
     build_router(state)
 }
 
@@ -357,4 +389,60 @@ async fn web_routes_are_hidden_when_web_is_disabled() {
         .expect("request");
     let resp = send(&app, req).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn admin_endpoints_require_explicit_admin_when_any_authenticated_disabled() {
+    let dir = TempDir::new().expect("dir");
+    let cfg = base_config(dir.path().to_path_buf());
+    let app = app_with_config_and_admin(
+        &cfg,
+        Some(Arc::new(NamedHook {
+            username: Some("alice".to_string()),
+            groups: vec!["dev-team".to_string()],
+        })),
+        Some(AdminAccessConfig {
+            allow_any_authenticated: false,
+            users: vec!["ops".to_string()],
+            groups: vec!["platform-admins".to_string()],
+        }),
+    )
+    .await;
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/-/admin/storage-health")
+        .header(header::AUTHORIZATION, "Bearer embedded-token")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn admin_endpoints_allow_user_or_group_allowlist() {
+    let dir = TempDir::new().expect("dir");
+    let cfg = base_config(dir.path().to_path_buf());
+    let app = app_with_config_and_admin(
+        &cfg,
+        Some(Arc::new(NamedHook {
+            username: Some("alice".to_string()),
+            groups: vec!["platform-admins".to_string()],
+        })),
+        Some(AdminAccessConfig {
+            allow_any_authenticated: false,
+            users: vec!["ops".to_string()],
+            groups: vec!["platform-admins".to_string()],
+        }),
+    )
+    .await;
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/-/admin/storage-health")
+        .header(header::AUTHORIZATION, "Bearer embedded-token")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
 }

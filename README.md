@@ -154,7 +154,44 @@ Build features:
 
 ```bash
 cargo test
+cargo test --features s3
 ```
+
+Run real S3-backend integration tests against local MinIO:
+
+```bash
+just minio-up
+just test-s3-it
+just minio-down
+```
+
+Run Redis/Postgres governance integration tests:
+
+```bash
+just governance-up
+just test-governance-it
+just governance-down
+```
+
+Defaults:
+
+- MinIO API: `http://127.0.0.1:9002`
+- MinIO console: `http://127.0.0.1:9003`
+- Access key / secret: `minioadmin` / `minioadmin`
+- Test bucket: `rustaccio-it`
+
+Override integration test connection settings with:
+
+- `RUSTACCIO_S3_IT_ENDPOINT`
+- `RUSTACCIO_S3_IT_REGION`
+- `RUSTACCIO_S3_IT_BUCKET`
+- `RUSTACCIO_S3_IT_ACCESS_KEY`
+- `RUSTACCIO_S3_IT_SECRET_KEY`
+
+Governance integration test connection settings:
+
+- `RUSTACCIO_REDIS_IT_URL` (default `redis://127.0.0.1:56379/`)
+- `RUSTACCIO_POSTGRES_IT_URL` (default `postgres://postgres:postgres@127.0.0.1:55432/rustaccio`)
 
 ## Just Commands
 
@@ -166,6 +203,12 @@ just build    # fast local release profile
 just dist     # fully optimized distribution profile
 just serve
 just serve ./config.yml
+just minio-up
+just minio-down
+just test-s3-it
+just governance-up
+just governance-down
+just test-governance-it
 ```
 
 ## Git Hooks (lefthook)
@@ -315,7 +358,7 @@ Key APIs:
 - `/-/user/*` (add user/login/logout)
 - `/-/v1/search`
 - `/-/all` and `/-/all/since` (deprecated response)
-- `/-/admin/reindex` and `/-/admin/storage-health` (authenticated admin/ops endpoints)
+- `/-/admin/reindex`, `/-/admin/storage-health`, and `/-/admin/policy-cache/invalidate` (admin/ops endpoints)
 - `/-/_view/starredByUser`
 - `/-/package/:package/dist-tags` (+ `:tag`)
 - `/-/npm/v1/user`
@@ -323,6 +366,7 @@ Key APIs:
 - `/-/npm/v1/security/advisories/bulk`
 - `/-/npm/v1/security/audits/quick`
 - `/-/npm/v1/security/audits`
+- `/-/metrics` (optional, when `RUSTACCIO_METRICS_BACKEND=prometheus`)
 - `/-/v1/login`, `/-/v1/login_cli/:sessionId`, `/-/v1/done/:sessionId`
 - Built-in web UI routes: `/`, `/-/web`, `/-/web/login`, `/-/web/settings`, `/-/web/detail/:package`, and static assets under `/-/web/static/*`
 - Package/tarball/publish routes (including scoped packages):
@@ -375,7 +419,7 @@ Rustaccio targets Verdaccio-compatible npm client behavior for core flows, but i
 - YAML `listen` can be configured as a list for config compatibility, but the server currently binds a single effective socket address.
 - `server.keepAliveTimeout` is currently mapped to an HTTP/1 header-read timeout for keep-alive connections (not a byte-for-byte Node.js socket timeout implementation).
 - Built-in web UI is a lightweight Verdaccio-style SPA shell and static assets, not the full upstream Verdaccio frontend/runtime surface.
-- Rustaccio-specific admin endpoints are exposed at `/-/admin/reindex` and `/-/admin/storage-health`.
+- Rustaccio-specific admin endpoints are exposed at `/-/admin/reindex`, `/-/admin/storage-health`, and `/-/admin/policy-cache/invalidate`.
 
 ## Architecture
 
@@ -384,6 +428,7 @@ Rustaccio targets Verdaccio-compatible npm client behavior for core flows, but i
 - `src/config.rs`: env + Verdaccio-style YAML parsing (`packages`, `uplinks`)
 - `src/storage.rs`: local state, persistence, auth/token/package operations + backend integration
 - `src/policy.rs`: policy engine abstraction (`external policy backend -> auth hook/plugin decisions -> ACL fallback`)
+- `src/governance.rs`: opt-in SaaS controls (`rate limiting`, `quota`, `metrics`) via trait-based guards/backends
 - `src/auth_plugin.rs`: HTTP auth backend plugin client
 - `src/tarball_backend.rs`: tarball backend abstraction (`local`, `s3`)
 - `src/upstream.rs`: npm uplink proxy client for package/search/tarball
@@ -411,7 +456,7 @@ store:
   aws-s3-storage:
     bucket: npm-cache
     region: us-east-1
-    endpoint: http://127.0.0.1:9001
+    endpoint: http://127.0.0.1:9002
     accessKeyId: minio
     secretAccessKey: miniopass
     prefix: tarballs/
@@ -469,6 +514,98 @@ Decision response:
 - Other non-`2xx`:
   - with `RUSTACCIO_POLICY_HTTP_FAIL_OPEN=true`: fall back to local policy chain
   - with `RUSTACCIO_POLICY_HTTP_FAIL_OPEN=false`: request fails with `502`
+
+Cache control:
+
+- `POST /-/admin/policy-cache/invalidate` clears in-memory external policy decision cache for the running instance.
+
+## SaaS Governance Controls (Opt-In)
+
+Rustaccio defaults to simple mode. SaaS controls are disabled unless explicitly enabled via env.
+
+Rate limiting:
+
+- `RUSTACCIO_RATE_LIMIT_BACKEND=none|memory|redis` (default `none`)
+- `RUSTACCIO_RATE_LIMIT_REQUESTS_PER_WINDOW` (default `0`, disabled)
+- `RUSTACCIO_RATE_LIMIT_WINDOW_SECS` (default `60`)
+- `RUSTACCIO_RATE_LIMIT_REDIS_URL` (required when backend=`redis`)
+- `RUSTACCIO_RATE_LIMIT_FAIL_OPEN` (default `true`)
+
+Quota enforcement:
+
+- `RUSTACCIO_QUOTA_BACKEND=none|memory|postgres` (default `none`)
+- `RUSTACCIO_QUOTA_REQUESTS_PER_DAY` (default `0`, disabled)
+- `RUSTACCIO_QUOTA_DOWNLOADS_PER_DAY` (default `0`, disabled)
+- `RUSTACCIO_QUOTA_PUBLISHES_PER_DAY` (default `0`, disabled)
+- `RUSTACCIO_QUOTA_POSTGRES_URL` (required when backend=`postgres`)
+- `RUSTACCIO_QUOTA_FAIL_OPEN` (default `true`)
+
+Postgres quota migrations:
+
+- Rustaccio applies quota schema migrations automatically on startup when `RUSTACCIO_QUOTA_BACKEND=postgres`.
+- Migration files live under `migrations/` (current: `migrations/0001_quota_usage_table.sql`).
+
+Metrics endpoint:
+
+- `RUSTACCIO_METRICS_BACKEND=none|prometheus` (default `none`)
+- `RUSTACCIO_METRICS_PATH` (default `/-/metrics`)
+- `RUSTACCIO_METRICS_REQUIRE_ADMIN` (default `true`)
+
+Build features for external backends:
+
+- `cargo build --features redis` for Redis rate limiter
+- `cargo build --features postgres` for Postgres quota backend
+- `cargo build --features otel` for OTLP span export
+
+OpenTelemetry (opt-in):
+
+- `RUSTACCIO_OTEL_ENABLED=false|true` (default `false`)
+- `RUSTACCIO_OTEL_EXPORTER_OTLP_ENDPOINT` (for example `http://otel-collector:4318/v1/traces`)
+- `RUSTACCIO_OTEL_SERVICE_NAME` (default `rustaccio`)
+
+## Admin Endpoint Authorization
+
+Admin endpoints are controlled by environment variables:
+
+- `RUSTACCIO_SAAS_MODE=false|true` (default `false`)
+- `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED` (default `true`)
+- `RUSTACCIO_ADMIN_USERS` (comma/space-separated usernames)
+- `RUSTACCIO_ADMIN_GROUPS` (comma/space-separated groups/roles)
+
+Behavior:
+
+- If `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=true`, any authenticated identity can call `/-/admin/*`.
+- If `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false`, only identities whose username is in `RUSTACCIO_ADMIN_USERS` or whose group/role is in `RUSTACCIO_ADMIN_GROUPS` are allowed.
+- Unauthenticated requests receive `401`; authenticated non-admin requests receive `403`.
+- If `RUSTACCIO_SAAS_MODE=true`, startup enforces safer guardrails:
+  - `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false`
+  - at least one explicit admin principal in `RUSTACCIO_ADMIN_USERS` or `RUSTACCIO_ADMIN_GROUPS`
+  - `auth.plugin.externalMode=true` (external identity provider mode)
+
+Recommended SaaS posture:
+
+- Set `RUSTACCIO_SAAS_MODE=true`.
+- Set `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false`.
+- Define a dedicated admin group from your control-plane identity provider, and set it in `RUSTACCIO_ADMIN_GROUPS`.
+
+## Scalability Notes
+
+Current simple mode:
+
+- Local metadata persists to a single `state.json` snapshot in the configured data directory.
+- This is great for single-node simplicity, but not ideal for horizontally scaled multi-node SaaS.
+
+Current production-oriented mode:
+
+- Tarballs can be offloaded to S3-compatible object storage (`store.backend: s3`).
+- Shared-state snapshot mode supports multiple nodes reading the same package metadata snapshot.
+
+Recommended next step for large SaaS tenants:
+
+- Move package/account metadata from snapshot-only persistence to a database-backed metadata store (for example Postgres).
+- Keep object storage for tarballs and immutable blobs.
+- Use Redis for distributed rate-limit keys and short-lived policy caches.
+- Add a control-plane managed invalidation/event channel for multi-node cache coherence.
 
 ## License
 

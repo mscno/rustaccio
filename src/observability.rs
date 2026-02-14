@@ -1,5 +1,11 @@
 use config::{Config as SettingsLoader, Environment};
 use std::sync::OnceLock;
+#[cfg(feature = "otel")]
+use tracing_opentelemetry::OpenTelemetryLayer;
+#[cfg(feature = "otel")]
+use tracing_subscriber::Registry;
+#[cfg(not(feature = "otel"))]
+use tracing_subscriber::layer::Identity;
 use tracing_subscriber::{
     EnvFilter, fmt, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt,
 };
@@ -62,9 +68,12 @@ pub fn init_from_env(default_level: &str) -> TracingSettings {
     let env_filter = EnvFilter::try_new(filter.clone())
         .unwrap_or_else(|_| EnvFilter::new("rustaccio=info,tower_http=info"));
 
+    maybe_warn_about_otel_without_feature();
+
     TRACING_INIT.get_or_init(|| match log_format {
         LogFormat::Json => {
             tracing_subscriber::registry()
+                .with(otel_layer_from_env())
                 .with(env_filter)
                 .with(tracing_error::ErrorLayer::default())
                 .with(
@@ -79,6 +88,7 @@ pub fn init_from_env(default_level: &str) -> TracingSettings {
         }
         LogFormat::Compact => {
             tracing_subscriber::registry()
+                .with(otel_layer_from_env())
                 .with(env_filter)
                 .with(tracing_error::ErrorLayer::default())
                 .with(
@@ -92,6 +102,7 @@ pub fn init_from_env(default_level: &str) -> TracingSettings {
         }
         LogFormat::Pretty => {
             tracing_subscriber::registry()
+                .with(otel_layer_from_env())
                 .with(env_filter)
                 .with(tracing_error::ErrorLayer::default())
                 .with(
@@ -106,6 +117,57 @@ pub fn init_from_env(default_level: &str) -> TracingSettings {
     });
 
     TracingSettings { filter, log_format }
+}
+
+#[cfg(not(feature = "otel"))]
+fn maybe_warn_about_otel_without_feature() {
+    let enabled = load_env_value("RUSTACCIO_OTEL_ENABLED")
+        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        .unwrap_or(false);
+    if enabled {
+        eprintln!(
+            "RUSTACCIO_OTEL_ENABLED is set, but rustaccio was not built with the `otel` feature"
+        );
+    }
+}
+
+#[cfg(feature = "otel")]
+fn maybe_warn_about_otel_without_feature() {}
+
+#[cfg(not(feature = "otel"))]
+fn otel_layer_from_env() -> Option<Identity> {
+    None
+}
+
+#[cfg(feature = "otel")]
+fn otel_layer_from_env() -> Option<OpenTelemetryLayer<Registry, opentelemetry_sdk::trace::Tracer>> {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_otlp::WithExportConfig;
+
+    let enabled = load_env_value("RUSTACCIO_OTEL_ENABLED")
+        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+
+    let endpoint = load_env_value("RUSTACCIO_OTEL_EXPORTER_OTLP_ENDPOINT")
+        .unwrap_or_else(|| "http://127.0.0.1:4318/v1/traces".to_string());
+    let service_name =
+        load_env_value("RUSTACCIO_OTEL_SERVICE_NAME").unwrap_or_else(|| "rustaccio".to_string());
+
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_endpoint(endpoint)
+        .build()
+        .ok()?;
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .build();
+    let tracer = provider.tracer(service_name);
+    opentelemetry::global::set_tracer_provider(provider);
+
+    Some(tracing_opentelemetry::layer().with_tracer(tracer))
 }
 
 fn with_noisy_dependency_guards(filter: String) -> String {
