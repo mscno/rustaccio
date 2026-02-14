@@ -5,6 +5,7 @@ pre-commit:
       run: cargo fmt --all -- --check
     cargo-check:
       run: cargo check --workspace --all-targets --locked
+    cargo-clippy:
+      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo-test:
       run: cargo test --workspace --all-targets --locked --quiet
-

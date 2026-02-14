@@ -312,7 +312,7 @@ impl Config {
             self.audit_enabled = parsed;
         }
         if let Some(value) = env_cfg.url_prefix.as_deref() {
-            self.url_prefix = normalize_url_prefix(&value);
+            self.url_prefix = normalize_url_prefix(value);
         }
         if let Some(parsed) = parse_env_value::<bool>(env_cfg.trust_proxy.as_deref()) {
             self.trust_proxy = parsed;
@@ -345,7 +345,7 @@ impl Config {
 
     fn apply_auth_env_overrides(&mut self, env_cfg: &RawEnvConfig) {
         if let Some(value) = env_cfg.auth_backend.as_deref() {
-            self.auth_plugin.backend = AuthBackend::from_str(&value);
+            self.auth_plugin.backend = AuthBackend::from_str(value);
         }
         if let Some(parsed) = parse_env_value::<bool>(env_cfg.auth_external_mode.as_deref()) {
             self.auth_plugin.external_mode = parsed;
@@ -394,7 +394,7 @@ impl Config {
 
     fn apply_storage_env_overrides(&mut self, env_cfg: &RawEnvConfig) {
         if let Some(value) = env_cfg.tarball_backend.as_deref() {
-            self.tarball_storage.backend = TarballStorageBackend::from_str(&value);
+            self.tarball_storage.backend = TarballStorageBackend::from_str(value);
         }
 
         if self.tarball_storage.backend == TarballStorageBackend::Local {

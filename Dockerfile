@@ -18,7 +18,11 @@ COPY --from=planner /app/recipe.json recipe.json
 ARG CARGO_BUILD_JOBS=2
 ARG CARGO_PROFILE=release
 
-RUN CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS}" cargo chef cook --release --locked --features s3
+RUN if [ "${CARGO_PROFILE}" = "release" ]; then \
+      cargo chef cook --release --locked --features s3 -j "${CARGO_BUILD_JOBS}"; \
+    else \
+      cargo chef cook --profile "${CARGO_PROFILE}" --locked --features s3 -j "${CARGO_BUILD_JOBS}"; \
+    fi
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src

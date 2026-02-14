@@ -105,7 +105,7 @@ Environment variables:
 - `RUSTACCIO_AUDIT_ENABLED` (default `true`)
 - `RUSTACCIO_URL_PREFIX` (default `/`)
 - `RUSTACCIO_TRUST_PROXY` (default `false`)
-- `RUSTACCIO_KEEP_ALIVE_TIMEOUT` (seconds, optional; currently accepted for config parity but not applied by the current axum serve path)
+- `RUSTACCIO_KEEP_ALIVE_TIMEOUT` (seconds, optional; applied as HTTP/1 keep-alive/header-read timeout)
 - `RUSTACCIO_REQUEST_TIMEOUT_SECS` (default `30`, clamps `1..=300`)
 - `RUSTACCIO_LOG_LEVEL` (default `info`)
 - `RUSTACCIO_LOG_FORMAT` (`pretty`, `compact`, or `json`, default `pretty`)
@@ -187,12 +187,13 @@ Configured pre-commit checks:
 
 - `cargo fmt --all -- --check`
 - `cargo check --workspace --all-targets --locked`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - `cargo test --workspace --all-targets --locked --quiet`
 
 Quality gate:
 
 ```bash
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 ## Library Embedding
@@ -372,7 +373,7 @@ Rustaccio targets Verdaccio-compatible npm client behavior for core flows, but i
 - `/-/npm/v1/user` currently does not support 2FA updates (`tfa` payload returns `503`).
 - Search (`/-/v1/search`) currently uses `text`, `size`, and `from`; score tuning params are ignored, and `total` reflects returned page size.
 - YAML `listen` can be configured as a list for config compatibility, but the server currently binds a single effective socket address.
-- `server.keepAliveTimeout` is parsed for config parity but is currently not applied by the active axum runtime path.
+- `server.keepAliveTimeout` is currently mapped to an HTTP/1 header-read timeout for keep-alive connections (not a byte-for-byte Node.js socket timeout implementation).
 - Built-in web UI is a lightweight Verdaccio-style SPA shell and static assets, not the full upstream Verdaccio frontend/runtime surface.
 - Rustaccio-specific admin endpoints are exposed at `/-/admin/reindex` and `/-/admin/storage-health`.
 

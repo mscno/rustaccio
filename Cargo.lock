@@ -2150,6 +2150,8 @@ dependencies = [
  "flate2",
  "hex",
  "http-body-util",
+ "hyper 1.8.1",
+ "hyper-util",
  "password-hash",
  "rand 0.8.5",
  "reqwest",
