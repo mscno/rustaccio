@@ -658,7 +658,6 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
 
         if tail.len() == 4 && tail[0] == "-" && tail[2] == "-rev" {
             ensure_unpublish_permission(&state, &package_name, auth_identity.as_ref()).await?;
-            ensure_publish_permission(&state, &package_name, auth_identity.as_ref()).await?;
             ensure_package_owner_permission(&state, &package_name, auth_user.as_deref()).await?;
             let message = state.store.remove_tarball(&package_name, &tail[1]).await?;
             return Ok(json_response(

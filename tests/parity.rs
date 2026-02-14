@@ -2106,6 +2106,50 @@ async fn unpublish_and_search_shape_edges() {
 }
 
 #[tokio::test]
+async fn remove_package_failure_keeps_state_when_backend_delete_fails() {
+    let dir = TempDir::new().expect("dir");
+    let app = test_app(dir.path().to_path_buf(), None).await;
+    let token = create_user(&app, "delete-fail", "secret").await;
+
+    let manifest = pkg_manifest("delete-fail", "1.0.0", "delete-fail-1.0.0.tgz", b"blob");
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri("/delete-fail")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&manifest).expect("payload")))
+        .expect("request");
+    assert_eq!(send(&app, req).await.status(), StatusCode::CREATED);
+
+    let package_path = dir.path().join("tarballs").join("delete-fail");
+    tokio::fs::remove_dir_all(&package_path)
+        .await
+        .expect("remove package directory");
+    tokio::fs::write(&package_path, b"not a directory")
+        .await
+        .expect("create backend failure sentinel file");
+
+    let req = Request::builder()
+        .method(Method::DELETE)
+        .uri("/delete-fail/-rev/revision")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/delete-fail")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["name"].as_str(), Some("delete-fail"));
+}
+
+#[tokio::test]
 async fn deprecate_and_undeprecate_flow() {
     let dir = TempDir::new().expect("dir");
     let app = test_app(dir.path().to_path_buf(), None).await;
@@ -2389,6 +2433,66 @@ async fn unpublish_specific_version_via_put_rev_flow() {
         .body(Body::empty())
         .expect("request");
     assert_eq!(send(&app, req).await.status(), StatusCode::OK);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/put-unpub")
+        .body(Body::empty())
+        .expect("request");
+    let body = json_body(send(&app, req).await).await;
+    assert!(body["versions"].get("1.0.0").is_none());
+    assert!(body["versions"].get("1.1.0").is_some());
+    assert!(body["_attachments"].get("put-unpub-1.0.0.tgz").is_none());
+    assert!(body["_attachments"].get("put-unpub-1.1.0.tgz").is_some());
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/put-unpub/-/put-unpub-1.0.0.tgz")
+        .body(Body::empty())
+        .expect("request");
+    assert_eq!(send(&app, req).await.status(), StatusCode::NOT_FOUND);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/put-unpub/-/put-unpub-1.1.0.tgz")
+        .body(Body::empty())
+        .expect("request");
+    assert_eq!(send(&app, req).await.status(), StatusCode::OK);
+
+    let removed_tarball_path = dir
+        .path()
+        .join("tarballs")
+        .join("put-unpub")
+        .join("put-unpub-1.0.0.tgz");
+    assert!(
+        !tokio::fs::try_exists(&removed_tarball_path)
+            .await
+            .expect("removed tarball exists check"),
+        "removed version tarball should be deleted from local backend"
+    );
+    let kept_tarball_path = dir
+        .path()
+        .join("tarballs")
+        .join("put-unpub")
+        .join("put-unpub-1.1.0.tgz");
+    assert!(
+        tokio::fs::try_exists(&kept_tarball_path)
+            .await
+            .expect("kept tarball exists check"),
+        "retained version tarball should remain in local backend"
+    );
+
+    let sidecar_path = dir
+        .path()
+        .join("tarballs")
+        .join("put-unpub")
+        .join("package.json");
+    let sidecar_bytes = tokio::fs::read(sidecar_path).await.expect("read sidecar");
+    let sidecar: Value = serde_json::from_slice(&sidecar_bytes).expect("parse sidecar");
+    assert!(sidecar["versions"].get("1.0.0").is_none());
+    assert!(sidecar["versions"].get("1.1.0").is_some());
+    assert!(sidecar["_attachments"].get("put-unpub-1.0.0.tgz").is_none());
+    assert!(sidecar["_attachments"].get("put-unpub-1.1.0.tgz").is_some());
 }
 
 #[tokio::test]
@@ -2558,6 +2662,51 @@ async fn acl_anonymous_publish_allowed() {
         .expect("request");
     let resp = send(&app, req).await;
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn acl_unpublish_can_remove_tarball_without_publish_permission() {
+    let dir = TempDir::new().expect("dir");
+    let rules = vec![
+        PackageRule {
+            pattern: "acl-unpub-only".to_string(),
+            access: vec!["$all".to_string()],
+            publish: vec!["alice-unpub".to_string()],
+            unpublish: vec!["bob-unpub".to_string()],
+            proxy: None,
+            uplinks_look: true,
+        },
+        PackageRule::open("**"),
+    ];
+    let app = test_app_with_rules(dir.path().to_path_buf(), None, rules).await;
+    let alice_token = create_user(&app, "alice-unpub", "secret").await;
+    let bob_token = create_user(&app, "bob-unpub", "secret").await;
+
+    let manifest = pkg_manifest(
+        "acl-unpub-only",
+        "1.0.0",
+        "acl-unpub-only-1.0.0.tgz",
+        b"acl",
+    );
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri("/acl-unpub-only")
+        .header(header::AUTHORIZATION, format!("Bearer {alice_token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&manifest).expect("payload")))
+        .expect("request");
+    assert_eq!(send(&app, req).await.status(), StatusCode::CREATED);
+
+    let req = Request::builder()
+        .method(Method::DELETE)
+        .uri("/acl-unpub-only/-/acl-unpub-only-1.0.0.tgz/-rev/revision")
+        .header(header::AUTHORIZATION, format!("Bearer {bob_token}"))
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = json_body(resp).await;
+    assert_eq!(body["ok"].as_str(), Some("tarball removed"));
 }
 
 #[tokio::test]
@@ -3501,6 +3650,175 @@ async fn s3_mode_writes_verdaccio_package_sidecar_on_publish() {
     assert!(
         verdaccio_sidecar_put,
         "publish should write package sidecar metadata in Verdaccio-compatible layout"
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "s3")]
+async fn s3_mode_put_rev_unpublish_rewrites_sidecar_and_deletes_tarball_blob() {
+    let s3 = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().starts_with("/registry-test")
+                && request
+                    .url
+                    .query_pairs()
+                    .any(|(k, v)| k == "list-type" && v == "2")
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_s3_list_xml()))
+        .mount(&s3)
+        .await;
+    Mock::given(method("GET"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().starts_with("/registry-test/")
+                && request.url.path().contains("__rustaccio_meta")
+                && request.url.path().ends_with("state.json")
+        })
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&s3)
+        .await;
+    Mock::given(method("PUT"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().starts_with("/registry-test/")
+                && request.url.path().contains("__rustaccio_meta")
+                && request.url.path().ends_with("state.json")
+        })
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&s3)
+        .await;
+    Mock::given(method("PUT"))
+        .and(|request: &wiremock::Request| request.url.path().ends_with(".tgz"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&s3)
+        .await;
+    Mock::given(method("PUT"))
+        .and(|request: &wiremock::Request| {
+            request
+                .url
+                .path()
+                .contains("/registry/put-unpub-s3/package.json")
+        })
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&s3)
+        .await;
+    Mock::given(method("HEAD"))
+        .and(|request: &wiremock::Request| {
+            request
+                .url
+                .path()
+                .contains("/registry/put-unpub-s3/put-unpub-s3-1.0.0.tgz")
+        })
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&s3)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(|request: &wiremock::Request| {
+            request
+                .url
+                .path()
+                .contains("/registry/put-unpub-s3/put-unpub-s3-1.0.0.tgz")
+        })
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&s3)
+        .await;
+
+    let dir = TempDir::new().expect("dir");
+    let cfg = s3_test_config(dir.path().to_path_buf(), s3.uri());
+    let state = runtime::build_state(&cfg, None).await.expect("state");
+    let app = build_router(state);
+    let token = create_user(&app, "put-unpub-s3-user", "secret").await;
+
+    for (version, filename, data) in [
+        ("1.0.0", "put-unpub-s3-1.0.0.tgz", b"v1".as_slice()),
+        ("1.1.0", "put-unpub-s3-1.1.0.tgz", b"v2".as_slice()),
+    ] {
+        let mut manifest = pkg_manifest("put-unpub-s3", version, filename, data);
+        if version == "1.1.0" {
+            manifest["dist-tags"] = json!({"latest":"1.1.0"});
+        }
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/put-unpub-s3")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&manifest).expect("payload")))
+            .expect("request");
+        assert_eq!(send(&app, req).await.status(), StatusCode::CREATED);
+    }
+
+    let requests_before = s3.received_requests().await.expect("requests before");
+    let sidecar_puts_before = requests_before
+        .iter()
+        .filter(|request| request.method.as_str() == "PUT")
+        .filter(|request| {
+            request
+                .url
+                .path()
+                .contains("/registry/put-unpub-s3/package.json")
+        })
+        .count();
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/put-unpub-s3?write=true")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request");
+    let body = json_body(send(&app, req).await).await;
+    let rev = body["_rev"].as_str().unwrap_or_default().to_string();
+    let unpublish_body = json!({
+        "_id": "put-unpub-s3",
+        "name": "put-unpub-s3",
+        "_rev": rev,
+        "dist-tags": { "latest": "1.1.0" },
+        "versions": {
+            "1.1.0": body["versions"]["1.1.0"].clone()
+        },
+        "users": body["users"].clone(),
+        "maintainers": body["maintainers"].clone(),
+        "time": body["time"].clone(),
+        "readme": body["readme"].clone()
+    });
+
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri("/put-unpub-s3/-rev/some-rev")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&unpublish_body).expect("payload"),
+        ))
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let requests_after = s3.received_requests().await.expect("requests after");
+    let sidecar_puts_after = requests_after
+        .iter()
+        .filter(|request| request.method.as_str() == "PUT")
+        .filter(|request| {
+            request
+                .url
+                .path()
+                .contains("/registry/put-unpub-s3/package.json")
+        })
+        .count();
+    assert!(
+        sidecar_puts_after > sidecar_puts_before,
+        "metadata-only unpublish should rewrite Verdaccio package sidecar"
+    );
+
+    let deleted_removed_tarball = requests_after.iter().any(|request| {
+        request.method.as_str() == "DELETE"
+            && request
+                .url
+                .path()
+                .contains("/registry/put-unpub-s3/put-unpub-s3-1.0.0.tgz")
+    });
+    assert!(
+        deleted_removed_tarball,
+        "metadata-only unpublish should delete removed tarball blob from backend"
     );
 }
 

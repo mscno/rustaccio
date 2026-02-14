@@ -247,7 +247,7 @@ impl LocalTarballBackend {
     pub async fn delete_package(&self, package: &str) -> Result<(), RegistryError> {
         let path = self.root.join(Self::package_dir(package));
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            let _ = tokio::fs::remove_dir_all(path).await;
+            tokio::fs::remove_dir_all(path).await?;
             debug!("deleted local package tarball directory");
         }
         Ok(())

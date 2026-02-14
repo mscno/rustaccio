@@ -64,6 +64,11 @@ struct PersistedStateView<'a> {
     packages: HashMap<&'a String, &'a PackageRecord>,
 }
 
+#[derive(Default)]
+struct MetadataOnlyMergeResult {
+    tarballs_to_delete: HashSet<String>,
+}
+
 impl Store {
     #[instrument(skip(config), fields(data_dir = %config.data_dir.display(), auth_backend = ?config.auth_plugin.backend))]
     pub async fn open(config: &Config) -> Result<Self, RegistryError> {
@@ -1271,10 +1276,20 @@ impl Store {
             .unwrap_or(false)
     }
 
+    fn tarball_filename_from_version_payload(payload: &Value) -> Option<String> {
+        payload
+            .get("dist")
+            .and_then(Value::as_object)
+            .and_then(|dist| dist.get("tarball"))
+            .and_then(Value::as_str)
+            .and_then(package_filename_from_tarball_url)
+    }
+
     fn merge_metadata_only_manifest(
         manifest: &mut Map<String, Value>,
         body: &Value,
-    ) -> Result<(), RegistryError> {
+    ) -> Result<MetadataOnlyMergeResult, RegistryError> {
+        let mut result = MetadataOnlyMergeResult::default();
         let incoming_versions =
             body.get("versions")
                 .and_then(Value::as_object)
@@ -1305,6 +1320,12 @@ impl Store {
         let mut removed_versions = HashSet::new();
         for version in existing_versions {
             let Some(incoming_version) = incoming_versions.get(&version) else {
+                if let Some(existing_payload) = dst_versions.get(&version)
+                    && let Some(filename) =
+                        Self::tarball_filename_from_version_payload(existing_payload)
+                {
+                    result.tarballs_to_delete.insert(filename);
+                }
                 dst_versions.remove(&version);
                 removed_versions.insert(version);
                 continue;
@@ -1355,11 +1376,31 @@ impl Store {
         }
 
         if let Some(attachments) = body.get("_attachments").and_then(Value::as_object) {
+            let previous_attachment_names = manifest
+                .get("_attachments")
+                .and_then(Value::as_object)
+                .map(|existing| existing.keys().cloned().collect::<HashSet<_>>())
+                .unwrap_or_default();
             let mut new_attachments = Map::new();
             for (name, attachment) in attachments {
                 new_attachments.insert(name.clone(), Self::remove_attachment_data(attachment));
             }
+            let new_attachment_names = new_attachments.keys().cloned().collect::<HashSet<_>>();
+            for filename in previous_attachment_names.difference(&new_attachment_names) {
+                result.tarballs_to_delete.insert(filename.clone());
+            }
+            result
+                .tarballs_to_delete
+                .retain(|filename| !new_attachment_names.contains(filename));
             manifest.insert("_attachments".to_string(), Value::Object(new_attachments));
+        } else if !result.tarballs_to_delete.is_empty()
+            && let Some(existing_attachments) = manifest
+                .get_mut("_attachments")
+                .and_then(Value::as_object_mut)
+        {
+            for filename in &result.tarballs_to_delete {
+                existing_attachments.remove(filename);
+            }
         }
 
         if !removed_versions.is_empty()
@@ -1381,7 +1422,7 @@ impl Store {
             }
         }
 
-        Ok(())
+        Ok(result)
     }
 
     #[instrument(skip(self, body), fields(package = package_name, username))]
@@ -1429,21 +1470,21 @@ impl Store {
             })?;
 
         if !Self::has_attachment_data(&body) {
-            {
-                let mut state = self.state.write().await;
-                let Some(record) = state.packages.get_mut(package_name) else {
+            let (merged_manifest, tarballs_to_delete) = {
+                let state = self.state.read().await;
+                let Some(record) = state.packages.get(package_name) else {
                     return Err(RegistryError::http(
                         StatusCode::BAD_REQUEST,
                         API_ERROR_UNSUPPORTED_REGISTRY_CALL,
                     ));
                 };
-                let Some(manifest) = record.manifest.as_object_mut() else {
+                let Some(mut manifest) = record.manifest.as_object().cloned() else {
                     return Err(RegistryError::Internal);
                 };
 
-                Self::merge_metadata_only_manifest(manifest, &body)?;
-                Self::ensure_manifest_defaults(manifest, package_name, username);
-                Self::bump_revision(manifest);
+                let merge_result = Self::merge_metadata_only_manifest(&mut manifest, &body)?;
+                Self::ensure_manifest_defaults(&mut manifest, package_name, username);
+                Self::bump_revision(&mut manifest);
 
                 if let Some(time_obj) = manifest.get_mut("time").and_then(Value::as_object_mut) {
                     time_obj.insert(
@@ -1452,6 +1493,31 @@ impl Store {
                     );
                 }
 
+                (
+                    manifest,
+                    merge_result
+                        .tarballs_to_delete
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                )
+            };
+
+            for filename in &tarballs_to_delete {
+                self.tarball_backend.delete(package_name, filename).await?;
+            }
+
+            {
+                let mut state = self.state.write().await;
+                let Some(record) = state.packages.get_mut(package_name) else {
+                    return Err(RegistryError::http(
+                        StatusCode::BAD_REQUEST,
+                        API_ERROR_UNSUPPORTED_REGISTRY_CALL,
+                    ));
+                };
+                for filename in &tarballs_to_delete {
+                    record.upstream_tarballs.remove(filename);
+                }
+                record.manifest = Value::Object(merged_manifest);
                 record.updated_at = Self::now_ms();
                 record.cached_from_uplink = false;
             }
@@ -1605,6 +1671,18 @@ impl Store {
     #[instrument(skip(self), fields(package = package_name))]
     pub async fn remove_package(&self, package_name: &str) -> Result<String, RegistryError> {
         {
+            let state = self.state.read().await;
+            if !state.packages.contains_key(package_name) {
+                return Err(RegistryError::http(
+                    StatusCode::NOT_FOUND,
+                    API_ERROR_NO_PACKAGE,
+                ));
+            }
+        }
+
+        self.tarball_backend.delete_package(package_name).await?;
+
+        {
             let mut state = self.state.write().await;
             if state.packages.remove(package_name).is_none() {
                 return Err(RegistryError::http(
@@ -1613,8 +1691,6 @@ impl Store {
                 ));
             }
         }
-
-        let _ = self.tarball_backend.delete_package(package_name).await;
 
         self.persist_state().await?;
         debug!("removed package");
