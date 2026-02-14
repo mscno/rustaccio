@@ -79,10 +79,10 @@ The Docker image compiles `rustaccio` with `--features s3` by default.
 The image does not include `config.example.yml`; mount your own config and set `RUSTACCIO_CONFIG`.
 
 `--config` loads the given YAML file and fails fast if the file cannot be read or parsed.
-`RUSTACCIO_CONFIG` remains available as an environment-variable alternative.
+`RUSTACCIO_CONFIG` and `RUSTACCIO_CONFIG_BASE64` remain available as environment-variable alternatives.
 Unified merge precedence is:
 
-`defaults < RUSTACCIO_CONFIG file < --config file < environment variables`.
+`defaults < RUSTACCIO_CONFIG or RUSTACCIO_CONFIG_BASE64 < --config file < environment variables`.
 
 `main` delegates to library runtime (`rustaccio::runtime::run_from_env()`), so standalone and embedded usage share the same config/runtime path.
 The full `RUSTACCIO_*` environment variable list is generated into `.env.example` via `cargo run --bin sync_examples`.
@@ -93,6 +93,7 @@ Environment variables:
 - `PORT` (optional platform-assigned port; when set, rustaccio binds to `0.0.0.0:$PORT` and this takes precedence over `RUSTACCIO_BIND`)
 - `RUSTACCIO_DATA_DIR` (default `.rustaccio-data`)
 - `RUSTACCIO_CONFIG` (optional Verdaccio-style YAML; loads `packages` ACL rules + `uplinks`)
+- `RUSTACCIO_CONFIG_BASE64` (optional base64-encoded Verdaccio-style YAML; mutually exclusive with `RUSTACCIO_CONFIG`)
 - `RUSTACCIO_UPSTREAM` (optional, eg `https://registry.npmjs.org`)
 - `RUSTACCIO_WEB_LOGIN` (default `false`; enables `/-/v1/login*` endpoints)
 - `RUSTACCIO_WEB_ENABLE` (default `true`)

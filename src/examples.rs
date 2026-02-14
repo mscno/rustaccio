@@ -206,6 +206,7 @@ fn env_defaults() -> BTreeMap<&'static str, &'static str> {
         ("RUSTACCIO_AUTH_HTTP_LOGIN_ENDPOINT", "/authenticate"),
         ("RUSTACCIO_AUTH_HTTP_TIMEOUT_MS", "5000"),
         ("RUSTACCIO_BIND", "127.0.0.1:4873"),
+        ("RUSTACCIO_CONFIG_BASE64", ""),
         ("RUSTACCIO_DATA_DIR", ".rustaccio-data"),
         ("RUSTACCIO_KEEP_ALIVE_TIMEOUT", ""),
         ("RUSTACCIO_LOG_FORMAT", "pretty"),

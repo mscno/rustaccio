@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use rustaccio::config::{AuthBackend, Config, TarballStorageBackend};
 use std::{collections::HashSet, io::Write, path::PathBuf, sync::Mutex};
 
@@ -188,6 +189,7 @@ fn from_env_errors_when_rustaccio_config_path_is_invalid() {
                 "RUSTACCIO_CONFIG",
                 Some("/definitely/missing/rustaccio.yml"),
             ),
+            ("RUSTACCIO_CONFIG_BASE64", None),
             ("PORT", None),
             ("RUSTACCIO_BIND", None),
         ],
@@ -199,11 +201,86 @@ fn from_env_errors_when_rustaccio_config_path_is_invalid() {
 }
 
 #[test]
+fn from_env_loads_rustaccio_config_base64() {
+    let yaml = r#"
+listen:
+  - 127.0.0.1:5111
+web:
+  title: Base64 Config
+  enable: false
+"#;
+    let encoded = B64.encode(yaml.as_bytes());
+
+    with_env_vars(
+        &[
+            ("RUSTACCIO_CONFIG", None),
+            ("RUSTACCIO_CONFIG_BASE64", Some(encoded.as_str())),
+            ("PORT", None),
+            ("RUSTACCIO_BIND", None),
+        ],
+        || {
+            let cfg = Config::from_env().expect("config from base64 env");
+            assert_eq!(cfg.listen, vec!["127.0.0.1:5111".to_string()]);
+            assert_eq!(cfg.web_title, "Base64 Config");
+            assert!(!cfg.web_enabled);
+        },
+    );
+}
+
+#[test]
+fn from_env_errors_when_rustaccio_config_base64_is_invalid() {
+    with_env_vars(
+        &[
+            ("RUSTACCIO_CONFIG", None),
+            ("RUSTACCIO_CONFIG_BASE64", Some("%%%not-base64%%%")),
+            ("PORT", None),
+            ("RUSTACCIO_BIND", None),
+        ],
+        || {
+            let err = Config::from_env().expect_err("invalid base64 config");
+            assert!(err.contains("failed to decode RUSTACCIO_CONFIG_BASE64"));
+        },
+    );
+}
+
+#[test]
+fn from_env_errors_when_both_config_sources_are_set() {
+    let mut file = tempfile::NamedTempFile::new().expect("temp file");
+    writeln!(file, "web:\n  title: From Path").expect("write");
+    let yaml = "web:\n  title: From Base64";
+    let encoded = B64.encode(yaml.as_bytes());
+
+    with_env_vars(
+        &[
+            (
+                "RUSTACCIO_CONFIG",
+                Some(file.path().to_str().expect("utf8 path")),
+            ),
+            ("RUSTACCIO_CONFIG_BASE64", Some(encoded.as_str())),
+            ("PORT", None),
+            ("RUSTACCIO_BIND", None),
+        ],
+        || {
+            let err = Config::from_env().expect_err("conflicting config sources");
+            assert!(err.contains("RUSTACCIO_CONFIG and RUSTACCIO_CONFIG_BASE64"));
+        },
+    );
+}
+
+#[test]
 fn from_env_uses_port_env_for_platform_compatibility() {
-    with_env_vars(&[("RUSTACCIO_BIND", None), ("PORT", Some("6123"))], || {
-        let cfg = Config::from_env().expect("config from env");
-        assert_eq!(cfg.listen, vec!["0.0.0.0:6123".to_string()]);
-    });
+    with_env_vars(
+        &[
+            ("RUSTACCIO_BIND", None),
+            ("RUSTACCIO_CONFIG", None),
+            ("RUSTACCIO_CONFIG_BASE64", None),
+            ("PORT", Some("6123")),
+        ],
+        || {
+            let cfg = Config::from_env().expect("config from env");
+            assert_eq!(cfg.listen, vec!["0.0.0.0:6123".to_string()]);
+        },
+    );
 }
 
 #[test]
@@ -211,6 +288,8 @@ fn port_env_overrides_rustaccio_bind() {
     with_env_vars(
         &[
             ("RUSTACCIO_BIND", Some("127.0.0.1:4999")),
+            ("RUSTACCIO_CONFIG", None),
+            ("RUSTACCIO_CONFIG_BASE64", None),
             ("PORT", Some("6123")),
         ],
         || {
@@ -265,6 +344,7 @@ store:
                 "RUSTACCIO_CONFIG",
                 Some(env_file.path().to_str().expect("utf8 path")),
             ),
+            ("RUSTACCIO_CONFIG_BASE64", None),
             ("RUSTACCIO_UPSTREAM", None),
             ("RUSTACCIO_WEB_LOGIN", None),
             ("RUSTACCIO_WEB_ENABLE", Some("true")),
@@ -359,6 +439,7 @@ fn without_config_env(run: impl FnOnce()) {
             ("PORT", None),
             ("RUSTACCIO_DATA_DIR", None),
             ("RUSTACCIO_CONFIG", None),
+            ("RUSTACCIO_CONFIG_BASE64", None),
             ("RUSTACCIO_UPSTREAM", None),
             ("RUSTACCIO_WEB_LOGIN", None),
             ("RUSTACCIO_WEB_ENABLE", None),

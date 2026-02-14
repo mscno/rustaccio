@@ -1,5 +1,6 @@
 use crate::acl::PackageRule;
-use config::{Config as SettingsLoader, Environment, File};
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use config::{Config as SettingsLoader, Environment};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -123,6 +124,7 @@ pub struct Config {
 #[serde(default)]
 struct RawEnvConfig {
     config: Option<String>,
+    config_base64: Option<String>,
     bind: Option<String>,
     data_dir: Option<String>,
     upstream: Option<String>,
@@ -163,7 +165,7 @@ impl Config {
     pub fn from_env() -> Result<Self, String> {
         let env_cfg = load_rustaccio_env()?;
         let mut cfg = Self::defaults();
-        cfg.apply_env_config_file_if_present(&env_cfg)?;
+        cfg.apply_env_config_sources_if_present(&env_cfg)?;
         cfg.apply_env_overrides(&env_cfg);
         cfg.apply_port_override(load_process_env_value("port")?);
         cfg.ensure_default_uplink();
@@ -173,7 +175,7 @@ impl Config {
     pub fn from_env_with_config_file(config_path: PathBuf) -> Result<Self, String> {
         let env_cfg = load_rustaccio_env()?;
         let mut cfg = Self::defaults();
-        cfg.apply_env_config_file_if_present(&env_cfg)?;
+        cfg.apply_env_config_sources_if_present(&env_cfg)?;
         cfg.apply_yaml_overrides(Self::from_yaml_file(config_path)?);
         cfg.apply_env_overrides(&env_cfg);
         cfg.apply_port_override(load_process_env_value("port")?);
@@ -213,17 +215,52 @@ impl Config {
         Self::defaults()
     }
 
-    fn apply_env_config_file_if_present(&mut self, env_cfg: &RawEnvConfig) -> Result<(), String> {
-        let Some(path) = env_cfg.config.as_deref() else {
-            return Ok(());
-        };
-        if path.trim().is_empty() {
-            return Ok(());
+    fn apply_env_config_sources_if_present(
+        &mut self,
+        env_cfg: &RawEnvConfig,
+    ) -> Result<(), String> {
+        let config_path = env_cfg
+            .config
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let config_b64 = env_cfg
+            .config_base64
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        match (config_path, config_b64) {
+            (Some(_), Some(_)) => Err(
+                "RUSTACCIO_CONFIG and RUSTACCIO_CONFIG_BASE64 are both set; use only one"
+                    .to_string(),
+            ),
+            (Some(path), None) => {
+                let loaded = Self::from_yaml_file(PathBuf::from(path))
+                    .map_err(|err| format!("failed to load RUSTACCIO_CONFIG={path}: {err}"))?;
+                self.apply_yaml_overrides(loaded);
+                Ok(())
+            }
+            (None, Some(value)) => {
+                let compact = value
+                    .chars()
+                    .filter(|ch| !ch.is_ascii_whitespace())
+                    .collect::<String>();
+                let decoded = B64
+                    .decode(compact)
+                    .map_err(|err| format!("failed to decode RUSTACCIO_CONFIG_BASE64: {err}"))?;
+                let yaml = String::from_utf8(decoded).map_err(|err| {
+                    format!(
+                        "failed to decode RUSTACCIO_CONFIG_BASE64: decoded bytes are not UTF-8 ({err})"
+                    )
+                })?;
+                let loaded = Self::from_yaml_str("RUSTACCIO_CONFIG_BASE64", &yaml)
+                    .map_err(|err| format!("failed to load RUSTACCIO_CONFIG_BASE64: {err}"))?;
+                self.apply_yaml_overrides(loaded);
+                Ok(())
+            }
+            (None, None) => Ok(()),
         }
-        let loaded = Self::from_yaml_file(PathBuf::from(&path))
-            .map_err(|err| format!("failed to load RUSTACCIO_CONFIG={path}: {err}"))?;
-        self.apply_yaml_overrides(loaded);
-        Ok(())
     }
 
     fn apply_env_overrides(&mut self, env_cfg: &RawEnvConfig) {
@@ -431,7 +468,15 @@ impl Config {
 
     pub fn from_yaml_file(path: PathBuf) -> Result<Self, String> {
         let parsed = load_yaml_config(&path)?;
+        Self::from_yaml_config(parsed)
+    }
 
+    fn from_yaml_str(source: &str, text: &str) -> Result<Self, String> {
+        let parsed = load_yaml_config_from_str(source, text)?;
+        Self::from_yaml_config(parsed)
+    }
+
+    fn from_yaml_config(parsed: YamlConfig) -> Result<Self, String> {
         let bind = parse_bind(parsed.listen.as_ref())?;
         let listen = parse_listen(parsed.listen.as_ref(), &bind);
         let data_dir = parse_data_dir(parsed.storage.as_ref());
@@ -527,21 +572,17 @@ impl Config {
 fn load_yaml_config(path: &Path) -> Result<YamlConfig, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-    let ordered_packages = serde_yaml::from_str::<YamlPackagesOnly>(&text)
+    let source = path.display().to_string();
+    load_yaml_config_from_str(&source, &text)
+}
+
+fn load_yaml_config_from_str(source: &str, text: &str) -> Result<YamlConfig, String> {
+    let ordered_packages = serde_yaml::from_str::<YamlPackagesOnly>(text)
         .ok()
         .and_then(|value| value.packages);
 
-    let loaded = SettingsLoader::builder()
-        .add_source(
-            File::from(path)
-                .format(config::FileFormat::Yaml)
-                .required(true),
-        )
-        .build()
-        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
-    let mut parsed = loaded
-        .try_deserialize::<YamlConfig>()
-        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    let mut parsed = serde_yaml::from_str::<YamlConfig>(text)
+        .map_err(|err| format!("failed to parse {source}: {err}"))?;
     if ordered_packages.is_some() {
         parsed.packages = ordered_packages;
     }
@@ -556,6 +597,7 @@ fn load_rustaccio_env() -> Result<RawEnvConfig, String> {
 
     Ok(RawEnvConfig {
         config: env_value_for_var(&settings, "RUSTACCIO_CONFIG"),
+        config_base64: env_value_for_var(&settings, "RUSTACCIO_CONFIG_BASE64"),
         bind: env_value_for_var(&settings, "RUSTACCIO_BIND"),
         data_dir: env_value_for_var(&settings, "RUSTACCIO_DATA_DIR"),
         upstream: env_value_for_var(&settings, "RUSTACCIO_UPSTREAM"),
