@@ -9,29 +9,31 @@
 <body>
   <div id="app" class="shell">
     <header class="topbar">
-      <div class="brand-wrap">
-        <div class="brand">
-          <div class="logo" aria-hidden="true"></div>
-          <div>
-            <a href="{{ASSET_BASE}}/" class="title" id="brandTitle">{{TITLE}}</a>
-            <p class="subtitle">Private npm registry control surface</p>
+      <div class="topbar-inner">
+        <div class="brand-wrap">
+          <div class="brand">
+            <div class="logo" aria-hidden="true"></div>
+            <div>
+              <a href="{{ASSET_BASE}}/" class="title" id="brandTitle">{{TITLE}}</a>
+              <p class="subtitle">Private npm registry control surface</p>
+            </div>
           </div>
+          <nav class="quick-links" aria-label="Quick Links">
+            <a class="pill-link" href="{{ASSET_BASE}}/-/web/">Packages</a>
+            <a class="pill-link" href="{{ASSET_BASE}}/-/web/settings">Account</a>
+          </nav>
         </div>
-        <nav class="quick-links" aria-label="Quick Links">
-          <a class="pill-link" href="{{ASSET_BASE}}/-/web/">Packages</a>
-          <a class="pill-link" href="{{ASSET_BASE}}/-/web/settings">Account</a>
-        </nav>
-      </div>
 
-      <form id="searchForm" class="search" role="search">
-        <label class="visually-hidden" for="searchInput">Search packages</label>
-        <input id="searchInput" type="search" placeholder="Search packages by name, keyword, or scope" autocomplete="off" />
-      </form>
+        <form id="searchForm" class="search" role="search">
+          <label class="visually-hidden" for="searchInput">Search packages</label>
+          <input id="searchInput" type="search" placeholder="Search packages by name, keyword, or scope" autocomplete="off" />
+        </form>
 
-      <div class="top-actions">
-        <a id="settingsLink" class="link-btn" href="{{ASSET_BASE}}/-/web/settings">Settings</a>
-        <a id="loginLink" class="link-btn" href="{{ASSET_BASE}}/-/web/login">Login</a>
-        <button id="logoutBtn" class="ghost hidden" type="button">Logout</button>
+        <div class="top-actions">
+          <a id="settingsLink" class="link-btn" href="{{ASSET_BASE}}/-/web/settings">Settings</a>
+          <a id="loginLink" class="link-btn" href="{{ASSET_BASE}}/-/web/login">Login</a>
+          <button id="logoutBtn" class="ghost hidden" type="button">Logout</button>
+        </div>
       </div>
     </header>
 

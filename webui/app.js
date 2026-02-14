@@ -141,6 +141,76 @@
     return manifest?.["dist-tags"]?.latest || "-";
   }
 
+  function parseSemverish(value) {
+    const raw = String(value || "");
+    const withoutBuild = raw.split("+")[0];
+    const [core, prereleaseRaw] = withoutBuild.split("-", 2);
+    const parts = core.split(".");
+    if (parts.length !== 3) {
+      return null;
+    }
+
+    const parsed = parts.map((part) => Number.parseInt(part, 10));
+    if (parsed.some((part) => Number.isNaN(part) || part < 0)) {
+      return null;
+    }
+
+    return {
+      core: parsed,
+      stable: prereleaseRaw == null,
+      prerelease: prereleaseRaw || "",
+    };
+  }
+
+  function compareVersionsDesc(a, b) {
+    const left = parseSemverish(a);
+    const right = parseSemverish(b);
+
+    if (left && right) {
+      for (let index = 0; index < left.core.length; index += 1) {
+        if (left.core[index] !== right.core[index]) {
+          return right.core[index] - left.core[index];
+        }
+      }
+      if (left.stable !== right.stable) {
+        return left.stable ? -1 : 1;
+      }
+      if (left.prerelease !== right.prerelease) {
+        return right.prerelease.localeCompare(left.prerelease, undefined, { numeric: true });
+      }
+      return String(b).localeCompare(String(a), undefined, { numeric: true });
+    }
+
+    if (left && !right) {
+      return -1;
+    }
+    if (!left && right) {
+      return 1;
+    }
+
+    return String(b).localeCompare(String(a), undefined, { numeric: true });
+  }
+
+  function packageVersions(manifest) {
+    const versions = new Set();
+
+    Object.keys(manifest?.versions || {}).forEach((version) => versions.add(String(version)));
+
+    Object.values(manifest?.["dist-tags"] || {}).forEach((version) => {
+      if (typeof version === "string" && version.trim()) {
+        versions.add(version);
+      }
+    });
+
+    Object.keys(manifest?.time || {}).forEach((version) => {
+      if (version !== "created" && version !== "modified") {
+        versions.add(version);
+      }
+    });
+
+    return Array.from(versions).sort(compareVersionsDesc);
+  }
+
   function packageReadme(manifest) {
     return manifest?.readme || "No README published.";
   }
@@ -210,12 +280,47 @@
 
   async function renderPackage(packageName) {
     const manifest = await api(`/${encodeURIComponent(packageName)}`);
-    const versions = Object.keys(manifest.versions || {}).sort().reverse();
+    const versions = packageVersions(manifest);
     const tags = Object.entries(manifest["dist-tags"] || {});
     const latest = latestVersion(manifest);
     const latestManifest = manifest.versions?.[latest] || {};
-    const latestDist = latestManifest?.dist?.tarball || "";
+    const latestDist =
+      latestManifest?.dist?.tarball ||
+      versions.map((version) => manifest.versions?.[version]?.dist?.tarball).find(Boolean) ||
+      "";
     const homepage = latestManifest.homepage || "";
+
+    const tagsByVersion = tags.reduce((acc, [tag, version]) => {
+      const key = String(version);
+      const row = acc.get(key) || [];
+      row.push(tag);
+      acc.set(key, row);
+      return acc;
+    }, new Map());
+
+    const versionRows = versions
+      .map((version) => {
+        const versionManifest = manifest.versions?.[version] || {};
+        const tarball = versionManifest?.dist?.tarball || "";
+        const matchingTags = tagsByVersion.get(version) || [];
+        const publishedAt = manifest?.time?.[version] || "";
+
+        return `<li class="version-row">
+          <div>
+            <div class="version-topline">
+              <code>${escapeHtml(version)}</code>
+              ${matchingTags
+                .map((tag) => `<span class="badge">tag ${escapeHtml(tag)}</span>`)
+                .join("")}
+            </div>
+            ${publishedAt ? `<div class="pkg-meta">published ${escapeHtml(publishedAt)}</div>` : ""}
+          </div>
+          <div class="version-actions">
+            ${tarball ? `<a class="btn alt" href="${escapeHtml(tarball)}" download>Tarball</a>` : '<span class="pkg-meta">No tarball URL</span>'}
+          </div>
+        </li>`;
+      })
+      .join("");
 
     els.viewRoot.innerHTML = `
       <section class="card">
@@ -240,7 +345,7 @@
         </article>
         <article class="card">
           <h2 class="panel-title">Versions</h2>
-          <ul class="list">${versions.map((v) => `<li>${escapeHtml(v)}</li>`).join("") || "<li>None</li>"}</ul>
+          <ul class="list version-list">${versionRows || "<li>None</li>"}</ul>
           <div class="form-actions">
             ${latestDist ? `<a class="btn alt" href="${escapeHtml(latestDist)}">Download latest tarball</a>` : ""}
             ${homepage ? `<a class="btn alt" href="${escapeHtml(homepage)}" target="_blank" rel="noreferrer">Homepage</a>` : ""}
