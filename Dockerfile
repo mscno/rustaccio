@@ -32,12 +32,13 @@ RUN if [ "${CARGO_PROFILE}" = "release" ]; then \
       cp "target/${CARGO_PROFILE}/rustaccio" /tmp/rustaccio-bin; \
     fi
 
-FROM debian:bookworm-slim AS runtime
+RUN mkdir -p /tmp/rustaccio-root/data
 
-RUN useradd --system --no-log-init --create-home --uid 10001 --home-dir /var/lib/rustaccio rustaccio
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
 WORKDIR /var/lib/rustaccio
 
+COPY --from=builder --chown=65532:65532 /tmp/rustaccio-root/ /var/lib/rustaccio/
 COPY --from=builder /tmp/rustaccio-bin /usr/local/bin/rustaccio
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
@@ -45,6 +46,6 @@ ENV RUSTACCIO_BIND=0.0.0.0:4873
 ENV RUSTACCIO_DATA_DIR=/var/lib/rustaccio/data
 
 EXPOSE 4873
-USER rustaccio
+USER 65532:65532
 
 ENTRYPOINT ["/usr/local/bin/rustaccio"]

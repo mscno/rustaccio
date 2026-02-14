@@ -5,3 +5,4 @@ verdaccio
 .rustaccio-data
 tmp
 local
+.tmp.Dockerfile.baseline
