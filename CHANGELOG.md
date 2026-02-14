@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-02-14
+
+### Added
+
+- `RUSTACCIO_CONFIG_BASE64` support for loading base64-encoded Verdaccio-style YAML configuration from environment variables.
+- Validation and test coverage for `RUSTACCIO_CONFIG_BASE64` success/failure paths and conflicts with `RUSTACCIO_CONFIG`.
+- New `justfile` with common local development and build commands.
+- Project logo asset and updated README branding.
+- Tagged-release binary artifact publishing in CI (`rustaccio-linux-amd64` attached to GitHub releases).
+
+### Changed
+
+- Config loading flow refactor to unify YAML/env parsing paths while preserving precedence (`defaults < env config source < --config file < env overrides`).
+- Built-in web UI redesign across package listing, package details, login, and settings views, including improved responsive layout and accessibility polish.
+- CI and container build pipeline updates for faster, more reliable release builds (cache/sccache and dist-profile build path improvements).
+- Docker and release documentation updated to reflect the revised build/release workflow.
+
 ## [0.3.0] - 2026-02-14
 
 ### Added
