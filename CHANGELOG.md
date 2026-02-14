@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-02-14
+
+### Added
+
+- CI: MinIO integration test job that spins up MinIO and runs S3 backend tests on every push and PR.
+
 ## [0.8.0] - 2026-02-14
 
 ### Fixed

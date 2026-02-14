@@ -5,6 +5,7 @@ use crate::{
         HEADER_JSON_INSTALL, HEADER_OCTET,
     },
     error::RegistryError,
+    governance::{GovernanceAction, GovernanceContext},
     models::{AuthIdentity, TenantContext},
     policy::{PolicyAction, RequestContext},
     storage::{
@@ -58,6 +59,32 @@ pub async fn dispatch(
     let auth_identity = resolve_auth_identity(&state.store, &headers, &method, &path).await?;
     let auth_user = auth_identity_primary_name(auth_identity.as_ref()).map(ToOwned::to_owned);
 
+    if method == Method::GET
+        && let Some(metrics_path) = state.governance.metrics_path()
+        && path == metrics_path
+    {
+        if state.governance.metrics_require_admin() {
+            ensure_admin_authenticated(&state, auth_identity.as_ref())?;
+        }
+        if let Some(metrics) = state.governance.render_metrics().await {
+            return Ok(text_response(
+                StatusCode::OK,
+                "text/plain; version=0.0.4",
+                metrics,
+            ));
+        }
+        return Err(RegistryError::http(StatusCode::NOT_FOUND, "not found"));
+    }
+
+    let governance_context = governance_context_for_request(
+        &method,
+        &path,
+        &headers,
+        auth_identity.as_ref(),
+        &request_context.tenant,
+    );
+    state.governance.enforce(&governance_context).await?;
+
     if method == Method::GET && path == "/-/ping" {
         return Ok(json_response(StatusCode::OK, json!({}), HEADER_JSON));
     }
@@ -77,15 +104,25 @@ pub async fn dispatch(
     }
 
     if method == Method::POST && path == "/-/admin/reindex" {
-        ensure_admin_authenticated(auth_user.as_deref())?;
+        ensure_admin_authenticated(&state, auth_identity.as_ref())?;
         let body = state.store.reindex_from_backend().await?;
         return Ok(json_response(StatusCode::OK, body, HEADER_JSON));
     }
 
     if method == Method::GET && path == "/-/admin/storage-health" {
-        ensure_admin_authenticated(auth_user.as_deref())?;
+        ensure_admin_authenticated(&state, auth_identity.as_ref())?;
         let body = state.store.storage_health().await?;
         return Ok(json_response(StatusCode::OK, body, HEADER_JSON));
+    }
+
+    if method == Method::POST && path == "/-/admin/policy-cache/invalidate" {
+        ensure_admin_authenticated(&state, auth_identity.as_ref())?;
+        state.policy.invalidate_cache().await?;
+        return Ok(json_response(
+            StatusCode::OK,
+            json!({ "ok": "policy cache invalidated" }),
+            HEADER_JSON,
+        ));
     }
 
     if method == Method::GET && (path == "/-/all" || path == "/-/all/since") {
@@ -1445,6 +1482,68 @@ fn query_params(query: Option<&str>) -> HashMap<String, String> {
     out
 }
 
+fn governance_context_for_request(
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    tenant: &TenantContext,
+) -> GovernanceContext {
+    let (package_name, action) = if let Some((package_name, tail)) = parse_package_path(path) {
+        let action = match method {
+            &Method::GET | &Method::HEAD if tail.len() == 2 && tail[0] == "-" => {
+                GovernanceAction::Download
+            }
+            &Method::GET | &Method::HEAD => GovernanceAction::Access,
+            &Method::PUT if tail.is_empty() => GovernanceAction::Publish,
+            &Method::PUT if tail.len() == 2 && tail[0] == "-rev" => GovernanceAction::Unpublish,
+            &Method::DELETE if tail.len() == 2 && tail[0] == "-rev" => GovernanceAction::Unpublish,
+            &Method::DELETE if tail.len() == 4 && tail[0] == "-" && tail[2] == "-rev" => {
+                GovernanceAction::Unpublish
+            }
+            &Method::PUT if tail.len() == 1 => GovernanceAction::Publish,
+            &Method::DELETE if tail.len() == 1 => GovernanceAction::Publish,
+            _ => GovernanceAction::Other,
+        };
+        (Some(package_name), action)
+    } else if let Some((package_name, tag)) = parse_canonical_dist_tags_path(path) {
+        let action = match *method {
+            Method::GET => GovernanceAction::Access,
+            Method::PUT => GovernanceAction::Publish,
+            Method::DELETE if tag.is_some() => GovernanceAction::Publish,
+            _ => GovernanceAction::Other,
+        };
+        (Some(package_name), action)
+    } else if method == Method::GET
+        && (path == "/-/v1/search" || path == "/-/all" || path == "/-/all/since")
+    {
+        (None, GovernanceAction::Search)
+    } else if path.starts_with("/-/admin/") {
+        (None, GovernanceAction::Admin)
+    } else {
+        (None, GovernanceAction::Other)
+    };
+
+    GovernanceContext::from_identity(
+        action,
+        method.as_str(),
+        path,
+        package_name,
+        identity,
+        tenant.clone(),
+        first_header_value(headers, &["x-forwarded-for"]).and_then(first_csv_token),
+    )
+}
+
+fn first_csv_token(value: String) -> Option<String> {
+    value
+        .split(',')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn tenant_context_from_headers(headers: &HeaderMap) -> TenantContext {
     TenantContext {
         org_id: first_header_value(headers, &["x-rustaccio-org-id", "x-org-id"]),
@@ -1461,6 +1560,14 @@ fn first_header_value(headers: &HeaderMap, names: &[&str]) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
     })
+}
+
+fn text_response(status: StatusCode, content_type: &str, body: String) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from(body))
+        .unwrap_or_else(|_| Response::new(Body::from(String::new())))
 }
 
 fn parse_canonical_dist_tags_path(path: &str) -> Option<(String, Option<String>)> {
@@ -1637,13 +1744,47 @@ fn ensure_audit_enabled(state: &AppState) -> Result<(), RegistryError> {
     Err(RegistryError::http(StatusCode::NOT_FOUND, "not found"))
 }
 
-fn ensure_admin_authenticated(user: Option<&str>) -> Result<(), RegistryError> {
-    if user.is_some() {
+fn ensure_admin_authenticated(
+    state: &AppState,
+    identity: Option<&AuthIdentity>,
+) -> Result<(), RegistryError> {
+    let Some(identity) = identity else {
+        return Err(RegistryError::http(
+            StatusCode::UNAUTHORIZED,
+            "authorization required",
+        ));
+    };
+
+    if state.admin_access.allow_any_authenticated {
         return Ok(());
     }
+
+    let is_user_admin = identity
+        .username
+        .as_deref()
+        .map(|username| {
+            state
+                .admin_access
+                .users
+                .iter()
+                .any(|allowed| allowed == username)
+        })
+        .unwrap_or(false);
+    let is_group_admin = identity.groups.iter().any(|group| {
+        state
+            .admin_access
+            .groups
+            .iter()
+            .any(|allowed| allowed == group)
+    });
+
+    if is_user_admin || is_group_admin {
+        return Ok(());
+    }
+
     Err(RegistryError::http(
-        StatusCode::UNAUTHORIZED,
-        "authorization required",
+        StatusCode::FORBIDDEN,
+        "admin authorization required",
     ))
 }
 

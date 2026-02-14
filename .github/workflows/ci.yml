@@ -79,6 +79,45 @@ jobs:
         if: always() && steps.sccache.outputs.enabled == 'true'
         run: sccache --show-stats || true
 
+  minio-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            -p 9002:9000 \
+            minio/minio server /data
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9002/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            echo "Waiting for MinIO... ($i)"
+            sleep 2
+          done
+
+      - name: Run MinIO integration tests
+        env:
+          RUSTACCIO_S3_IT_ENDPOINT: http://127.0.0.1:9002
+          RUSTACCIO_S3_IT_REGION: us-east-1
+          RUSTACCIO_S3_IT_BUCKET: rustaccio-it
+          RUSTACCIO_S3_IT_ACCESS_KEY: minioadmin
+          RUSTACCIO_S3_IT_SECRET_KEY: minioadmin
+        run: cargo test --workspace --all-features --all-targets --locked -- --ignored
+
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: rust
