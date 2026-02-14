@@ -32,16 +32,24 @@
   }
 
   function routePath() {
-    let p = window.location.pathname;
-    if (prefix && p.startsWith(prefix)) {
-      p = p.slice(prefix.length) || "/";
+    let path = window.location.pathname;
+    if (prefix && path.startsWith(prefix)) {
+      path = path.slice(prefix.length) || "/";
     }
-    return p;
+    return path;
+  }
+
+  function toAbsolute(path) {
+    return `${prefix}${path}`;
+  }
+
+  function isSpaPath(path) {
+    return path === "/" || path === "/-/web" || path.startsWith("/-/web/");
   }
 
   function navigate(path) {
-    const url = `${prefix}${path}`;
-    window.history.pushState({}, "", url);
+    const normalized = path || "/";
+    window.history.pushState({}, "", toAbsolute(normalized));
     renderRoute();
   }
 
@@ -67,6 +75,18 @@
     }
   }
 
+  function renderLoading(label = "Loading...") {
+    els.viewRoot.innerHTML = `<section class="card"><p class="pkg-meta">${escapeHtml(label)}</p></section>`;
+  }
+
+  function scoreBadge(entry) {
+    const score = entry?.score?.final;
+    if (typeof score !== "number") {
+      return "";
+    }
+    return `<span class="badge">score ${score.toFixed(2)}</span>`;
+  }
+
   async function api(path, options = {}) {
     const headers = new Headers(options.headers || {});
     if (!headers.has("Accept")) {
@@ -76,7 +96,7 @@
       headers.set("Authorization", `Bearer ${state.token}`);
     }
 
-    const res = await fetch(`${prefix}${path}`, {
+    const res = await fetch(toAbsolute(path), {
       method: options.method || "GET",
       headers,
       body: options.body,
@@ -108,11 +128,7 @@
 
     try {
       const body = await api("/-/whoami");
-      if (body && body.username) {
-        state.me = { username: body.username };
-      } else {
-        state.me = null;
-      }
+      state.me = body?.username ? { username: body.username } : null;
     } catch {
       state.me = null;
       state.token = "";
@@ -122,12 +138,11 @@
   }
 
   function latestVersion(manifest) {
-    const latest = manifest?.["dist-tags"]?.latest;
-    return latest || "-";
+    return manifest?.["dist-tags"]?.latest || "-";
   }
 
   function packageReadme(manifest) {
-    return manifest?.readme || "No README";
+    return manifest?.readme || "No README published.";
   }
 
   async function loadSearch(text) {
@@ -138,38 +153,57 @@
   }
 
   function renderHome() {
+    const queryActive = Boolean(state.searchText);
+    const queryLabel = queryActive ? `for "${escapeHtml(state.searchText)}"` : "across all packages";
+
     const cards = state.packages.map((entry) => {
       const pkg = entry.package || {};
       const name = escapeHtml(pkg.name || "unknown");
       const version = escapeHtml(pkg.version || "-");
-      const description = escapeHtml(pkg.description || "No description");
+      const description = escapeHtml(pkg.description || "No description available.");
       const packagePath = `/-/web/detail/${encodeURIComponent(pkg.name || "")}`;
+      const maintainers = Array.isArray(pkg.maintainers) ? pkg.maintainers.length : 0;
+      const keywords = Array.isArray(pkg.keywords) ? pkg.keywords.length : 0;
 
       return `<article class="card">
         <div class="pkg-header">
-          <a class="pkg-name" href="${prefix}${packagePath}">${name}</a>
+          <a class="pkg-name" data-nav="${escapeHtml(packagePath)}" href="${toAbsolute(packagePath)}">${name}</a>
           <span class="pkg-meta">v${version}</span>
         </div>
-        <p class="pkg-meta">${description}</p>
+        <p class="pkg-desc pkg-meta">${description}</p>
+        <div class="badge-row">
+          ${scoreBadge(entry)}
+          <span class="badge">${maintainers} maintainer${maintainers === 1 ? "" : "s"}</span>
+          <span class="badge">${keywords} keyword${keywords === 1 ? "" : "s"}</span>
+        </div>
       </article>`;
     });
 
+    const emptyState = `<section class="card empty-state">
+      <h2 class="card-heading">No matches found</h2>
+      <p class="pkg-meta">Try a broader query, a package scope like <code>@scope</code>, or clear the search box.</p>
+    </section>`;
+
     els.viewRoot.innerHTML = `
       <section class="card">
-        <div class="pkg-header">
-          <h1 class="pkg-name">Packages</h1>
-          <span class="pkg-meta">${cards.length} result(s)</span>
+        <h1 class="card-heading">Packages</h1>
+        <p class="pkg-meta">Showing ${state.packages.length} result(s) ${queryLabel}.</p>
+        <div class="stat-grid">
+          <div class="stat"><span>Results</span><strong>${state.packages.length}</strong></div>
+          <div class="stat"><span>Session</span><strong>${state.me ? "Signed In" : "Guest"}</strong></div>
+          <div class="stat"><span>Search</span><strong>${queryActive ? "Filtered" : "All"}</strong></div>
         </div>
       </section>
-      ${cards.join("") || '<section class="card"><p class="muted">No packages found.</p></section>'}
+      ${cards.join("") || emptyState}
     `;
 
-    els.viewRoot.querySelectorAll("a.pkg-name").forEach((link) => {
+    els.viewRoot.querySelectorAll("a[data-nav]").forEach((link) => {
       link.addEventListener("click", (event) => {
         event.preventDefault();
-        const href = link.getAttribute("href") || `${prefix}/`;
-        const path = href.startsWith(prefix) ? href.slice(prefix.length) || "/" : href;
-        navigate(path);
+        const path = link.getAttribute("data-nav");
+        if (path) {
+          navigate(path);
+        }
       });
     });
   }
@@ -179,15 +213,22 @@
     const versions = Object.keys(manifest.versions || {}).sort().reverse();
     const tags = Object.entries(manifest["dist-tags"] || {});
     const latest = latestVersion(manifest);
-    const latestDist = manifest.versions?.[latest]?.dist?.tarball || "";
+    const latestManifest = manifest.versions?.[latest] || {};
+    const latestDist = latestManifest?.dist?.tarball || "";
+    const homepage = latestManifest.homepage || "";
 
     els.viewRoot.innerHTML = `
       <section class="card">
         <div class="pkg-header">
-          <h1 class="pkg-name">${escapeHtml(manifest.name || packageName)}</h1>
-          <span class="pkg-meta">latest: ${escapeHtml(latest)}</span>
+          <h1 class="card-heading">${escapeHtml(manifest.name || packageName)}</h1>
+          <span class="pkg-meta">latest ${escapeHtml(latest)}</span>
         </div>
-        <p class="pkg-meta">${escapeHtml(manifest.versions?.[latest]?.description || "")}</p>
+        <p class="pkg-meta">${escapeHtml(latestManifest.description || "No description available.")}</p>
+        <div class="badge-row">
+          <span class="badge">${versions.length} version${versions.length === 1 ? "" : "s"}</span>
+          <span class="badge">${tags.length} dist-tag${tags.length === 1 ? "" : "s"}</span>
+          ${latestDist ? '<span class="badge">tarball available</span>' : ""}
+        </div>
       </section>
 
       <section class="grid two">
@@ -200,7 +241,10 @@
         <article class="card">
           <h2 class="panel-title">Versions</h2>
           <ul class="list">${versions.map((v) => `<li>${escapeHtml(v)}</li>`).join("") || "<li>None</li>"}</ul>
-          ${latestDist ? `<p><a href="${escapeHtml(latestDist)}">Download latest tarball</a></p>` : ""}
+          <div class="form-actions">
+            ${latestDist ? `<a class="btn alt" href="${escapeHtml(latestDist)}">Download latest tarball</a>` : ""}
+            ${homepage ? `<a class="btn alt" href="${escapeHtml(homepage)}" target="_blank" rel="noreferrer">Homepage</a>` : ""}
+          </div>
         </article>
       </section>
 
@@ -225,7 +269,7 @@
 
     const sessionId = parseSessionId(loginFlow?.loginUrl || "");
     if (!sessionId) {
-      throw new Error("invalid login flow response");
+      throw new Error("Invalid login flow response");
     }
 
     const body = await api(`/-/v1/login_cli/${encodeURIComponent(sessionId)}`, {
@@ -236,7 +280,7 @@
 
     const token = body?.token;
     if (!token) {
-      throw new Error("login did not return token");
+      throw new Error("Login did not return token");
     }
 
     state.token = token;
@@ -253,7 +297,7 @@
 
     const token = body?.token;
     if (!token) {
-      throw new Error("registration did not return token");
+      throw new Error("Registration did not return token");
     }
 
     state.token = token;
@@ -269,7 +313,7 @@
       : '<div id="tokensList" class="grid"></div>';
 
     const passwordSection = !state.me || cfg.externalAuthMode
-      ? '<p class="muted">Password updates are unavailable.</p>'
+      ? '<p class="muted">Password updates are unavailable when external auth is enabled.</p>'
       : `<form id="changePasswordForm" class="form">
           <div class="row"><label for="oldPassword">Old Password</label><input id="oldPassword" type="password" required /></div>
           <div class="row"><label for="newPassword">New Password</label><input id="newPassword" type="password" required /></div>
@@ -280,14 +324,14 @@
       ? ""
       : `<form id="createTokenForm" class="form">
           <div class="row"><label for="tokenPassword">Password</label><input id="tokenPassword" type="password" required /></div>
-          <div class="row"><label><input id="tokenReadonly" type="checkbox" /> Read only</label></div>
+          <div class="row"><label><input id="tokenReadonly" type="checkbox" /> Read only token</label></div>
           <button class="btn alt" type="submit">Create Token</button>
         </form>`;
 
     els.viewRoot.innerHTML = `
       <section class="card">
-        <h1 class="pkg-name">Settings</h1>
-        <p class="pkg-meta">Manage account and tokens.</p>
+        <h1 class="card-heading">Settings</h1>
+        <p class="pkg-meta">Manage credentials, access tokens, and account preferences.</p>
       </section>
 
       <section class="grid two">
@@ -309,14 +353,16 @@
       const tokens = tokenBody?.objects || [];
       tokensList.innerHTML = tokens.length
         ? tokens
-            .map((item) => `<div class="token-row"><code>${escapeHtml(item.key || "")}</code><button data-token="${escapeHtml(item.key || "")}" class="btn alt" type="button">Delete</button></div>`)
+            .map((item) => `<div class="token-row"><code class="token-key">${escapeHtml(item.key || "")}</code><button data-token="${escapeHtml(item.key || "")}" class="btn alt" type="button">Delete</button></div>`)
             .join("")
         : '<p class="muted">No tokens yet.</p>';
 
       tokensList.querySelectorAll("button[data-token]").forEach((button) => {
         button.addEventListener("click", async () => {
           const tokenKey = button.getAttribute("data-token");
-          if (!tokenKey) return;
+          if (!tokenKey) {
+            return;
+          }
           try {
             await api(`/-/npm/v1/tokens/token/${encodeURIComponent(tokenKey)}`, { method: "DELETE" });
             setFlash("Token deleted", "ok");
@@ -372,8 +418,8 @@
   async function renderLogin() {
     els.viewRoot.innerHTML = `
       <section class="card">
-        <h1 class="pkg-name">Sign In</h1>
-        <p class="pkg-meta">Use credentials, register, or provide an existing token.</p>
+        <h1 class="card-heading">Sign In</h1>
+        <p class="pkg-meta">Authenticate with credentials, register a new account, or paste a bearer token.</p>
       </section>
 
       <section class="grid two">
@@ -382,7 +428,7 @@
           <form id="loginForm" class="form">
             <div class="row"><label for="loginUser">Username</label><input id="loginUser" required /></div>
             <div class="row"><label for="loginPassword">Password</label><input id="loginPassword" type="password" required /></div>
-            <div class="row">
+            <div class="form-actions">
               <button class="btn" type="submit">Login</button>
               <button id="registerBtn" class="btn alt" type="button">Register</button>
             </div>
@@ -410,7 +456,7 @@
       const password = document.getElementById("loginPassword").value;
       try {
         if (!cfg.webLoginEnabled) {
-          throw new Error("web login flow disabled by registry config");
+          throw new Error("Web login flow disabled by registry config");
         }
         await loginWithCredentials(username, password);
         setFlash("Signed in", "ok");
@@ -450,6 +496,7 @@
   async function renderRoute() {
     setFlash("");
     const path = routePath();
+    renderLoading();
 
     try {
       if (path === "/" || path === "/-/web" || path === "/-/web/") {
@@ -487,10 +534,12 @@
   els.searchForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     state.searchText = els.searchInput.value.trim();
-    if (routePath() !== "/" && routePath() !== "/-/web" && routePath() !== "/-/web/") {
+    if (!isSpaPath(routePath()) || routePath().startsWith("/-/web/detail/")) {
       navigate("/");
       return;
     }
+
+    renderLoading("Searching packages...");
     try {
       await loadSearch(state.searchText);
       renderHome();
@@ -499,13 +548,43 @@
     }
   });
 
-  els.logoutBtn.addEventListener("click", async () => {
+  els.logoutBtn.addEventListener("click", () => {
     state.token = "";
     state.me = null;
     localStorage.removeItem("rustaccio_token");
     setAccountState();
     setFlash("Signed out", "ok");
     navigate("/");
+  });
+
+  document.addEventListener("click", (event) => {
+    const anchor = event.target.closest("a[href]");
+    if (!anchor) {
+      return;
+    }
+    if (anchor.target === "_blank" || anchor.hasAttribute("download")) {
+      return;
+    }
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+      return;
+    }
+
+    const url = new URL(anchor.href, window.location.origin);
+    if (url.origin !== window.location.origin) {
+      return;
+    }
+
+    let path = url.pathname;
+    if (prefix && path.startsWith(prefix)) {
+      path = path.slice(prefix.length) || "/";
+    }
+
+    if (!isSpaPath(path)) {
+      return;
+    }
+
+    event.preventDefault();
+    navigate(path);
   });
 
   window.addEventListener("popstate", () => {

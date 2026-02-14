@@ -9,13 +9,23 @@
 <body>
   <div id="app" class="shell">
     <header class="topbar">
-      <div class="brand">
-        <div class="logo" aria-hidden="true"></div>
-        <a href="{{ASSET_BASE}}/" class="title" id="brandTitle">{{TITLE}}</a>
+      <div class="brand-wrap">
+        <div class="brand">
+          <div class="logo" aria-hidden="true"></div>
+          <div>
+            <a href="{{ASSET_BASE}}/" class="title" id="brandTitle">{{TITLE}}</a>
+            <p class="subtitle">Private npm registry control surface</p>
+          </div>
+        </div>
+        <nav class="quick-links" aria-label="Quick Links">
+          <a class="pill-link" href="{{ASSET_BASE}}/-/web/">Packages</a>
+          <a class="pill-link" href="{{ASSET_BASE}}/-/web/settings">Account</a>
+        </nav>
       </div>
 
       <form id="searchForm" class="search" role="search">
-        <input id="searchInput" type="search" placeholder="Search packages" autocomplete="off" />
+        <label class="visually-hidden" for="searchInput">Search packages</label>
+        <input id="searchInput" type="search" placeholder="Search packages by name, keyword, or scope" autocomplete="off" />
       </form>
 
       <div class="top-actions">
@@ -37,11 +47,15 @@
           <div class="kv"><span>Web Login</span><span id="registryWebLogin">false</span></div>
           <div class="kv"><span>External Auth</span><span id="registryExternalAuth">false</span></div>
         </div>
+        <div class="panel panel-note">
+          <h2 class="panel-title">Workflow</h2>
+          <p class="muted">Use search to jump directly to a package, then open details for dist-tags, versions, and README.</p>
+        </div>
       </aside>
 
       <main class="content">
-        <div id="flash" class="flash hidden"></div>
-        <section id="viewRoot"></section>
+        <div id="flash" class="flash hidden" role="status" aria-live="polite"></div>
+        <section id="viewRoot" class="view-root"></section>
       </main>
     </div>
   </div>
