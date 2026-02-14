@@ -116,7 +116,55 @@ jobs:
           RUSTACCIO_S3_IT_BUCKET: rustaccio-it
           RUSTACCIO_S3_IT_ACCESS_KEY: minioadmin
           RUSTACCIO_S3_IT_SECRET_KEY: minioadmin
-        run: cargo test --workspace --all-features --all-targets --locked -- --ignored
+        run: cargo test --all-features --locked --test s3_minio_integration -- --ignored
+
+  governance-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Start Redis and Postgres
+        run: |
+          docker run -d --name redis \
+            -p 56379:6379 \
+            redis:7-alpine
+          docker run -d --name postgres \
+            -e POSTGRES_DB=rustaccio \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD=postgres \
+            -p 55432:5432 \
+            postgres:16-alpine
+          for i in $(seq 1 30); do
+            if docker exec redis redis-cli ping 2>/dev/null | grep -q PONG; then
+              echo "Redis is ready"
+              break
+            fi
+            echo "Waiting for Redis... ($i)"
+            sleep 2
+          done
+          for i in $(seq 1 30); do
+            if docker exec postgres pg_isready -U postgres -d rustaccio 2>/dev/null; then
+              echo "Postgres is ready"
+              break
+            fi
+            echo "Waiting for Postgres... ($i)"
+            sleep 2
+          done
+
+      - name: Run governance integration tests
+        env:
+          RUSTACCIO_REDIS_IT_URL: redis://127.0.0.1:56379/
+          RUSTACCIO_POSTGRES_IT_URL: postgres://postgres:postgres@127.0.0.1:55432/rustaccio
+        run: cargo test --all-features --locked --test governance_redis_postgres_integration -- --ignored
 
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')

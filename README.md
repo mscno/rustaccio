@@ -68,6 +68,11 @@ Container (local build + run):
 docker build -t rustaccio:local .
 # Lower memory pressure on constrained builders (slower compile):
 docker build --build-arg CARGO_BUILD_JOBS=1 -t rustaccio:local .
+# Build image with managed-platform backends enabled at compile-time:
+docker build \
+  --build-arg CARGO_FEATURES="s3,redis,postgres,otel" \
+  -t rustaccio:saas .
+
 docker run --rm -p 4873:4873 \
   -v "$(pwd)/.rustaccio-data:/var/lib/rustaccio/data" \
   -v "$(pwd)/config.yml:/etc/rustaccio/config.yml:ro" \
@@ -76,6 +81,13 @@ docker run --rm -p 4873:4873 \
 ```
 
 The Docker image compiles `rustaccio` with `--features s3` by default.
+Override compile-time features with `--build-arg CARGO_FEATURES=...` when you need optional backends:
+
+- `redis` for distributed rate limiting (`RUSTACCIO_RATE_LIMIT_BACKEND=redis`)
+- `postgres` for persistent quota backend (`RUSTACCIO_QUOTA_BACKEND=postgres`)
+- `otel` for OTLP tracing export (`RUSTACCIO_OTEL_ENABLED=true`)
+
+If a backend is configured at runtime without its compile-time feature, startup fails fast.
 The image does not include `config.example.yml`; mount your own config and set `RUSTACCIO_CONFIG`.
 
 `--config` loads the given YAML file and fails fast if the file cannot be read or parsed.
@@ -428,7 +440,7 @@ Rustaccio targets Verdaccio-compatible npm client behavior for core flows, but i
 - `src/config.rs`: env + Verdaccio-style YAML parsing (`packages`, `uplinks`)
 - `src/storage.rs`: local state, persistence, auth/token/package operations + backend integration
 - `src/policy.rs`: policy engine abstraction (`external policy backend -> auth hook/plugin decisions -> ACL fallback`)
-- `src/governance.rs`: opt-in SaaS controls (`rate limiting`, `quota`, `metrics`) via trait-based guards/backends
+- `src/governance.rs`: opt-in governance controls (`rate limiting`, `quota`, `metrics`) via trait-based guards/backends
 - `src/auth_plugin.rs`: HTTP auth backend plugin client
 - `src/tarball_backend.rs`: tarball backend abstraction (`local`, `s3`)
 - `src/upstream.rs`: npm uplink proxy client for package/search/tarball
@@ -519,9 +531,9 @@ Cache control:
 
 - `POST /-/admin/policy-cache/invalidate` clears in-memory external policy decision cache for the running instance.
 
-## SaaS Governance Controls (Opt-In)
+## Governance Controls (Opt-In)
 
-Rustaccio defaults to simple mode. SaaS controls are disabled unless explicitly enabled via env.
+Rustaccio defaults to simple mode. Governance controls are disabled unless explicitly enabled via env.
 
 Rate limiting:
 
@@ -567,7 +579,7 @@ OpenTelemetry (opt-in):
 
 Admin endpoints are controlled by environment variables:
 
-- `RUSTACCIO_SAAS_MODE=false|true` (default `false`)
+- `RUSTACCIO_MANAGED_MODE=false|true` (default `false`)
 - `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED` (default `true`)
 - `RUSTACCIO_ADMIN_USERS` (comma/space-separated usernames)
 - `RUSTACCIO_ADMIN_GROUPS` (comma/space-separated groups/roles)
@@ -577,35 +589,236 @@ Behavior:
 - If `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=true`, any authenticated identity can call `/-/admin/*`.
 - If `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false`, only identities whose username is in `RUSTACCIO_ADMIN_USERS` or whose group/role is in `RUSTACCIO_ADMIN_GROUPS` are allowed.
 - Unauthenticated requests receive `401`; authenticated non-admin requests receive `403`.
-- If `RUSTACCIO_SAAS_MODE=true`, startup enforces safer guardrails:
+- If `RUSTACCIO_MANAGED_MODE=true`, startup enforces stricter guardrails:
   - `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false`
   - at least one explicit admin principal in `RUSTACCIO_ADMIN_USERS` or `RUSTACCIO_ADMIN_GROUPS`
   - `auth.plugin.externalMode=true` (external identity provider mode)
 
-Recommended SaaS posture:
+Recommended managed-mode posture:
 
-- Set `RUSTACCIO_SAAS_MODE=true`.
+- Set `RUSTACCIO_MANAGED_MODE=true`.
 - Set `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false`.
 - Define a dedicated admin group from your control-plane identity provider, and set it in `RUSTACCIO_ADMIN_GROUPS`.
 
-## Scalability Notes
+## Run Modes
 
-Current simple mode:
+Rustaccio currently supports these practical runtime modes.
 
-- Local metadata persists to a single `state.json` snapshot in the configured data directory.
-- This is great for single-node simplicity, but not ideal for horizontally scaled multi-node SaaS.
+| Mode | Tarball Backend | Metadata Authority | Governance Backends | Typical Use |
+|---|---|---|---|---|
+| Simple local | `local` | local `state.json` | none/memory | single-node, low ops |
+| Shared snapshot | `s3` | shared snapshot (`__rustaccio_meta/state.json`) + local mirror | none/memory | multi-node read/write with shared object store |
+| Managed governance | `local` or `s3` | same as above | Redis/Postgres/Prometheus/OTel | managed platform with limits/observability |
+| External control-plane auth/policy | `local` or `s3` | same as above | same as above | centralized identity/policy decisions |
 
-Current production-oriented mode:
+Simple local mode defaults:
 
-- Tarballs can be offloaded to S3-compatible object storage (`store.backend: s3`).
-- Shared-state snapshot mode supports multiple nodes reading the same package metadata snapshot.
+- `RUSTACCIO_TARBALL_BACKEND=local`
+- `RUSTACCIO_RATE_LIMIT_BACKEND=none`
+- `RUSTACCIO_QUOTA_BACKEND=none`
+- `RUSTACCIO_POLICY_BACKEND=local`
+- `RUSTACCIO_MANAGED_MODE=false`
 
-Recommended next step for large SaaS tenants:
+Managed hardening mode:
 
-- Move package/account metadata from snapshot-only persistence to a database-backed metadata store (for example Postgres).
-- Keep object storage for tarballs and immutable blobs.
-- Use Redis for distributed rate-limit keys and short-lived policy caches.
-- Add a control-plane managed invalidation/event channel for multi-node cache coherence.
+- `RUSTACCIO_MANAGED_MODE=true` enforces:
+  - `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false`
+  - explicit admin principals (`RUSTACCIO_ADMIN_USERS` or `RUSTACCIO_ADMIN_GROUPS`)
+  - `auth.plugin.externalMode=true` (env: `RUSTACCIO_AUTH_EXTERNAL_MODE=true`)
+
+## Deploying with Redis/Postgres Backends
+
+### 1) Build image with required compile-time features
+
+```bash
+docker build \
+  --build-arg CARGO_FEATURES="s3,redis,postgres,otel" \
+  -t rustaccio:saas .
+```
+
+### 2) Runtime env for managed governance
+
+Required for Redis rate limiter:
+
+- `RUSTACCIO_RATE_LIMIT_BACKEND=redis`
+- `RUSTACCIO_RATE_LIMIT_REDIS_URL=redis://redis:6379/`
+
+Required for Postgres quotas:
+
+- `RUSTACCIO_QUOTA_BACKEND=postgres`
+- `RUSTACCIO_QUOTA_POSTGRES_URL=postgres://postgres:postgres@postgres:5432/rustaccio`
+
+Recommended managed security baseline:
+
+- `RUSTACCIO_MANAGED_MODE=true`
+- `RUSTACCIO_AUTH_EXTERNAL_MODE=true`
+- `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false`
+- `RUSTACCIO_ADMIN_GROUPS=<control-plane-admin-group>`
+
+Example container run:
+
+```bash
+docker run --rm -p 4873:4873 \
+  -v "$(pwd)/.rustaccio-data:/var/lib/rustaccio/data" \
+  -v "$(pwd)/config.yml:/etc/rustaccio/config.yml:ro" \
+  -e RUSTACCIO_CONFIG=/etc/rustaccio/config.yml \
+  -e RUSTACCIO_MANAGED_MODE=true \
+  -e RUSTACCIO_AUTH_EXTERNAL_MODE=true \
+  -e RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false \
+  -e RUSTACCIO_ADMIN_GROUPS=platform-admins \
+  -e RUSTACCIO_RATE_LIMIT_BACKEND=redis \
+  -e RUSTACCIO_RATE_LIMIT_REDIS_URL=redis://redis:6379/ \
+  -e RUSTACCIO_QUOTA_BACKEND=postgres \
+  -e RUSTACCIO_QUOTA_POSTGRES_URL=postgres://postgres:postgres@postgres:5432/rustaccio \
+  -e RUSTACCIO_METRICS_BACKEND=prometheus \
+  rustaccio:saas
+```
+
+Notes:
+
+- `RUSTACCIO_RATE_LIMIT_FAIL_OPEN=true|false` controls availability vs strictness on Redis failures.
+- `RUSTACCIO_QUOTA_FAIL_OPEN=true|false` controls availability vs strictness on Postgres failures.
+- Postgres migrations for quotas run automatically at startup.
+
+## Storage and Data Model
+
+### Core persisted model
+
+The persisted state model (`PersistedState`) contains:
+
+- `users`
+- `auth_tokens`
+- `npm_tokens`
+- `login_sessions`
+- `packages`
+
+Package state (`PackageRecord`) contains:
+
+- `manifest` (full package manifest JSON)
+- `upstream_tarballs` (filename -> original upstream URL cache)
+- `updated_at`
+- `cached_from_uplink`
+
+Important behavior:
+
+- `cached_from_uplink=true` package records are intentionally excluded from persisted snapshots.
+- Only local/non-uplink package metadata is durable in `state.json`.
+
+### Snapshot storage
+
+Local backend mode:
+
+- Authority snapshot: `<data_dir>/state.json`
+- Local tarballs: `<data_dir>/tarballs/<package-with-slashes-replaced>/...`
+- Package sidecar: `<data_dir>/tarballs/<package-with-slashes-replaced>/package.json`
+
+S3 backend mode:
+
+- Shared snapshot object: `<prefix>__rustaccio_meta/state.json`
+- Tarball objects are written in canonical rustaccio layout, but reads also accept Verdaccio-style key layouts.
+- Package sidecar is written as `<prefix><package>/package.json` (Verdaccio-compatible layout).
+
+### Metadata sidecars
+
+Rustaccio writes package sidecar metadata after manifest mutations (`publish`, metadata-only update, dist-tag/owner/star changes, tarball removals).
+
+At startup and reindex:
+
+- Rustaccio loads tarball references from backend listing.
+- It loads package sidecars when available.
+- It can merge legacy index hints (`verdaccio-s3-db.json`) where present.
+- It rebuilds missing manifest structures from tarball filenames and sidecar metadata.
+
+## Data Inconsistency and Failure Modes
+
+Rustaccio is robust for common flows, but current storage writes are not fully transactional across all artifacts.
+
+Known failure windows:
+
+1. Tarball written, snapshot persist fails:
+- blob may exist without durable manifest reference.
+
+2. Snapshot persisted, sidecar write fails:
+- `state.json` (and shared snapshot, if enabled) may be newer than package sidecar.
+
+3. Tarball delete succeeds, snapshot persist fails:
+- snapshot may reference a tarball that no longer exists.
+
+4. Shared snapshot mode multi-writer races:
+- snapshot writes are last-write-wins without distributed CAS/lease protection.
+
+5. Redis/Postgres backend outage:
+- behavior depends on `*_FAIL_OPEN` settings (`allow` vs reject with backend-unavailable errors).
+
+Operational diagnostics:
+
+- `GET /-/admin/storage-health` reports drift signals:
+  - `tarballsWithoutSidecar`
+  - `sidecarsWithoutTarballs`
+  - `tarballsMissingFromManifest`
+  - `manifestAttachmentsMissingBlob`
+  - `staleStatePackages`
+
+## Rebuild and Recovery
+
+### Online reindex from storage backend
+
+Use admin endpoint:
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer <admin-token>" \
+  http://<host>:4873/-/admin/reindex
+```
+
+Response includes:
+
+- `changed`
+- `packagesBefore`
+- `packagesAfter`
+- `sidecarsSynced`
+
+This rebuilds package metadata from backend tarballs/sidecars and can repair many drift cases.
+
+### Snapshot recovery behavior
+
+- On startup in S3 mode, rustaccio attempts to load shared snapshot first and mirrors it to local `state.json`.
+- If shared snapshot is unavailable, it falls back to local snapshot and hydrates from backend listing.
+- Reindex can be re-run at any time after backend restoration.
+
+### What cannot be reconstructed from tarballs alone
+
+- `users`, `auth_tokens`, `npm_tokens`, and `login_sessions` are snapshot data.
+- If snapshot is lost and no backup exists, those auth/session records are not recoverable from tarball blobs.
+
+### Recommended backup strategy
+
+- Back up snapshot (`state.json` local and shared snapshot object in S3 mode).
+- Back up all tarball objects.
+- For governance:
+  - back up Postgres quota tables
+  - persist Redis if you require durable counters across restarts (optional by policy)
+
+## Scalability Characteristics
+
+Current architecture scales well for many package blobs, but metadata authority is still snapshot-centric.
+
+What scales today:
+
+- Object-store tarballs (`s3`) and sidecars.
+- Horizontal read/write nodes using shared snapshot mode.
+- Distributed rate limiting (Redis) and quota accounting (Postgres).
+
+Current bottlenecks/limits:
+
+- Snapshot metadata is still coarse-grained (whole-state file persistence).
+- Multi-node concurrent snapshot writes are not protected by distributed optimistic concurrency.
+
+Recommended evolution for high-scale managed deployments:
+
+- Move package/user/token metadata to a transactional DB-backed metadata store.
+- Keep object storage for immutable tarballs/blobs.
+- Add distributed compare-and-swap/evented invalidation for metadata cache coherence.
 
 ## License
 

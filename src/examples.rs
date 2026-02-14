@@ -223,7 +223,7 @@ fn env_defaults() -> BTreeMap<&'static str, &'static str> {
         ("RUSTACCIO_OTEL_EXPORTER_OTLP_ENDPOINT", ""),
         ("RUSTACCIO_OTEL_SERVICE_NAME", "rustaccio"),
         ("RUSTACCIO_PASSWORD_MIN", "3"),
-        ("RUSTACCIO_SAAS_MODE", "false"),
+        ("RUSTACCIO_MANAGED_MODE", "false"),
         ("RUSTACCIO_POLICY_BACKEND", "local"),
         ("RUSTACCIO_POLICY_HTTP_BASE_URL", ""),
         ("RUSTACCIO_POLICY_HTTP_CACHE_TTL_MS", "5000"),

@@ -34,7 +34,7 @@ pub async fn build_state(
     let acl = Acl::new(config.acl_rules.clone());
     let governance = Arc::new(GovernanceEngine::from_env().await?);
     let admin_access = AdminAccessConfig::from_env();
-    validate_saas_guardrails(config, &admin_access)?;
+    validate_managed_mode_guardrails(config, &admin_access)?;
     let policy = if let Some(policy_cfg) = HttpPolicyConfig::from_env() {
         Arc::new(DefaultPolicyEngine::new_with_http(
             store.clone(),
@@ -128,48 +128,52 @@ fn startup_log_level(config: &Config) -> &str {
     config.log_level.as_str()
 }
 
-fn validate_saas_guardrails(
+fn validate_managed_mode_guardrails(
     config: &Config,
     admin_access: &AdminAccessConfig,
 ) -> Result<(), RegistryError> {
-    validate_saas_guardrails_with_mode(saas_mode_enabled_from_env(), config, admin_access)
+    validate_managed_mode_guardrails_with_flag(
+        managed_mode_enabled_from_env(),
+        config,
+        admin_access,
+    )
 }
 
-fn validate_saas_guardrails_with_mode(
-    saas_mode: bool,
+fn validate_managed_mode_guardrails_with_flag(
+    managed_mode: bool,
     config: &Config,
     admin_access: &AdminAccessConfig,
 ) -> Result<(), RegistryError> {
-    if !saas_mode {
+    if !managed_mode {
         return Ok(());
     }
 
     if admin_access.allow_any_authenticated {
         return Err(RegistryError::http(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "RUSTACCIO_SAAS_MODE=true requires RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false",
+            "RUSTACCIO_MANAGED_MODE=true requires RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false",
         ));
     }
 
     if admin_access.users.is_empty() && admin_access.groups.is_empty() {
         return Err(RegistryError::http(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "RUSTACCIO_SAAS_MODE=true requires RUSTACCIO_ADMIN_USERS or RUSTACCIO_ADMIN_GROUPS",
+            "RUSTACCIO_MANAGED_MODE=true requires RUSTACCIO_ADMIN_USERS or RUSTACCIO_ADMIN_GROUPS",
         ));
     }
 
     if !config.auth_plugin.external_mode {
         return Err(RegistryError::http(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "RUSTACCIO_SAAS_MODE=true requires auth.plugin.externalMode=true",
+            "RUSTACCIO_MANAGED_MODE=true requires auth.plugin.externalMode=true",
         ));
     }
 
     Ok(())
 }
 
-fn saas_mode_enabled_from_env() -> bool {
-    std::env::var("RUSTACCIO_SAAS_MODE")
+fn managed_mode_enabled_from_env() -> bool {
+    std::env::var("RUSTACCIO_MANAGED_MODE")
         .ok()
         .map(|value| {
             matches!(
@@ -316,7 +320,7 @@ fn is_connection_error(error: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{startup_log_level, validate_saas_guardrails_with_mode};
+    use super::{startup_log_level, validate_managed_mode_guardrails_with_flag};
     use crate::{
         app::AdminAccessConfig,
         config::{
@@ -364,21 +368,22 @@ mod tests {
     }
 
     #[test]
-    fn saas_guardrails_allow_simple_mode_defaults() {
+    fn managed_mode_guardrails_allow_simple_mode_defaults() {
         let config = config_with_external_mode(false);
         let admin = AdminAccessConfig::default();
-        assert!(validate_saas_guardrails_with_mode(false, &config, &admin).is_ok());
+        assert!(validate_managed_mode_guardrails_with_flag(false, &config, &admin).is_ok());
     }
 
     #[test]
-    fn saas_guardrails_reject_any_authenticated_admin_access() {
+    fn managed_mode_guardrails_reject_any_authenticated_admin_access() {
         let config = config_with_external_mode(true);
         let admin = AdminAccessConfig {
             allow_any_authenticated: true,
             users: vec!["ops".to_string()],
             groups: Vec::new(),
         };
-        let err = validate_saas_guardrails_with_mode(true, &config, &admin).expect_err("must fail");
+        let err = validate_managed_mode_guardrails_with_flag(true, &config, &admin)
+            .expect_err("must fail");
         assert!(
             err.to_string()
                 .contains("ADMIN_ALLOW_ANY_AUTHENTICATED=false")
@@ -386,14 +391,15 @@ mod tests {
     }
 
     #[test]
-    fn saas_guardrails_reject_missing_admin_principals() {
+    fn managed_mode_guardrails_reject_missing_admin_principals() {
         let config = config_with_external_mode(true);
         let admin = AdminAccessConfig {
             allow_any_authenticated: false,
             users: Vec::new(),
             groups: Vec::new(),
         };
-        let err = validate_saas_guardrails_with_mode(true, &config, &admin).expect_err("must fail");
+        let err = validate_managed_mode_guardrails_with_flag(true, &config, &admin)
+            .expect_err("must fail");
         assert!(
             err.to_string()
                 .contains("ADMIN_USERS or RUSTACCIO_ADMIN_GROUPS")
@@ -401,25 +407,26 @@ mod tests {
     }
 
     #[test]
-    fn saas_guardrails_require_external_auth_mode() {
+    fn managed_mode_guardrails_require_external_auth_mode() {
         let config = config_with_external_mode(false);
         let admin = AdminAccessConfig {
             allow_any_authenticated: false,
             users: vec!["ops".to_string()],
             groups: Vec::new(),
         };
-        let err = validate_saas_guardrails_with_mode(true, &config, &admin).expect_err("must fail");
+        let err = validate_managed_mode_guardrails_with_flag(true, &config, &admin)
+            .expect_err("must fail");
         assert!(err.to_string().contains("auth.plugin.externalMode=true"));
     }
 
     #[test]
-    fn saas_guardrails_accept_external_mode_with_explicit_admins() {
+    fn managed_mode_guardrails_accept_external_mode_with_explicit_admins() {
         let config = config_with_external_mode(true);
         let admin = AdminAccessConfig {
             allow_any_authenticated: false,
             users: vec!["ops".to_string()],
             groups: vec!["platform-admins".to_string()],
         };
-        assert!(validate_saas_guardrails_with_mode(true, &config, &admin).is_ok());
+        assert!(validate_managed_mode_guardrails_with_flag(true, &config, &admin).is_ok());
     }
 }

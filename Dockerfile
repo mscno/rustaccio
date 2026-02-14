@@ -17,11 +17,12 @@ COPY --from=planner /app/recipe.json recipe.json
 # Keep release builds within lower memory limits by reducing parallel codegen.
 ARG CARGO_BUILD_JOBS=2
 ARG CARGO_PROFILE=release
+ARG CARGO_FEATURES=s3
 
 RUN if [ "${CARGO_PROFILE}" = "release" ]; then \
-      CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS}" cargo chef cook --release --locked --features s3; \
+      CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS}" cargo chef cook --release --locked --features "${CARGO_FEATURES}"; \
     else \
-      CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS}" cargo chef cook --profile "${CARGO_PROFILE}" --locked --features s3; \
+      CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS}" cargo chef cook --profile "${CARGO_PROFILE}" --locked --features "${CARGO_FEATURES}"; \
     fi
 
 COPY Cargo.toml Cargo.lock ./
@@ -29,10 +30,10 @@ COPY src ./src
 COPY webui ./webui
 
 RUN if [ "${CARGO_PROFILE}" = "release" ]; then \
-      cargo build --release --locked --features s3 -j "${CARGO_BUILD_JOBS}" && \
+      cargo build --release --locked --features "${CARGO_FEATURES}" -j "${CARGO_BUILD_JOBS}" && \
       cp target/release/rustaccio /tmp/rustaccio-bin; \
     else \
-      cargo build --profile "${CARGO_PROFILE}" --locked --features s3 -j "${CARGO_BUILD_JOBS}" && \
+      cargo build --profile "${CARGO_PROFILE}" --locked --features "${CARGO_FEATURES}" -j "${CARGO_BUILD_JOBS}" && \
       cp "target/${CARGO_PROFILE}/rustaccio" /tmp/rustaccio-bin; \
     fi
 
