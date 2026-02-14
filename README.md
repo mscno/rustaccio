@@ -55,6 +55,13 @@ cargo build --release
 ./target/release/rustaccio --config ./config.yml
 ```
 
+Maximum-optimization distribution build:
+
+```bash
+cargo build --profile dist
+./target/dist/rustaccio --config ./config.yml
+```
+
 Container (local build + run):
 
 ```bash
@@ -148,6 +155,18 @@ Build features:
 cargo test
 ```
 
+## Just Commands
+
+```bash
+just          # default: check + test
+just check
+just test
+just build    # fast local release profile
+just dist     # fully optimized distribution profile
+just serve
+just serve ./config.yml
+```
+
 ## Git Hooks (lefthook)
 
 Install and enable local pre-commit hooks:
@@ -173,13 +192,6 @@ Quality gate:
 
 ```bash
 cargo clippy --all-targets --all-features -- -D warnings
-```
-
-File-size gate (enforced by `tests/file_length.rs`): every Rust source file in `src/` and `tests/` must be `<= 400` lines.
-The gate is currently disabled by default; enable it explicitly with:
-
-```bash
-RUSTACCIO_ENFORCE_FILE_LENGTH=1 cargo test --test file_length
 ```
 
 ## Library Embedding
