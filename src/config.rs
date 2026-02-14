@@ -1,6 +1,11 @@
 use crate::acl::PackageRule;
+use config::{Config as SettingsLoader, Environment, File};
 use serde::Deserialize;
-use std::{collections::HashMap, env, net::SocketAddr, path::PathBuf};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthBackend {
@@ -114,20 +119,64 @@ pub struct Config {
     pub tarball_storage: TarballStorageConfig,
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct RawEnvConfig {
+    config: Option<String>,
+    bind: Option<String>,
+    data_dir: Option<String>,
+    upstream: Option<String>,
+    web_login: Option<String>,
+    web_enable: Option<String>,
+    web_title: Option<String>,
+    publish_check_owners: Option<String>,
+    password_min: Option<String>,
+    login_session_ttl_seconds: Option<String>,
+    max_body_size: Option<String>,
+    audit_enabled: Option<String>,
+    url_prefix: Option<String>,
+    trust_proxy: Option<String>,
+    keep_alive_timeout: Option<String>,
+    log_level: Option<String>,
+    auth_backend: Option<String>,
+    auth_external_mode: Option<String>,
+    auth_http_base_url: Option<String>,
+    auth_http_adduser_endpoint: Option<String>,
+    auth_http_login_endpoint: Option<String>,
+    auth_http_change_password_endpoint: Option<String>,
+    auth_http_request_auth_endpoint: Option<String>,
+    auth_http_allow_access_endpoint: Option<String>,
+    auth_http_allow_publish_endpoint: Option<String>,
+    auth_http_allow_unpublish_endpoint: Option<String>,
+    auth_http_timeout_ms: Option<String>,
+    tarball_backend: Option<String>,
+    s3_bucket: Option<String>,
+    s3_region: Option<String>,
+    s3_endpoint: Option<String>,
+    s3_access_key_id: Option<String>,
+    s3_secret_access_key: Option<String>,
+    s3_prefix: Option<String>,
+    s3_force_path_style: Option<String>,
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, String> {
+        let env_cfg = load_rustaccio_env()?;
         let mut cfg = Self::defaults();
-        cfg.apply_env_config_file_if_present()?;
-        cfg.apply_env_overrides();
+        cfg.apply_env_config_file_if_present(&env_cfg)?;
+        cfg.apply_env_overrides(&env_cfg);
+        cfg.apply_port_override(load_process_env_value("port")?);
         cfg.ensure_default_uplink();
         Ok(cfg)
     }
 
     pub fn from_env_with_config_file(config_path: PathBuf) -> Result<Self, String> {
+        let env_cfg = load_rustaccio_env()?;
         let mut cfg = Self::defaults();
-        cfg.apply_env_config_file_if_present()?;
+        cfg.apply_env_config_file_if_present(&env_cfg)?;
         cfg.apply_yaml_overrides(Self::from_yaml_file(config_path)?);
-        cfg.apply_env_overrides();
+        cfg.apply_env_overrides(&env_cfg);
+        cfg.apply_port_override(load_process_env_value("port")?);
         cfg.ensure_default_uplink();
         Ok(cfg)
     }
@@ -164,8 +213,8 @@ impl Config {
         Self::defaults()
     }
 
-    fn apply_env_config_file_if_present(&mut self) -> Result<(), String> {
-        let Ok(path) = env::var("RUSTACCIO_CONFIG") else {
+    fn apply_env_config_file_if_present(&mut self, env_cfg: &RawEnvConfig) -> Result<(), String> {
+        let Some(path) = env_cfg.config.as_deref() else {
             return Ok(());
         };
         if path.trim().is_empty() {
@@ -177,27 +226,17 @@ impl Config {
         Ok(())
     }
 
-    fn apply_env_overrides(&mut self) {
-        if let Ok(raw_bind) = env::var("RUSTACCIO_BIND")
-            && let Ok(bind) = raw_bind.parse::<SocketAddr>()
-        {
-            self.bind = bind;
-            self.listen = vec![bind.to_string()];
-        }
-        // PaaS compatibility: honor injected PORT (e.g. Railway) and force a public bind address.
-        if let Ok(raw_port) = env::var("PORT")
-            && let Ok(port) = raw_port.parse::<u16>()
-        {
-            let bind = SocketAddr::from(([0, 0, 0, 0], port));
+    fn apply_env_overrides(&mut self, env_cfg: &RawEnvConfig) {
+        if let Some(bind) = parse_env_value::<SocketAddr>(env_cfg.bind.as_deref()) {
             self.bind = bind;
             self.listen = vec![bind.to_string()];
         }
 
-        if let Ok(raw_data_dir) = env::var("RUSTACCIO_DATA_DIR") {
+        if let Some(raw_data_dir) = env_cfg.data_dir.as_deref() {
             self.data_dir = PathBuf::from(raw_data_dir);
         }
 
-        if let Ok(raw_upstream) = env::var("RUSTACCIO_UPSTREAM") {
+        if let Some(raw_upstream) = env_cfg.upstream.as_deref() {
             let upstream = raw_upstream.trim().trim_end_matches('/').to_string();
             if upstream.is_empty() {
                 self.upstream_registry = None;
@@ -208,77 +247,70 @@ impl Config {
             }
         }
 
-        if let Ok(value) = env::var("RUSTACCIO_WEB_LOGIN")
-            && let Ok(parsed) = value.parse::<bool>()
-        {
+        if let Some(parsed) = parse_env_value::<bool>(env_cfg.web_login.as_deref()) {
             self.web_login = parsed;
         }
-        if let Ok(value) = env::var("RUSTACCIO_WEB_ENABLE")
-            && let Ok(parsed) = value.parse::<bool>()
-        {
+        if let Some(parsed) = parse_env_value::<bool>(env_cfg.web_enable.as_deref()) {
             self.web_enabled = parsed;
         }
-        if let Ok(value) = env::var("RUSTACCIO_WEB_TITLE") {
-            self.web_title = value;
+        if let Some(value) = env_cfg.web_title.as_deref() {
+            self.web_title = value.to_string();
         }
 
-        if let Ok(value) = env::var("RUSTACCIO_PUBLISH_CHECK_OWNERS")
-            && let Ok(parsed) = value.parse::<bool>()
-        {
+        if let Some(parsed) = parse_env_value::<bool>(env_cfg.publish_check_owners.as_deref()) {
             self.publish_check_owners = parsed;
         }
-        if let Ok(value) = env::var("RUSTACCIO_PASSWORD_MIN")
-            && let Ok(parsed) = value.parse::<usize>()
-        {
+        if let Some(parsed) = parse_env_value::<usize>(env_cfg.password_min.as_deref()) {
             self.password_min_length = parsed;
         }
-        if let Ok(value) = env::var("RUSTACCIO_LOGIN_SESSION_TTL_SECONDS")
-            && let Ok(parsed) = value.parse::<i64>()
-        {
+        if let Some(parsed) = parse_env_value::<i64>(env_cfg.login_session_ttl_seconds.as_deref()) {
             self.login_session_ttl_seconds = parsed;
         }
-        if let Ok(value) = env::var("RUSTACCIO_MAX_BODY_SIZE")
-            && let Some(parsed) = parse_body_size(&value)
+        if let Some(value) = env_cfg.max_body_size.as_deref()
+            && let Some(parsed) = parse_body_size(value)
         {
             self.max_body_size = parsed;
         }
-        if let Ok(value) = env::var("RUSTACCIO_AUDIT_ENABLED")
-            && let Ok(parsed) = value.parse::<bool>()
-        {
+        if let Some(parsed) = parse_env_value::<bool>(env_cfg.audit_enabled.as_deref()) {
             self.audit_enabled = parsed;
         }
-        if let Ok(value) = env::var("RUSTACCIO_URL_PREFIX") {
+        if let Some(value) = env_cfg.url_prefix.as_deref() {
             self.url_prefix = normalize_url_prefix(&value);
         }
-        if let Ok(value) = env::var("RUSTACCIO_TRUST_PROXY")
-            && let Ok(parsed) = value.parse::<bool>()
-        {
+        if let Some(parsed) = parse_env_value::<bool>(env_cfg.trust_proxy.as_deref()) {
             self.trust_proxy = parsed;
         }
-        if let Ok(value) = env::var("RUSTACCIO_KEEP_ALIVE_TIMEOUT") {
+        if let Some(value) = env_cfg.keep_alive_timeout.as_deref() {
             if value.trim().is_empty() {
                 self.keep_alive_timeout_secs = None;
-            } else if let Ok(parsed) = value.parse::<u64>() {
+            } else if let Some(parsed) = parse_env_value::<u64>(Some(value)) {
                 self.keep_alive_timeout_secs = Some(parsed);
             }
         }
-        if let Ok(value) = env::var("RUSTACCIO_LOG_LEVEL")
+        if let Some(value) = env_cfg.log_level.as_deref()
             && !value.trim().is_empty()
         {
-            self.log_level = value;
+            self.log_level = value.to_string();
         }
 
-        self.apply_auth_env_overrides();
-        self.apply_storage_env_overrides();
+        self.apply_auth_env_overrides(env_cfg);
+        self.apply_storage_env_overrides(env_cfg);
     }
 
-    fn apply_auth_env_overrides(&mut self) {
-        if let Ok(value) = env::var("RUSTACCIO_AUTH_BACKEND") {
+    fn apply_port_override(&mut self, port_value: Option<String>) {
+        // PaaS compatibility: honor injected PORT (e.g. Railway) and force a public bind address.
+        if let Some(port) = parse_env_value::<u16>(port_value.as_deref()) {
+            let bind = SocketAddr::from(([0, 0, 0, 0], port));
+            self.bind = bind;
+            self.listen = vec![bind.to_string()];
+        }
+    }
+
+    fn apply_auth_env_overrides(&mut self, env_cfg: &RawEnvConfig) {
+        if let Some(value) = env_cfg.auth_backend.as_deref() {
             self.auth_plugin.backend = AuthBackend::from_str(&value);
         }
-        if let Ok(value) = env::var("RUSTACCIO_AUTH_EXTERNAL_MODE")
-            && let Ok(parsed) = value.parse::<bool>()
-        {
+        if let Some(parsed) = parse_env_value::<bool>(env_cfg.auth_external_mode.as_deref()) {
             self.auth_plugin.external_mode = parsed;
         }
 
@@ -293,40 +325,38 @@ impl Config {
             .clone()
             .unwrap_or_else(default_http_auth_config);
 
-        if let Ok(value) = env::var("RUSTACCIO_AUTH_HTTP_BASE_URL") {
-            http.base_url = value;
+        if let Some(value) = env_cfg.auth_http_base_url.as_deref() {
+            http.base_url = value.to_string();
         }
-        if let Ok(value) = env::var("RUSTACCIO_AUTH_HTTP_ADDUSER_ENDPOINT") {
-            http.add_user_endpoint = value;
+        if let Some(value) = env_cfg.auth_http_adduser_endpoint.as_deref() {
+            http.add_user_endpoint = value.to_string();
         }
-        if let Ok(value) = env::var("RUSTACCIO_AUTH_HTTP_LOGIN_ENDPOINT") {
-            http.login_endpoint = value;
+        if let Some(value) = env_cfg.auth_http_login_endpoint.as_deref() {
+            http.login_endpoint = value.to_string();
         }
-        if let Ok(value) = env::var("RUSTACCIO_AUTH_HTTP_CHANGE_PASSWORD_ENDPOINT") {
-            http.change_password_endpoint = value;
+        if let Some(value) = env_cfg.auth_http_change_password_endpoint.as_deref() {
+            http.change_password_endpoint = value.to_string();
         }
-        if let Ok(value) = env::var("RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT") {
-            http.request_auth_endpoint = empty_string_to_none(value);
+        if let Some(value) = env_cfg.auth_http_request_auth_endpoint.as_deref() {
+            http.request_auth_endpoint = empty_string_to_none(value.to_string());
         }
-        if let Ok(value) = env::var("RUSTACCIO_AUTH_HTTP_ALLOW_ACCESS_ENDPOINT") {
-            http.allow_access_endpoint = empty_string_to_none(value);
+        if let Some(value) = env_cfg.auth_http_allow_access_endpoint.as_deref() {
+            http.allow_access_endpoint = empty_string_to_none(value.to_string());
         }
-        if let Ok(value) = env::var("RUSTACCIO_AUTH_HTTP_ALLOW_PUBLISH_ENDPOINT") {
-            http.allow_publish_endpoint = empty_string_to_none(value);
+        if let Some(value) = env_cfg.auth_http_allow_publish_endpoint.as_deref() {
+            http.allow_publish_endpoint = empty_string_to_none(value.to_string());
         }
-        if let Ok(value) = env::var("RUSTACCIO_AUTH_HTTP_ALLOW_UNPUBLISH_ENDPOINT") {
-            http.allow_unpublish_endpoint = empty_string_to_none(value);
+        if let Some(value) = env_cfg.auth_http_allow_unpublish_endpoint.as_deref() {
+            http.allow_unpublish_endpoint = empty_string_to_none(value.to_string());
         }
-        if let Ok(value) = env::var("RUSTACCIO_AUTH_HTTP_TIMEOUT_MS")
-            && let Ok(parsed) = value.parse::<u64>()
-        {
+        if let Some(parsed) = parse_env_value::<u64>(env_cfg.auth_http_timeout_ms.as_deref()) {
             http.timeout_ms = parsed;
         }
         self.auth_plugin.http = Some(http);
     }
 
-    fn apply_storage_env_overrides(&mut self) {
-        if let Ok(value) = env::var("RUSTACCIO_TARBALL_BACKEND") {
+    fn apply_storage_env_overrides(&mut self, env_cfg: &RawEnvConfig) {
+        if let Some(value) = env_cfg.tarball_backend.as_deref() {
             self.tarball_storage.backend = TarballStorageBackend::from_str(&value);
         }
 
@@ -341,31 +371,29 @@ impl Config {
             .clone()
             .unwrap_or_else(default_s3_storage_config);
 
-        if let Ok(value) = env::var("RUSTACCIO_S3_BUCKET")
+        if let Some(value) = env_cfg.s3_bucket.as_deref()
             && !value.is_empty()
         {
-            s3.bucket = value;
+            s3.bucket = value.to_string();
         }
-        if let Ok(value) = env::var("RUSTACCIO_S3_REGION")
+        if let Some(value) = env_cfg.s3_region.as_deref()
             && !value.is_empty()
         {
-            s3.region = value;
+            s3.region = value.to_string();
         }
-        if let Ok(value) = env::var("RUSTACCIO_S3_ENDPOINT") {
-            s3.endpoint = empty_string_to_none(value);
+        if let Some(value) = env_cfg.s3_endpoint.as_deref() {
+            s3.endpoint = empty_string_to_none(value.to_string());
         }
-        if let Ok(value) = env::var("RUSTACCIO_S3_ACCESS_KEY_ID") {
-            s3.access_key_id = empty_string_to_none(value);
+        if let Some(value) = env_cfg.s3_access_key_id.as_deref() {
+            s3.access_key_id = empty_string_to_none(value.to_string());
         }
-        if let Ok(value) = env::var("RUSTACCIO_S3_SECRET_ACCESS_KEY") {
-            s3.secret_access_key = empty_string_to_none(value);
+        if let Some(value) = env_cfg.s3_secret_access_key.as_deref() {
+            s3.secret_access_key = empty_string_to_none(value.to_string());
         }
-        if let Ok(value) = env::var("RUSTACCIO_S3_PREFIX") {
-            s3.prefix = value;
+        if let Some(value) = env_cfg.s3_prefix.as_deref() {
+            s3.prefix = value.to_string();
         }
-        if let Ok(value) = env::var("RUSTACCIO_S3_FORCE_PATH_STYLE")
-            && let Ok(parsed) = value.parse::<bool>()
-        {
+        if let Some(parsed) = parse_env_value::<bool>(env_cfg.s3_force_path_style.as_deref()) {
             s3.force_path_style = parsed;
         }
 
@@ -402,10 +430,7 @@ impl Config {
     }
 
     pub fn from_yaml_file(path: PathBuf) -> Result<Self, String> {
-        let text = std::fs::read_to_string(&path)
-            .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-        let parsed: YamlConfig = serde_yaml::from_str(&text)
-            .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+        let parsed = load_yaml_config(&path)?;
 
         let bind = parse_bind(parsed.listen.as_ref())?;
         let listen = parse_listen(parsed.listen.as_ref(), &bind);
@@ -497,6 +522,129 @@ impl Config {
             tarball_storage,
         })
     }
+}
+
+fn load_yaml_config(path: &Path) -> Result<YamlConfig, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let ordered_packages = serde_yaml::from_str::<YamlPackagesOnly>(&text)
+        .ok()
+        .and_then(|value| value.packages);
+
+    let loaded = SettingsLoader::builder()
+        .add_source(
+            File::from(path)
+                .format(config::FileFormat::Yaml)
+                .required(true),
+        )
+        .build()
+        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    let mut parsed = loaded
+        .try_deserialize::<YamlConfig>()
+        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    if ordered_packages.is_some() {
+        parsed.packages = ordered_packages;
+    }
+    Ok(parsed)
+}
+
+fn load_rustaccio_env() -> Result<RawEnvConfig, String> {
+    let settings = SettingsLoader::builder()
+        .add_source(Environment::with_prefix("RUSTACCIO").try_parsing(false))
+        .build()
+        .map_err(|err| format!("failed to load RUSTACCIO_* environment: {err}"))?;
+
+    Ok(RawEnvConfig {
+        config: env_value_for_var(&settings, "RUSTACCIO_CONFIG"),
+        bind: env_value_for_var(&settings, "RUSTACCIO_BIND"),
+        data_dir: env_value_for_var(&settings, "RUSTACCIO_DATA_DIR"),
+        upstream: env_value_for_var(&settings, "RUSTACCIO_UPSTREAM"),
+        web_login: env_value_for_var(&settings, "RUSTACCIO_WEB_LOGIN"),
+        web_enable: env_value_for_var(&settings, "RUSTACCIO_WEB_ENABLE"),
+        web_title: env_value_for_var(&settings, "RUSTACCIO_WEB_TITLE"),
+        publish_check_owners: env_value_for_var(&settings, "RUSTACCIO_PUBLISH_CHECK_OWNERS"),
+        password_min: env_value_for_var(&settings, "RUSTACCIO_PASSWORD_MIN"),
+        login_session_ttl_seconds: env_value_for_var(
+            &settings,
+            "RUSTACCIO_LOGIN_SESSION_TTL_SECONDS",
+        ),
+        max_body_size: env_value_for_var(&settings, "RUSTACCIO_MAX_BODY_SIZE"),
+        audit_enabled: env_value_for_var(&settings, "RUSTACCIO_AUDIT_ENABLED"),
+        url_prefix: env_value_for_var(&settings, "RUSTACCIO_URL_PREFIX"),
+        trust_proxy: env_value_for_var(&settings, "RUSTACCIO_TRUST_PROXY"),
+        keep_alive_timeout: env_value_for_var(&settings, "RUSTACCIO_KEEP_ALIVE_TIMEOUT"),
+        log_level: env_value_for_var(&settings, "RUSTACCIO_LOG_LEVEL"),
+        auth_backend: env_value_for_var(&settings, "RUSTACCIO_AUTH_BACKEND"),
+        auth_external_mode: env_value_for_var(&settings, "RUSTACCIO_AUTH_EXTERNAL_MODE"),
+        auth_http_base_url: env_value_for_var(&settings, "RUSTACCIO_AUTH_HTTP_BASE_URL"),
+        auth_http_adduser_endpoint: env_value_for_var(
+            &settings,
+            "RUSTACCIO_AUTH_HTTP_ADDUSER_ENDPOINT",
+        ),
+        auth_http_login_endpoint: env_value_for_var(
+            &settings,
+            "RUSTACCIO_AUTH_HTTP_LOGIN_ENDPOINT",
+        ),
+        auth_http_change_password_endpoint: env_value_for_var(
+            &settings,
+            "RUSTACCIO_AUTH_HTTP_CHANGE_PASSWORD_ENDPOINT",
+        ),
+        auth_http_request_auth_endpoint: env_value_for_var(
+            &settings,
+            "RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT",
+        ),
+        auth_http_allow_access_endpoint: env_value_for_var(
+            &settings,
+            "RUSTACCIO_AUTH_HTTP_ALLOW_ACCESS_ENDPOINT",
+        ),
+        auth_http_allow_publish_endpoint: env_value_for_var(
+            &settings,
+            "RUSTACCIO_AUTH_HTTP_ALLOW_PUBLISH_ENDPOINT",
+        ),
+        auth_http_allow_unpublish_endpoint: env_value_for_var(
+            &settings,
+            "RUSTACCIO_AUTH_HTTP_ALLOW_UNPUBLISH_ENDPOINT",
+        ),
+        auth_http_timeout_ms: env_value_for_var(&settings, "RUSTACCIO_AUTH_HTTP_TIMEOUT_MS"),
+        tarball_backend: env_value_for_var(&settings, "RUSTACCIO_TARBALL_BACKEND"),
+        s3_bucket: env_value_for_var(&settings, "RUSTACCIO_S3_BUCKET"),
+        s3_region: env_value_for_var(&settings, "RUSTACCIO_S3_REGION"),
+        s3_endpoint: env_value_for_var(&settings, "RUSTACCIO_S3_ENDPOINT"),
+        s3_access_key_id: env_value_for_var(&settings, "RUSTACCIO_S3_ACCESS_KEY_ID"),
+        s3_secret_access_key: env_value_for_var(&settings, "RUSTACCIO_S3_SECRET_ACCESS_KEY"),
+        s3_prefix: env_value_for_var(&settings, "RUSTACCIO_S3_PREFIX"),
+        s3_force_path_style: env_value_for_var(&settings, "RUSTACCIO_S3_FORCE_PATH_STYLE"),
+    })
+}
+
+fn load_process_env_value(key: &str) -> Result<Option<String>, String> {
+    let settings = SettingsLoader::builder()
+        .add_source(Environment::default().try_parsing(false))
+        .build()
+        .map_err(|err| format!("failed to load process environment: {err}"))?;
+    Ok(env_value(&settings, key))
+}
+
+fn env_value(settings: &SettingsLoader, key: &str) -> Option<String> {
+    settings
+        .get_string(key)
+        .ok()
+        .or_else(|| settings.get_string(&key.to_ascii_uppercase()).ok())
+}
+
+fn env_value_for_var(settings: &SettingsLoader, env_var: &str) -> Option<String> {
+    let key = env_var
+        .strip_prefix("RUSTACCIO_")
+        .unwrap_or(env_var)
+        .to_ascii_lowercase();
+    env_value(settings, &key)
+}
+
+fn parse_env_value<T>(raw: Option<&str>) -> Option<T>
+where
+    T: std::str::FromStr,
+{
+    raw.and_then(|value| value.parse::<T>().ok())
 }
 
 pub fn default_http_auth_config_for_examples() -> HttpAuthPluginConfig {
@@ -669,6 +817,11 @@ struct YamlConfig {
     server: Option<YamlServer>,
     log: Option<YamlLog>,
     auth: Option<YamlAuth>,
+}
+
+#[derive(Debug, Deserialize)]
+struct YamlPackagesOnly {
+    packages: Option<serde_yaml::Mapping>,
 }
 
 #[derive(Debug, Deserialize)]

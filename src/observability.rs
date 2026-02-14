@@ -1,3 +1,4 @@
+use config::{Config as SettingsLoader, Environment};
 use std::sync::OnceLock;
 use tracing_subscriber::{
     EnvFilter, fmt, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt,
@@ -25,8 +26,8 @@ pub enum LogFormat {
 
 impl LogFormat {
     fn from_env() -> Self {
-        match std::env::var("RUSTACCIO_LOG_FORMAT")
-            .unwrap_or_else(|_| "pretty".to_string())
+        match load_env_value("RUSTACCIO_LOG_FORMAT")
+            .unwrap_or_else(|| "pretty".to_string())
             .to_ascii_lowercase()
             .as_str()
         {
@@ -52,8 +53,7 @@ pub struct TracingSettings {
 }
 
 pub fn init_from_env(default_level: &str) -> TracingSettings {
-    let base_filter = std::env::var("RUST_LOG")
-        .ok()
+    let base_filter = load_env_value("RUST_LOG")
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| format!("rustaccio={default_level},tower_http=info"));
     let filter = with_noisy_dependency_guards(base_filter);
@@ -109,7 +109,7 @@ pub fn init_from_env(default_level: &str) -> TracingSettings {
 }
 
 fn with_noisy_dependency_guards(filter: String) -> String {
-    let verbose_dependencies = std::env::var("RUSTACCIO_VERBOSE_DEP_LOGS")
+    let verbose_dependencies = load_env_value("RUSTACCIO_VERBOSE_DEP_LOGS")
         .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
         .unwrap_or(false);
     if verbose_dependencies {
@@ -125,6 +125,17 @@ fn with_noisy_dependency_guards(filter: String) -> String {
         }
     }
     directives
+}
+
+fn load_env_value(key: &str) -> Option<String> {
+    let settings = SettingsLoader::builder()
+        .add_source(Environment::default().try_parsing(false))
+        .build()
+        .ok()?;
+    settings
+        .get_string(key)
+        .ok()
+        .or_else(|| settings.get_string(&key.to_ascii_lowercase()).ok())
 }
 
 fn has_target_directive(filter: &str, target: &str) -> bool {

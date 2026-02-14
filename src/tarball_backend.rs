@@ -7,6 +7,8 @@ use crate::{
 #[cfg(feature = "s3")]
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use axum::http::StatusCode;
+#[cfg(feature = "s3")]
+use config::{Config as SettingsLoader, Environment};
 use serde_json::Value;
 #[cfg(feature = "s3")]
 use std::collections::HashSet;
@@ -856,7 +858,7 @@ fn parse_package_from_metadata_object_key(prefix: &str, key: &str) -> Option<Str
 
 #[cfg(feature = "s3")]
 fn load_s3_ca_bundle_pem() -> Result<Option<Vec<u8>>, RegistryError> {
-    if let Ok(path) = std::env::var("RUSTACCIO_S3_CA_BUNDLE")
+    if let Some(path) = load_env_value("RUSTACCIO_S3_CA_BUNDLE")
         && !path.trim().is_empty()
     {
         let bytes = std::fs::read(&path).map_err(|err| {
@@ -876,6 +878,18 @@ fn load_s3_ca_bundle_pem() -> Result<Option<Vec<u8>>, RegistryError> {
     }
 
     Ok(None)
+}
+
+#[cfg(feature = "s3")]
+fn load_env_value(key: &str) -> Option<String> {
+    let settings = SettingsLoader::builder()
+        .add_source(Environment::default().try_parsing(false))
+        .build()
+        .ok()?;
+    settings
+        .get_string(key)
+        .ok()
+        .or_else(|| settings.get_string(&key.to_ascii_lowercase()).ok())
 }
 
 #[cfg(feature = "s3")]

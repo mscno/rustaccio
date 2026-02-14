@@ -4,6 +4,7 @@ use axum::{
     http::{HeaderName, StatusCode},
     routing::any,
 };
+use config::{Config as SettingsLoader, Environment};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tower_http::{
     limit::RequestBodyLimitLayer,
@@ -52,7 +53,7 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 fn request_timeout_secs_from_env() -> u64 {
-    let raw = std::env::var("RUSTACCIO_REQUEST_TIMEOUT_SECS").ok();
+    let raw = load_env_value("RUSTACCIO_REQUEST_TIMEOUT_SECS");
     parse_request_timeout_secs(raw.as_deref())
 }
 
@@ -60,6 +61,17 @@ fn parse_request_timeout_secs(raw: Option<&str>) -> u64 {
     raw.and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(30)
         .clamp(1, 300)
+}
+
+fn load_env_value(key: &str) -> Option<String> {
+    let settings = SettingsLoader::builder()
+        .add_source(Environment::default().try_parsing(false))
+        .build()
+        .ok()?;
+    settings
+        .get_string(key)
+        .ok()
+        .or_else(|| settings.get_string(&key.to_ascii_lowercase()).ok())
 }
 
 #[cfg(test)]

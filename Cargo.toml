@@ -17,6 +17,7 @@ aws-smithy-http-client = { version = "1.1.10", optional = true, default-features
 axum = { version = "0.7.9", default-features = false, features = ["http1", "tokio", "json"] }
 base64 = "0.22.1"
 chrono = { version = "0.4.43", features = ["clock"] }
+config = { version = "0.15.11", default-features = false, features = ["yaml"] }
 hex = "0.4.3"
 password-hash = "0.5.0"
 rand = "0.8.5"
@@ -44,9 +45,15 @@ wiremock = "0.6.5"
 
 [profile.release]
 opt-level = 3
-lto = "fat"
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
 strip = "symbols"
 panic = "abort"
 debug = 0
+incremental = true
+
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
 incremental = false

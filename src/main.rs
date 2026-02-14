@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use config::{Config as SettingsLoader, Environment};
 use rustaccio::{
     config::Config,
     runtime::{run_from_env, run_standalone},
@@ -51,7 +52,7 @@ where
 }
 
 fn parse_env_usize(key: &str, default: usize, min: usize, max: usize) -> usize {
-    let raw = std::env::var(key).ok();
+    let raw = load_env_value(key);
     parse_usize_or_default(raw.as_deref(), default, min, max)
 }
 
@@ -60,6 +61,17 @@ fn parse_usize_or_default(raw: Option<&str>, default: usize, min: usize, max: us
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(default);
     parsed.clamp(min, max)
+}
+
+fn load_env_value(key: &str) -> Option<String> {
+    let settings = SettingsLoader::builder()
+        .add_source(Environment::default().try_parsing(false))
+        .build()
+        .ok()?;
+    settings
+        .get_string(key)
+        .ok()
+        .or_else(|| settings.get_string(&key.to_ascii_lowercase()).ok())
 }
 
 fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
