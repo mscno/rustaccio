@@ -19,6 +19,7 @@ use crate::{
         AuthIdentity, AuthTokenRecord, LoginSessionRecord, NpmTokenRecord, PackageRecord,
         PersistedState, UserRecord,
     },
+    state_coordination::StateWriteCoordinator,
     tarball_backend::TarballBackend,
 };
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
@@ -49,6 +50,7 @@ pub struct Store {
     state: RwLock<PersistedState>,
     state_file: PathBuf,
     tarball_backend: TarballBackend,
+    state_coordinator: StateWriteCoordinator,
     auth_plugin: Option<HttpAuthPlugin>,
     auth_hook: Option<Arc<dyn AuthHook>>,
     password_min_length: usize,
@@ -82,6 +84,7 @@ impl Store {
     ) -> Result<Self, RegistryError> {
         tokio::fs::create_dir_all(&config.data_dir).await?;
         let tarball_backend = TarballBackend::from_config(config).await?;
+        let state_coordinator = StateWriteCoordinator::from_env().await?;
 
         let state_file = config.data_dir.join("state.json");
         let mut state = if tarball_backend.supports_shared_state_snapshot() {
@@ -117,6 +120,7 @@ impl Store {
             state: RwLock::new(state),
             state_file,
             tarball_backend,
+            state_coordinator,
             auth_plugin,
             auth_hook: options.auth_hook,
             password_min_length: config.password_min_length,
@@ -647,17 +651,21 @@ impl Store {
     }
 
     async fn persist_state(&self) -> Result<(), RegistryError> {
-        let bytes = {
-            let state = self.state.read().await;
-            Self::serialize_persisted_state(&state)?
-        };
-        Self::write_local_snapshot_bytes(&self.state_file, &bytes).await?;
-        if self.tarball_backend.supports_shared_state_snapshot() {
-            self.tarball_backend
-                .save_shared_state_snapshot(&bytes)
-                .await?;
-        }
-        Ok(())
+        self.state_coordinator
+            .run_exclusive("persist_state", || async {
+                let bytes = {
+                    let state = self.state.read().await;
+                    Self::serialize_persisted_state(&state)?
+                };
+                Self::write_local_snapshot_bytes(&self.state_file, &bytes).await?;
+                if self.tarball_backend.supports_shared_state_snapshot() {
+                    self.tarball_backend
+                        .save_shared_state_snapshot(&bytes)
+                        .await?;
+                }
+                Ok(())
+            })
+            .await
     }
 
     fn serialize_persisted_state(state: &PersistedState) -> Result<Vec<u8>, RegistryError> {

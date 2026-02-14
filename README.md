@@ -150,6 +150,13 @@ Environment variables:
 - `RUSTACCIO_S3_PREFIX` (optional key prefix)
 - `RUSTACCIO_S3_FORCE_PATH_STYLE` (default `true`)
 - `RUSTACCIO_S3_CA_BUNDLE` (optional PEM bundle path for S3 TLS trust; falls back to common system bundle paths when present)
+- `RUSTACCIO_STATE_COORDINATION_BACKEND` (`none` or `redis`, default `none`)
+- `RUSTACCIO_STATE_COORDINATION_REDIS_URL` (required for `redis` state coordination backend)
+- `RUSTACCIO_STATE_COORDINATION_LOCK_KEY` (default `rustaccio:state:lock`)
+- `RUSTACCIO_STATE_COORDINATION_LEASE_MS` (default `5000`)
+- `RUSTACCIO_STATE_COORDINATION_ACQUIRE_TIMEOUT_MS` (default `15000`)
+- `RUSTACCIO_STATE_COORDINATION_POLL_INTERVAL_MS` (default `100`)
+- `RUSTACCIO_STATE_COORDINATION_FAIL_OPEN` (default `false`)
 
 Build features:
 
@@ -557,6 +564,22 @@ Postgres quota migrations:
 - Rustaccio applies quota schema migrations automatically on startup when `RUSTACCIO_QUOTA_BACKEND=postgres`.
 - Migration files live under `migrations/` (current: `migrations/0001_quota_usage_table.sql`).
 
+State write coordination (opt-in):
+
+- `RUSTACCIO_STATE_COORDINATION_BACKEND=none|redis` (default `none`)
+- `RUSTACCIO_STATE_COORDINATION_REDIS_URL` (required when backend=`redis`)
+- `RUSTACCIO_STATE_COORDINATION_LOCK_KEY` (default `rustaccio:state:lock`)
+- `RUSTACCIO_STATE_COORDINATION_LEASE_MS` (default `5000`)
+- `RUSTACCIO_STATE_COORDINATION_ACQUIRE_TIMEOUT_MS` (default `15000`)
+- `RUSTACCIO_STATE_COORDINATION_POLL_INTERVAL_MS` (default `100`)
+- `RUSTACCIO_STATE_COORDINATION_FAIL_OPEN` (default `false`)
+
+Semantics:
+
+- Coordinates snapshot persistence with a distributed Redis lease lock.
+- Prevents concurrent snapshot write sections from overlapping across instances.
+- This is a write-coordination primitive, not full multi-writer state conflict resolution.
+
 Metrics endpoint:
 
 - `RUSTACCIO_METRICS_BACKEND=none|prometheus` (default `none`)
@@ -654,6 +677,8 @@ Recommended managed security baseline:
 - `RUSTACCIO_AUTH_EXTERNAL_MODE=true`
 - `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false`
 - `RUSTACCIO_ADMIN_GROUPS=<control-plane-admin-group>`
+- `RUSTACCIO_STATE_COORDINATION_BACKEND=redis`
+- `RUSTACCIO_STATE_COORDINATION_REDIS_URL=redis://redis:6379/`
 
 Example container run:
 
@@ -668,6 +693,8 @@ docker run --rm -p 4873:4873 \
   -e RUSTACCIO_ADMIN_GROUPS=platform-admins \
   -e RUSTACCIO_RATE_LIMIT_BACKEND=redis \
   -e RUSTACCIO_RATE_LIMIT_REDIS_URL=redis://redis:6379/ \
+  -e RUSTACCIO_STATE_COORDINATION_BACKEND=redis \
+  -e RUSTACCIO_STATE_COORDINATION_REDIS_URL=redis://redis:6379/ \
   -e RUSTACCIO_QUOTA_BACKEND=postgres \
   -e RUSTACCIO_QUOTA_POSTGRES_URL=postgres://postgres:postgres@postgres:5432/rustaccio \
   -e RUSTACCIO_METRICS_BACKEND=prometheus \
@@ -746,9 +773,30 @@ Known failure windows:
 
 4. Shared snapshot mode multi-writer races:
 - snapshot writes are last-write-wins without distributed CAS/lease protection.
+- enabling Redis state coordination reduces overlapping write sections, but does not by itself provide semantic merge/conflict resolution for independently diverged in-memory states.
 
 5. Redis/Postgres backend outage:
 - behavior depends on `*_FAIL_OPEN` settings (`allow` vs reject with backend-unavailable errors).
+
+## Stateless Backend Feasibility
+
+Current answer: not fully today.
+
+Why:
+
+- package metadata authority is still snapshot-based (`state.json` / shared snapshot object).
+- token/session/user records are persisted in the same state model (unless external auth mode is used, where local auth routes are disabled).
+
+What external auth mode changes:
+
+- local user/token/profile flows are disabled, reducing auth-state reliance.
+- package metadata state is still required for publish/dist-tags/attachments/owner-star metadata and registry responses.
+
+Path to fully stateless registry nodes:
+
+- move package metadata and auth/session/token records to external transactional stores.
+- keep tarball blobs in object storage.
+- make each request resolve metadata from external state stores or a strongly coherent cache layer.
 
 Operational diagnostics:
 
