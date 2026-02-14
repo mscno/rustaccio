@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-02-14
+
+### Fixed
+
+- Docker build: pass `CARGO_BUILD_JOBS` as env var to `cargo-chef cook` instead of unsupported `-j` flag.
+
+## [0.5.0] - 2026-02-14
+
+### Fixed
+
+- Web UI: content area no longer overflows viewport width (added `min-width: 0` to cards/grids and `overflow: hidden` to content container).
+
+### Changed
+
+- Docker build: `cargo chef cook` now respects `CARGO_PROFILE` build arg, using the `dist` profile when specified instead of always using `release`.
+- Switched Docker runtime base image to distroless (`gcr.io/distroless/cc-debian12:nonroot`).
+- Improved config loading and runtime setup.
+- CI: made sccache optional when GHA cache is unavailable.
+
 ## [0.4.0] - 2026-02-14
 
 ### Added
