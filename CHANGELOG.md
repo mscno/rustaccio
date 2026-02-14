@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-02-14
+
+### Fixed
+
+- Package manifest `versions` object now preserves insertion (publish) order instead of sorting lexicographically, matching Verdaccio behavior.
+
+## [0.7.0] - 2026-02-14
+
+### Changed
+
+- CI: increased Docker publish workflow timeout from 45 to 120 minutes.
+
 ## [0.6.0] - 2026-02-14
 
 ### Fixed
