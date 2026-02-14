@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Breaking: removed snapshot-based package metadata persistence and shared S3 `__rustaccio_meta/state.json` package snapshots. Package metadata is now always sidecar-authoritative (`package.json`), and local `state.json` persists auth/session/token records only.
+
 ## [0.9.0] - 2026-02-14
 
 ### Added

@@ -115,35 +115,20 @@ impl TarballBackend {
         }
     }
 
+    pub async fn list_package_tarballs(&self, package: &str) -> Result<Vec<String>, RegistryError> {
+        let refs = self.list().await?;
+        Ok(refs
+            .into_iter()
+            .filter(|reference| reference.package == package)
+            .map(|reference| reference.filename)
+            .collect())
+    }
+
     pub async fn list_packages(&self) -> Result<Vec<String>, RegistryError> {
         match self {
             Self::Local(backend) => backend.list_packages().await,
             #[cfg(feature = "s3")]
             Self::S3(backend) => backend.list_packages().await,
-        }
-    }
-
-    pub fn supports_shared_state_snapshot(&self) -> bool {
-        match self {
-            Self::Local(_) => false,
-            #[cfg(feature = "s3")]
-            Self::S3(_) => true,
-        }
-    }
-
-    pub async fn load_shared_state_snapshot(&self) -> Result<Option<Vec<u8>>, RegistryError> {
-        match self {
-            Self::Local(_) => Ok(None),
-            #[cfg(feature = "s3")]
-            Self::S3(backend) => backend.get_state_snapshot().await,
-        }
-    }
-
-    pub async fn save_shared_state_snapshot(&self, _content: &[u8]) -> Result<(), RegistryError> {
-        match self {
-            Self::Local(_) => Ok(()),
-            #[cfg(feature = "s3")]
-            Self::S3(backend) => backend.put_state_snapshot(_content).await,
         }
     }
 
@@ -340,8 +325,6 @@ pub struct S3TarballBackend {
 
 #[cfg(feature = "s3")]
 impl S3TarballBackend {
-    const SHARED_STATE_PACKAGE: &'static str = "__rustaccio_meta";
-    const SHARED_STATE_FILENAME: &'static str = "state.json";
     const LEGACY_VERDACCIO_DB_FILENAME: &'static str = "verdaccio-s3-db.json";
 
     #[instrument(skip(cfg), fields(bucket = cfg.bucket, region = cfg.region, endpoint = cfg.endpoint.as_deref().unwrap_or("<aws-default>")))]
@@ -521,7 +504,6 @@ impl S3TarballBackend {
         Ok(Some(bytes.into_bytes().to_vec()))
     }
 
-    #[instrument(skip(self), fields(key))]
     async fn exists(&self, key: &str) -> Result<bool, RegistryError> {
         match self
             .client
@@ -709,20 +691,6 @@ impl S3TarballBackend {
         let mut out = packages.into_iter().collect::<Vec<_>>();
         out.sort();
         Ok(out)
-    }
-
-    pub async fn get_state_snapshot(&self) -> Result<Option<Vec<u8>>, RegistryError> {
-        self.get(Self::SHARED_STATE_PACKAGE, Self::SHARED_STATE_FILENAME)
-            .await
-    }
-
-    pub async fn put_state_snapshot(&self, content: &[u8]) -> Result<(), RegistryError> {
-        self.put(
-            Self::SHARED_STATE_PACKAGE,
-            Self::SHARED_STATE_FILENAME,
-            content,
-        )
-        .await
     }
 
     pub async fn read_package_metadata(

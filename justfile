@@ -41,6 +41,8 @@ minio-down:
 	docker compose -f docker-compose.minio.yml down -v
 
 test-s3-it:
+	just _cargo "cargo test --features s3 --test state_coordination_s3_integration -- --nocapture"
+	just _cargo "cargo test --features s3 --test state_coordination_s3_integration -- --ignored --nocapture"
 	just _cargo "cargo test --features s3 --test s3_minio_integration -- --ignored --nocapture"
 
 governance-up:

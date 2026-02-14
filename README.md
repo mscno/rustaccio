@@ -150,13 +150,20 @@ Environment variables:
 - `RUSTACCIO_S3_PREFIX` (optional key prefix)
 - `RUSTACCIO_S3_FORCE_PATH_STYLE` (default `true`)
 - `RUSTACCIO_S3_CA_BUNDLE` (optional PEM bundle path for S3 TLS trust; falls back to common system bundle paths when present)
-- `RUSTACCIO_STATE_COORDINATION_BACKEND` (`none` or `redis`, default `none`)
+- `RUSTACCIO_PACKAGE_METADATA_AUTHORITY` (`sidecar`, default `sidecar`)
+- `RUSTACCIO_STATE_COORDINATION_BACKEND` (`none`, `redis`, or `s3`, default `none`)
 - `RUSTACCIO_STATE_COORDINATION_REDIS_URL` (required for `redis` state coordination backend)
 - `RUSTACCIO_STATE_COORDINATION_LOCK_KEY` (default `rustaccio:state:lock`)
 - `RUSTACCIO_STATE_COORDINATION_LEASE_MS` (default `5000`)
 - `RUSTACCIO_STATE_COORDINATION_ACQUIRE_TIMEOUT_MS` (default `15000`)
 - `RUSTACCIO_STATE_COORDINATION_POLL_INTERVAL_MS` (default `100`)
 - `RUSTACCIO_STATE_COORDINATION_FAIL_OPEN` (default `false`)
+- `RUSTACCIO_STATE_COORDINATION_S3_BUCKET` (required for `s3` state coordination backend)
+- `RUSTACCIO_STATE_COORDINATION_S3_REGION` (default `us-east-1`)
+- `RUSTACCIO_STATE_COORDINATION_S3_ENDPOINT` (optional, eg MinIO/LocalStack endpoint)
+- `RUSTACCIO_STATE_COORDINATION_S3_ACCESS_KEY_ID` / `RUSTACCIO_STATE_COORDINATION_S3_SECRET_ACCESS_KEY` (optional static credentials)
+- `RUSTACCIO_STATE_COORDINATION_S3_PREFIX` (default `rustaccio/state-locks/`)
+- `RUSTACCIO_STATE_COORDINATION_S3_FORCE_PATH_STYLE` (default `false`)
 
 Build features:
 
@@ -566,18 +573,24 @@ Postgres quota migrations:
 
 State write coordination (opt-in):
 
-- `RUSTACCIO_STATE_COORDINATION_BACKEND=none|redis` (default `none`)
+- `RUSTACCIO_STATE_COORDINATION_BACKEND=none|redis|s3` (default `none`)
 - `RUSTACCIO_STATE_COORDINATION_REDIS_URL` (required when backend=`redis`)
 - `RUSTACCIO_STATE_COORDINATION_LOCK_KEY` (default `rustaccio:state:lock`)
 - `RUSTACCIO_STATE_COORDINATION_LEASE_MS` (default `5000`)
 - `RUSTACCIO_STATE_COORDINATION_ACQUIRE_TIMEOUT_MS` (default `15000`)
 - `RUSTACCIO_STATE_COORDINATION_POLL_INTERVAL_MS` (default `100`)
 - `RUSTACCIO_STATE_COORDINATION_FAIL_OPEN` (default `false`)
+- `RUSTACCIO_STATE_COORDINATION_S3_BUCKET` (required when backend=`s3`)
+- `RUSTACCIO_STATE_COORDINATION_S3_REGION` (default `us-east-1`)
+- `RUSTACCIO_STATE_COORDINATION_S3_ENDPOINT` (optional)
+- `RUSTACCIO_STATE_COORDINATION_S3_ACCESS_KEY_ID`, `RUSTACCIO_STATE_COORDINATION_S3_SECRET_ACCESS_KEY` (optional)
+- `RUSTACCIO_STATE_COORDINATION_S3_PREFIX` (default `rustaccio/state-locks/`)
+- `RUSTACCIO_STATE_COORDINATION_S3_FORCE_PATH_STYLE` (default `false`)
 
 Semantics:
 
-- Coordinates snapshot persistence with a distributed Redis lease lock.
-- Prevents concurrent snapshot write sections from overlapping across instances.
+- Coordinates write sections with scoped lease locks (`state` scope for auth/session persistence and `package:<name>` scope for package mutations).
+- Prevents overlapping multi-instance write sections when all instances use the same coordination backend.
 - This is a write-coordination primitive, not full multi-writer state conflict resolution.
 
 Metrics endpoint:
@@ -625,18 +638,19 @@ Recommended managed-mode posture:
 
 ## Run Modes
 
-Rustaccio currently supports these practical runtime modes.
+Rustaccio now runs sidecar-authoritative package metadata in all modes.
 
 | Mode | Tarball Backend | Metadata Authority | Governance Backends | Typical Use |
 |---|---|---|---|---|
-| Simple local | `local` | local `state.json` | none/memory | single-node, low ops |
-| Shared snapshot | `s3` | shared snapshot (`__rustaccio_meta/state.json`) + local mirror | none/memory | multi-node read/write with shared object store |
-| Managed governance | `local` or `s3` | same as above | Redis/Postgres/Prometheus/OTel | managed platform with limits/observability |
-| External control-plane auth/policy | `local` or `s3` | same as above | same as above | centralized identity/policy decisions |
+| Simple local | `local` | package sidecars (`package.json`) | none/memory | single-node, low ops |
+| Shared object store | `s3` | package sidecars (`package.json`) | none/memory | multi-node with shared blob storage |
+| Managed governance | `local` or `s3` | package sidecars (`package.json`) | Redis/Postgres/Prometheus/OTel | managed platform with limits/observability |
+| External control-plane auth/policy | `local` or `s3` | package sidecars (`package.json`) | same as above | centralized identity/policy decisions |
 
 Simple local mode defaults:
 
 - `RUSTACCIO_TARBALL_BACKEND=local`
+- `RUSTACCIO_PACKAGE_METADATA_AUTHORITY=sidecar`
 - `RUSTACCIO_RATE_LIMIT_BACKEND=none`
 - `RUSTACCIO_QUOTA_BACKEND=none`
 - `RUSTACCIO_POLICY_BACKEND=local`
@@ -677,8 +691,15 @@ Recommended managed security baseline:
 - `RUSTACCIO_AUTH_EXTERNAL_MODE=true`
 - `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false`
 - `RUSTACCIO_ADMIN_GROUPS=<control-plane-admin-group>`
+- `RUSTACCIO_PACKAGE_METADATA_AUTHORITY=sidecar`
 - `RUSTACCIO_STATE_COORDINATION_BACKEND=redis`
 - `RUSTACCIO_STATE_COORDINATION_REDIS_URL=redis://redis:6379/`
+
+Alternative coordination backend (if you prefer object-storage-native locking):
+
+- `RUSTACCIO_STATE_COORDINATION_BACKEND=s3`
+- `RUSTACCIO_STATE_COORDINATION_S3_BUCKET=<lock-bucket>`
+- `RUSTACCIO_STATE_COORDINATION_S3_PREFIX=rustaccio/state-locks/`
 
 Example container run:
 
@@ -691,6 +712,7 @@ docker run --rm -p 4873:4873 \
   -e RUSTACCIO_AUTH_EXTERNAL_MODE=true \
   -e RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false \
   -e RUSTACCIO_ADMIN_GROUPS=platform-admins \
+  -e RUSTACCIO_PACKAGE_METADATA_AUTHORITY=sidecar \
   -e RUSTACCIO_RATE_LIMIT_BACKEND=redis \
   -e RUSTACCIO_RATE_LIMIT_REDIS_URL=redis://redis:6379/ \
   -e RUSTACCIO_STATE_COORDINATION_BACKEND=redis \
@@ -711,92 +733,54 @@ Notes:
 
 ### Core persisted model
 
-The persisted state model (`PersistedState`) contains:
+The local persisted state file (`<data_dir>/state.json`) stores only auth/session state:
 
 - `users`
 - `auth_tokens`
 - `npm_tokens`
 - `login_sessions`
-- `packages`
 
-Package state (`PackageRecord`) contains:
+`packages` is intentionally persisted as an empty map. Package metadata authority is sidecar-only.
+
+Package runtime state (`PackageRecord`) contains:
 
 - `manifest` (full package manifest JSON)
 - `upstream_tarballs` (filename -> original upstream URL cache)
 - `updated_at`
 - `cached_from_uplink`
 
-Important behavior:
-
-- `cached_from_uplink=true` package records are intentionally excluded from persisted snapshots.
-- Only local/non-uplink package metadata is durable in `state.json`.
-
-### Snapshot storage
-
-Local backend mode:
-
-- Authority snapshot: `<data_dir>/state.json`
-- Local tarballs: `<data_dir>/tarballs/<package-with-slashes-replaced>/...`
-- Package sidecar: `<data_dir>/tarballs/<package-with-slashes-replaced>/package.json`
-
-S3 backend mode:
-
-- Shared snapshot object: `<prefix>__rustaccio_meta/state.json`
-- Tarball objects are written in canonical rustaccio layout, but reads also accept Verdaccio-style key layouts.
-- Package sidecar is written as `<prefix><package>/package.json` (Verdaccio-compatible layout).
-
 ### Metadata sidecars
 
-Rustaccio writes package sidecar metadata after manifest mutations (`publish`, metadata-only update, dist-tag/owner/star changes, tarball removals).
+Package metadata is stored in backend sidecars:
+
+- Local: `<data_dir>/tarballs/<package-with-slashes-replaced>/package.json`
+- S3: `<prefix><package>/package.json` (Verdaccio-compatible layout)
+
+Rustaccio writes sidecars after manifest mutations (`publish`, metadata-only update, dist-tag/owner/star changes, tarball removals).
 
 At startup and reindex:
 
 - Rustaccio loads tarball references from backend listing.
-- It loads package sidecars when available.
-- It can merge legacy index hints (`verdaccio-s3-db.json`) where present.
+- It loads sidecars when available.
+- It merges legacy Verdaccio package index hints (`verdaccio-s3-db.json`) when present.
 - It rebuilds missing manifest structures from tarball filenames and sidecar metadata.
 
 ## Data Inconsistency and Failure Modes
 
-Rustaccio is robust for common flows, but current storage writes are not fully transactional across all artifacts.
-
 Known failure windows:
 
-1. Tarball written, snapshot persist fails:
-- blob may exist without durable manifest reference.
+1. Tarball written, sidecar write fails:
+- blob may exist without updated manifest reference.
 
-2. Snapshot persisted, sidecar write fails:
-- `state.json` (and shared snapshot, if enabled) may be newer than package sidecar.
+2. Sidecar updated, tarball delete fails:
+- manifest may stop referencing a blob that still exists (or vice versa, depending on operation ordering).
 
-3. Tarball delete succeeds, snapshot persist fails:
-- snapshot may reference a tarball that no longer exists.
+3. Sidecar authority multi-writer races:
+- if coordination backend is `none`, concurrent writers can still race.
+- with `redis`/`s3` coordination enabled, rustaccio serializes package mutations by `package:<name>` scope, which removes overlapping write sections but is still not a full transactional metadata system.
 
-4. Shared snapshot mode multi-writer races:
-- snapshot writes are last-write-wins without distributed CAS/lease protection.
-- enabling Redis state coordination reduces overlapping write sections, but does not by itself provide semantic merge/conflict resolution for independently diverged in-memory states.
-
-5. Redis/Postgres backend outage:
+4. Backend outages (Redis/Postgres/S3 lock backend):
 - behavior depends on `*_FAIL_OPEN` settings (`allow` vs reject with backend-unavailable errors).
-
-## Stateless Backend Feasibility
-
-Current answer: not fully today.
-
-Why:
-
-- package metadata authority is still snapshot-based (`state.json` / shared snapshot object).
-- token/session/user records are persisted in the same state model (unless external auth mode is used, where local auth routes are disabled).
-
-What external auth mode changes:
-
-- local user/token/profile flows are disabled, reducing auth-state reliance.
-- package metadata state is still required for publish/dist-tags/attachments/owner-star metadata and registry responses.
-
-Path to fully stateless registry nodes:
-
-- move package metadata and auth/session/token records to external transactional stores.
-- keep tarball blobs in object storage.
-- make each request resolve metadata from external state stores or a strongly coherent cache layer.
 
 Operational diagnostics:
 
@@ -828,39 +812,31 @@ Response includes:
 
 This rebuilds package metadata from backend tarballs/sidecars and can repair many drift cases.
 
-### Snapshot recovery behavior
-
-- On startup in S3 mode, rustaccio attempts to load shared snapshot first and mirrors it to local `state.json`.
-- If shared snapshot is unavailable, it falls back to local snapshot and hydrates from backend listing.
-- Reindex can be re-run at any time after backend restoration.
-
 ### What cannot be reconstructed from tarballs alone
 
-- `users`, `auth_tokens`, `npm_tokens`, and `login_sessions` are snapshot data.
-- If snapshot is lost and no backup exists, those auth/session records are not recoverable from tarball blobs.
+- `users`, `auth_tokens`, `npm_tokens`, and `login_sessions` are local auth/session state.
+- If local `state.json` is lost and no backup exists, those records are not recoverable from tarball blobs.
 
 ### Recommended backup strategy
 
-- Back up snapshot (`state.json` local and shared snapshot object in S3 mode).
-- Back up all tarball objects.
+- Back up local `state.json` for auth/session records.
+- Back up all tarball objects and package sidecars.
 - For governance:
   - back up Postgres quota tables
   - persist Redis if you require durable counters across restarts (optional by policy)
 
 ## Scalability Characteristics
 
-Current architecture scales well for many package blobs, but metadata authority is still snapshot-centric.
-
 What scales today:
 
 - Object-store tarballs (`s3`) and sidecars.
-- Horizontal read/write nodes using shared snapshot mode.
+- Horizontal read/write nodes with shared object storage.
 - Distributed rate limiting (Redis) and quota accounting (Postgres).
 
 Current bottlenecks/limits:
 
-- Snapshot metadata is still coarse-grained (whole-state file persistence).
-- Multi-node concurrent snapshot writes are not protected by distributed optimistic concurrency.
+- Metadata writes are still not transactional across tarball + sidecar artifacts.
+- Sidecar conflict resolution remains optimistic at application level.
 
 Recommended evolution for high-scale managed deployments:
 

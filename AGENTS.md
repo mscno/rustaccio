@@ -74,10 +74,13 @@ Rustaccio has two valid operating modes. Agents must preserve both.
 1. `self-hosted / self-managed` mode:
    - Must run with local/simple defaults only.
    - No external infra required (no Redis, no Postgres, no OTel collector, no external policy service).
+   - Default package metadata authority remains snapshot-based:
+     - `RUSTACCIO_PACKAGE_METADATA_AUTHORITY=snapshot`
    - Memory/local backends must remain first-class:
      - `RUSTACCIO_RATE_LIMIT_BACKEND=none|memory`
      - `RUSTACCIO_QUOTA_BACKEND=none|memory`
      - `RUSTACCIO_POLICY_BACKEND=local`
+     - `RUSTACCIO_STATE_COORDINATION_BACKEND=none`
      - `RUSTACCIO_MANAGED_MODE=false`
    - Do not force strict guardrails in this mode.
 
@@ -85,14 +88,19 @@ Rustaccio has two valid operating modes. Agents must preserve both.
    - Enabled via `RUSTACCIO_MANAGED_MODE=true`.
    - Stricter guardrails are expected and enforced.
    - External backends (Redis/Postgres/OTel/policy service) are opt-in, not implicit defaults.
+   - Package metadata can run in sidecar-authoritative mode:
+     - `RUSTACCIO_PACKAGE_METADATA_AUTHORITY=sidecar`
+   - State coordination is still opt-in and can be configured via:
+     - `RUSTACCIO_STATE_COORDINATION_BACKEND=none|redis|s3`
 
 ### Mode-Safety Requirements for Changes
 
 1. Any change touching auth/admin/policy/governance/storage must not regress simple mode behavior.
 2. Managed-mode safeguards must be additive and explicitly gated behind config/env/feature flags.
 3. Never make Redis/Postgres/OTel/policy dependencies mandatory for core startup.
-4. Document mode impacts in `README.md` when behavior/config changes.
-5. Add/update tests to cover both:
+4. Never make `sidecar` metadata authority the implicit default; it must remain opt-in.
+5. Document mode impacts in `README.md` when behavior/config changes.
+6. Add/update tests to cover both:
    - simple local path
    - managed/strict path when relevant
 

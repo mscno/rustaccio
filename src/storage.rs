@@ -82,23 +82,14 @@ impl Store {
         config: &Config,
         options: StoreOptions,
     ) -> Result<Self, RegistryError> {
+        Self::ensure_sidecar_metadata_authority()?;
         tokio::fs::create_dir_all(&config.data_dir).await?;
         let tarball_backend = TarballBackend::from_config(config).await?;
         let state_coordinator = StateWriteCoordinator::from_env().await?;
 
         let state_file = config.data_dir.join("state.json");
-        let mut state = if tarball_backend.supports_shared_state_snapshot() {
-            if let Some(remote) = Self::read_shared_state_snapshot(&tarball_backend).await? {
-                Self::write_local_snapshot(&state_file, &remote).await?;
-                remote
-            } else {
-                Self::read_local_snapshot(&state_file).await?
-            }
-        } else {
-            Self::read_local_snapshot(&state_file).await?
-        };
-        let pruned_legacy_uplink_cache_entries =
-            Self::prune_legacy_uplink_snapshot_entries(&mut state);
+        let mut state = Self::read_local_snapshot(&state_file).await?;
+        state.packages.clear();
 
         let auth_plugin = match config.auth_plugin.backend {
             AuthBackend::Local => None,
@@ -113,9 +104,6 @@ impl Store {
             }
         };
 
-        let reindexed_from_backend =
-            Self::hydrate_from_tarball_backend(&mut state, &tarball_backend).await?;
-
         let store = Self {
             state: RwLock::new(state),
             state_file,
@@ -126,13 +114,7 @@ impl Store {
             password_min_length: config.password_min_length,
             login_session_ttl_seconds: config.login_session_ttl_seconds,
         };
-        if reindexed_from_backend || pruned_legacy_uplink_cache_entries > 0 {
-            store.persist_state().await?;
-        }
-        debug!(
-            reindexed_from_backend,
-            pruned_legacy_uplink_cache_entries, "store initialized"
-        );
+        debug!("store initialized");
         Ok(store)
     }
 
@@ -140,8 +122,47 @@ impl Store {
         Utc::now().timestamp_millis()
     }
 
+    fn ensure_sidecar_metadata_authority() -> Result<(), RegistryError> {
+        let Some(raw) = std::env::var("RUSTACCIO_PACKAGE_METADATA_AUTHORITY").ok() else {
+            return Ok(());
+        };
+        let normalized = raw.trim().to_ascii_lowercase();
+        if matches!(
+            normalized.as_str(),
+            "" | "sidecar" | "sidecar_authoritative" | "sidecar-authoritative"
+        ) {
+            return Ok(());
+        }
+        Err(RegistryError::http(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "RUSTACCIO_PACKAGE_METADATA_AUTHORITY={raw} is unsupported; only `sidecar` is valid"
+            ),
+        ))
+    }
+
     fn now_http() -> String {
         Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+    }
+
+    fn package_lock_scope(package_name: &str) -> String {
+        format!("package:{package_name}")
+    }
+
+    async fn run_package_exclusive<T, F, Fut>(
+        &self,
+        package_name: &str,
+        operation_name: &str,
+        operation: F,
+    ) -> Result<T, RegistryError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T, RegistryError>>,
+    {
+        let scope = Self::package_lock_scope(package_name);
+        self.state_coordinator
+            .run_exclusive_scoped(&scope, operation_name, operation)
+            .await
     }
 
     async fn hydrate_from_tarball_backend(
@@ -619,27 +640,6 @@ impl Store {
         }
     }
 
-    async fn read_shared_state_snapshot(
-        tarball_backend: &TarballBackend,
-    ) -> Result<Option<PersistedState>, RegistryError> {
-        let Some(bytes) = tarball_backend.load_shared_state_snapshot().await? else {
-            return Ok(None);
-        };
-        if bytes.is_empty() {
-            return Ok(Some(PersistedState::default()));
-        }
-        let snapshot = serde_json::from_slice::<PersistedState>(&bytes)?;
-        Ok(Some(snapshot))
-    }
-
-    async fn write_local_snapshot(
-        state_file: &Path,
-        snapshot: &PersistedState,
-    ) -> Result<(), RegistryError> {
-        let bytes = serde_json::to_vec_pretty(snapshot)?;
-        Self::write_local_snapshot_bytes(state_file, &bytes).await
-    }
-
     async fn write_local_snapshot_bytes(
         state_file: &Path,
         bytes: &[u8],
@@ -652,36 +652,199 @@ impl Store {
 
     async fn persist_state(&self) -> Result<(), RegistryError> {
         self.state_coordinator
-            .run_exclusive("persist_state", || async {
+            .run_exclusive_scoped("state", "persist_state", || async {
                 let bytes = {
                     let state = self.state.read().await;
                     Self::serialize_persisted_state(&state)?
                 };
                 Self::write_local_snapshot_bytes(&self.state_file, &bytes).await?;
-                if self.tarball_backend.supports_shared_state_snapshot() {
-                    self.tarball_backend
-                        .save_shared_state_snapshot(&bytes)
-                        .await?;
-                }
                 Ok(())
             })
             .await
     }
 
     fn serialize_persisted_state(state: &PersistedState) -> Result<Vec<u8>, RegistryError> {
-        let packages = state
-            .packages
-            .iter()
-            .filter(|(_, record)| !record.cached_from_uplink)
-            .collect::<HashMap<_, _>>();
         let view = PersistedStateView {
             users: &state.users,
             auth_tokens: &state.auth_tokens,
             npm_tokens: &state.npm_tokens,
             login_sessions: &state.login_sessions,
-            packages,
+            packages: HashMap::new(),
         };
         Ok(serde_json::to_vec_pretty(&view)?)
+    }
+
+    async fn load_authoritative_package_record(
+        &self,
+        package_name: &str,
+    ) -> Result<Option<PackageRecord>, RegistryError> {
+        let package_metadata = self
+            .tarball_backend
+            .read_package_metadata(package_name)
+            .await?;
+        let tarball_files = self
+            .tarball_backend
+            .list_package_tarballs(package_name)
+            .await?;
+        let mut tarballs = Vec::new();
+        for filename in tarball_files {
+            let Some(version) = Self::infer_version_from_filename(&filename) else {
+                continue;
+            };
+            tarballs.push((filename, version));
+        }
+
+        if package_metadata.is_none() && tarballs.is_empty() {
+            return Ok(None);
+        }
+
+        let now_rfc3339 = Utc::now().to_rfc3339();
+        let mut manifest = package_metadata
+            .clone()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| {
+                Value::Object(Self::inferred_manifest_shell(package_name, &now_rfc3339))
+            });
+        let Some(manifest_obj) = manifest.as_object_mut() else {
+            return Ok(None);
+        };
+
+        if manifest_obj.get("_id").and_then(Value::as_str) != Some(package_name) {
+            manifest_obj.insert("_id".to_string(), Value::String(package_name.to_string()));
+        }
+        if manifest_obj.get("name").and_then(Value::as_str) != Some(package_name) {
+            manifest_obj.insert("name".to_string(), Value::String(package_name.to_string()));
+        }
+        if !manifest_obj.contains_key("_rev") {
+            manifest_obj.insert("_rev".to_string(), Value::String(Self::initial_revision()));
+        }
+        if let Some(metadata) = package_metadata.as_ref() {
+            let _ = Self::merge_startup_manifest_metadata(manifest_obj, metadata, package_name);
+        }
+
+        {
+            let versions = Self::ensure_object_field(manifest_obj, "versions");
+            for (filename, version) in &tarballs {
+                let payload = versions
+                    .entry(version.clone())
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if !payload.is_object() {
+                    *payload = Value::Object(Map::new());
+                }
+                if let Some(sidecar_version) =
+                    Self::startup_metadata_for_version(package_metadata.as_ref(), version)
+                    && let (Some(target), Some(source)) =
+                        (payload.as_object_mut(), sidecar_version.as_object())
+                {
+                    for (key, value) in source {
+                        target.entry(key.clone()).or_insert_with(|| value.clone());
+                    }
+                }
+                if let Some(target) = payload.as_object_mut() {
+                    let expected_id = format!("{package_name}@{version}");
+                    target
+                        .entry("_id".to_string())
+                        .or_insert_with(|| Value::String(expected_id));
+                    target
+                        .entry("name".to_string())
+                        .or_insert_with(|| Value::String(package_name.to_string()));
+                    target
+                        .entry("version".to_string())
+                        .or_insert_with(|| Value::String(version.clone()));
+                    let expected_tarball = Self::inferred_tarball_url(package_name, filename);
+                    let dist = target
+                        .entry("dist".to_string())
+                        .or_insert_with(|| Value::Object(Map::new()));
+                    if !dist.is_object() {
+                        *dist = Value::Object(Map::new());
+                    }
+                    if let Some(dist_obj) = dist.as_object_mut() {
+                        dist_obj.insert("tarball".to_string(), Value::String(expected_tarball));
+                    }
+                }
+            }
+        }
+
+        let attachments = Self::ensure_object_field(manifest_obj, "_attachments");
+        for (filename, version) in &tarballs {
+            let expected_attachment = json!({ "version": version });
+            attachments
+                .entry(filename.clone())
+                .or_insert(expected_attachment);
+        }
+
+        let version_keys = manifest_obj
+            .get("versions")
+            .and_then(Value::as_object)
+            .map(|versions| versions.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let latest_version = manifest_obj
+            .get("versions")
+            .and_then(Value::as_object)
+            .and_then(Self::select_latest_version);
+        let dist_tags = Self::ensure_object_field(manifest_obj, "dist-tags");
+        let latest_valid = dist_tags
+            .get("latest")
+            .and_then(Value::as_str)
+            .is_some_and(|tag| version_keys.iter().any(|version| version == tag));
+        if !latest_valid && let Some(latest) = latest_version {
+            dist_tags.insert("latest".to_string(), Value::String(latest));
+        }
+
+        if !manifest_obj
+            .get("maintainers")
+            .is_some_and(serde_json::Value::is_array)
+        {
+            manifest_obj.insert("maintainers".to_string(), Value::Array(Vec::new()));
+        }
+        if !manifest_obj
+            .get("users")
+            .is_some_and(serde_json::Value::is_object)
+        {
+            manifest_obj.insert("users".to_string(), Value::Object(Map::new()));
+        }
+        let time = Self::ensure_object_field(manifest_obj, "time");
+        if !time.contains_key("created") {
+            time.insert("created".to_string(), Value::String(now_rfc3339.clone()));
+        }
+        for version in version_keys {
+            if !time.contains_key(&version) {
+                time.insert(version, Value::String(now_rfc3339.clone()));
+            }
+        }
+        if !time.contains_key("modified") {
+            time.insert("modified".to_string(), Value::String(now_rfc3339));
+        }
+
+        Ok(Some(PackageRecord {
+            manifest,
+            upstream_tarballs: HashMap::new(),
+            updated_at: Self::now_ms(),
+            cached_from_uplink: false,
+        }))
+    }
+
+    async fn refresh_package_from_authority_cache(
+        &self,
+        package_name: &str,
+    ) -> Result<(), RegistryError> {
+        let authoritative = self.load_authoritative_package_record(package_name).await?;
+        let mut state = self.state.write().await;
+        match authoritative {
+            Some(record) => {
+                state.packages.insert(package_name.to_string(), record);
+            }
+            None => {
+                let keep_uplink = state
+                    .packages
+                    .get(package_name)
+                    .is_some_and(|record| record.cached_from_uplink);
+                if !keep_uplink {
+                    state.packages.remove(package_name);
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn sync_all_package_sidecars(&self) -> Result<usize, RegistryError> {
@@ -721,20 +884,6 @@ impl Store {
             .await
     }
 
-    fn prune_legacy_uplink_snapshot_entries(state: &mut PersistedState) -> usize {
-        let before = state.packages.len();
-        state.packages.retain(|_, record| {
-            let attachments_empty = record
-                .manifest
-                .get("_attachments")
-                .and_then(Value::as_object)
-                .is_none_or(|attachments| attachments.is_empty());
-            let looks_like_uplink_cache = attachments_empty && !record.upstream_tarballs.is_empty();
-            !looks_like_uplink_cache
-        });
-        before.saturating_sub(state.packages.len())
-    }
-
     async fn write_tarball_file(
         &self,
         package: &str,
@@ -753,8 +902,17 @@ impl Store {
     }
 
     pub async fn is_known_package(&self, package: &str) -> bool {
-        let state = self.state.read().await;
-        state.packages.contains_key(package)
+        {
+            let state = self.state.read().await;
+            if state.packages.contains_key(package) {
+                return true;
+            }
+        }
+        self.load_authoritative_package_record(package)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     pub async fn username_from_auth_token(&self, token: &str) -> Option<String> {
@@ -1440,6 +1598,21 @@ impl Store {
         body: Value,
         username: &str,
     ) -> Result<String, RegistryError> {
+        self.run_package_exclusive(package_name, "publish_manifest", || async {
+            self.refresh_package_from_authority_cache(package_name)
+                .await?;
+            self.publish_manifest_inner(package_name, body, username)
+                .await
+        })
+        .await
+    }
+
+    async fn publish_manifest_inner(
+        &self,
+        package_name: &str,
+        body: Value,
+        username: &str,
+    ) -> Result<String, RegistryError> {
         let is_owner_or_star_update = body.get("versions").is_none()
             && (body.get("users").is_some() || body.get("maintainers").is_some());
 
@@ -1464,7 +1637,6 @@ impl Store {
                 record.cached_from_uplink = false;
             }
 
-            self.persist_state().await?;
             self.sync_package_sidecar(package_name).await?;
             debug!("updated package owner/star metadata");
             return Ok(API_MESSAGE_PKG_CHANGED.to_string());
@@ -1530,7 +1702,6 @@ impl Store {
                 record.cached_from_uplink = false;
             }
 
-            self.persist_state().await?;
             self.sync_package_sidecar(package_name).await?;
             debug!("applied metadata-only publish update");
             return Ok(API_MESSAGE_PKG_CHANGED.to_string());
@@ -1670,7 +1841,6 @@ impl Store {
             message
         };
 
-        self.persist_state().await?;
         self.sync_package_sidecar(package_name).await?;
         debug!(message = message.as_str(), "published package manifest");
         Ok(message)
@@ -1678,6 +1848,15 @@ impl Store {
 
     #[instrument(skip(self), fields(package = package_name))]
     pub async fn remove_package(&self, package_name: &str) -> Result<String, RegistryError> {
+        self.run_package_exclusive(package_name, "remove_package", || async {
+            self.refresh_package_from_authority_cache(package_name)
+                .await?;
+            self.remove_package_inner(package_name).await
+        })
+        .await
+    }
+
+    async fn remove_package_inner(&self, package_name: &str) -> Result<String, RegistryError> {
         {
             let state = self.state.read().await;
             if !state.packages.contains_key(package_name) {
@@ -1700,13 +1879,25 @@ impl Store {
             }
         }
 
-        self.persist_state().await?;
         debug!("removed package");
         Ok(API_MESSAGE_PKG_REMOVED.to_string())
     }
 
     #[instrument(skip(self), fields(package = package_name, filename))]
     pub async fn remove_tarball(
+        &self,
+        package_name: &str,
+        filename: &str,
+    ) -> Result<String, RegistryError> {
+        self.run_package_exclusive(package_name, "remove_tarball", || async {
+            self.refresh_package_from_authority_cache(package_name)
+                .await?;
+            self.remove_tarball_inner(package_name, filename).await
+        })
+        .await
+    }
+
+    async fn remove_tarball_inner(
         &self,
         package_name: &str,
         filename: &str,
@@ -1786,13 +1977,26 @@ impl Store {
             record.updated_at = Self::now_ms();
         }
 
-        self.persist_state().await?;
         self.sync_package_sidecar(package_name).await?;
         debug!("removed tarball");
         Ok(API_MESSAGE_TARBALL_REMOVED.to_string())
     }
 
     pub async fn merge_dist_tag(
+        &self,
+        package_name: &str,
+        tag: &str,
+        version: Option<&str>,
+    ) -> Result<String, RegistryError> {
+        self.run_package_exclusive(package_name, "merge_dist_tag", || async {
+            self.refresh_package_from_authority_cache(package_name)
+                .await?;
+            self.merge_dist_tag_inner(package_name, tag, version).await
+        })
+        .await
+    }
+
+    async fn merge_dist_tag_inner(
         &self,
         package_name: &str,
         tag: &str,
@@ -1825,14 +2029,12 @@ impl Store {
             response.to_string()
         };
 
-        self.persist_state().await?;
         self.sync_package_sidecar(package_name).await?;
         Ok(response)
     }
 
     pub async fn dist_tags(&self, package_name: &str) -> Result<Value, RegistryError> {
-        let state = self.state.read().await;
-        let Some(record) = state.packages.get(package_name) else {
+        let Some(record) = self.get_package_record(package_name).await else {
             return Err(RegistryError::http(
                 StatusCode::NOT_FOUND,
                 API_ERROR_NO_PACKAGE,
@@ -1847,8 +2049,27 @@ impl Store {
     }
 
     pub async fn get_package_record(&self, package_name: &str) -> Option<PackageRecord> {
-        let state = self.state.read().await;
-        state.packages.get(package_name).cloned()
+        {
+            let state = self.state.read().await;
+            if let Some(record) = state.packages.get(package_name)
+                && record.cached_from_uplink
+            {
+                return Some(record.clone());
+            }
+        }
+
+        let authoritative = self
+            .load_authoritative_package_record(package_name)
+            .await
+            .ok()
+            .flatten()?;
+        {
+            let mut state = self.state.write().await;
+            state
+                .packages
+                .insert(package_name.to_string(), authoritative.clone());
+        }
+        Some(authoritative)
     }
 
     #[instrument(skip(self, manifest, upstream_tarballs), fields(package = package_name, upstream_tarball_count = upstream_tarballs.len()))]
@@ -1906,13 +2127,17 @@ impl Store {
     }
 
     pub async fn all_packages(&self) -> Vec<PackageRecord> {
-        let state = self.state.read().await;
-        state
-            .packages
-            .values()
-            .filter(|record| !record.cached_from_uplink)
-            .cloned()
-            .collect()
+        let mut records = Vec::new();
+        if let Ok(packages) = self.tarball_backend.list_packages().await {
+            for package_name in packages {
+                if let Ok(Some(record)) =
+                    self.load_authoritative_package_record(&package_name).await
+                {
+                    records.push(record);
+                }
+            }
+        }
+        records
     }
 
     pub async fn reindex_from_backend(&self) -> Result<Value, RegistryError> {
@@ -1924,9 +2149,6 @@ impl Store {
             let after_packages = state.packages.len();
             (changed, before_packages, after_packages)
         };
-        if changed {
-            self.persist_state().await?;
-        }
         let sidecars_synced = if changed {
             self.sync_all_package_sidecars().await?
         } else {
@@ -1976,33 +2198,33 @@ impl Store {
             }
         }
 
-        let (state_package_set, state_attachments) = {
-            let state = self.state.read().await;
-            let mut packages = HashSet::new();
-            let mut attachments: HashMap<String, HashSet<String>> = HashMap::new();
-            for (package, record) in &state.packages {
-                if record.cached_from_uplink {
-                    continue;
-                }
-                packages.insert(package.clone());
-                let filenames = record
-                    .manifest
-                    .get("_attachments")
-                    .and_then(Value::as_object)
-                    .map(|object| {
-                        object
-                            .keys()
-                            .filter(|filename| {
-                                Self::infer_version_from_filename(filename).is_some()
-                            })
-                            .cloned()
-                            .collect::<HashSet<_>>()
-                    })
-                    .unwrap_or_default();
-                attachments.insert(package.clone(), filenames);
-            }
-            (packages, attachments)
-        };
+        let local_packages = self.all_packages().await;
+        let mut state_package_set = HashSet::new();
+        let mut state_attachments: HashMap<String, HashSet<String>> = HashMap::new();
+        for record in local_packages {
+            let Some(package_name) = record
+                .manifest
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            state_package_set.insert(package_name.clone());
+            let filenames = record
+                .manifest
+                .get("_attachments")
+                .and_then(Value::as_object)
+                .map(|object| {
+                    object
+                        .keys()
+                        .filter(|filename| Self::infer_version_from_filename(filename).is_some())
+                        .cloned()
+                        .collect::<HashSet<_>>()
+                })
+                .unwrap_or_default();
+            state_attachments.insert(package_name, filenames);
+        }
 
         let mut tarballs_without_sidecar = backend_tarballs
             .keys()
@@ -2077,9 +2299,8 @@ impl Store {
     }
 
     pub async fn starred_packages(&self, user_key: &str) -> Vec<String> {
-        let state = self.state.read().await;
         let mut rows = Vec::new();
-        for record in state.packages.values() {
+        for record in self.all_packages().await {
             let Some(name) = record
                 .manifest
                 .get("name")
@@ -2628,10 +2849,10 @@ mod tests {
 
         let state_file = data_dir.join("state.json");
         assert!(
-            tokio::fs::try_exists(&state_file)
+            !tokio::fs::try_exists(&state_file)
                 .await
                 .expect("state file existence"),
-            "startup hydration should persist state"
+            "package metadata discovery should not write state.json"
         );
     }
 

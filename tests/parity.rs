@@ -1119,7 +1119,7 @@ async fn tarball_uses_local_cache_after_first_upstream_fetch() {
 }
 
 #[tokio::test]
-async fn upstream_cached_packages_are_not_persisted_in_snapshot() {
+async fn upstream_cached_packages_are_not_persisted_in_local_state() {
     let upstream = MockServer::start().await;
     let upstream_manifest = json!({
         "_id": "upstream-only",
@@ -1159,14 +1159,14 @@ async fn upstream_cached_packages_are_not_persisted_in_snapshot() {
     {
         let bytes = tokio::fs::read(&state_file).await.expect("read state");
         if !bytes.is_empty() {
-            let snapshot: Value = serde_json::from_slice(&bytes).expect("parse state");
-            let persisted = snapshot
+            let state_json: Value = serde_json::from_slice(&bytes).expect("parse state");
+            let persisted = state_json
                 .get("packages")
                 .and_then(Value::as_object)
                 .and_then(|packages| packages.get("upstream-only"));
             assert!(
                 persisted.is_none(),
-                "upstream cache entries should stay runtime-only and never persist in snapshot"
+                "upstream cache entries should stay runtime-only and never persist in state.json"
             );
         }
     }
@@ -2122,7 +2122,7 @@ async fn unpublish_and_search_shape_edges() {
 }
 
 #[tokio::test]
-async fn remove_package_failure_keeps_state_when_backend_delete_fails() {
+async fn remove_package_returns_not_found_when_authoritative_package_state_is_missing() {
     let dir = TempDir::new().expect("dir");
     let app = test_app(dir.path().to_path_buf(), None).await;
     let token = create_user(&app, "delete-fail", "secret").await;
@@ -2152,7 +2152,7 @@ async fn remove_package_failure_keeps_state_when_backend_delete_fails() {
         .body(Body::empty())
         .expect("request");
     let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     let req = Request::builder()
         .method(Method::GET)
@@ -2160,9 +2160,7 @@ async fn remove_package_failure_keeps_state_when_backend_delete_fails() {
         .body(Body::empty())
         .expect("request");
     let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = json_body(resp).await;
-    assert_eq!(body["name"].as_str(), Some("delete-fail"));
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -3464,132 +3462,6 @@ fn npm_tarball_with_package_json(package_json: &Value) -> Vec<u8> {
 
 #[tokio::test]
 #[cfg(feature = "s3")]
-async fn s3_mode_loads_shared_state_snapshot() {
-    let s3 = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(|request: &wiremock::Request| {
-            request.url.path().starts_with("/registry-test")
-                && request
-                    .url
-                    .query_pairs()
-                    .any(|(k, v)| k == "list-type" && v == "2")
-        })
-        .respond_with(ResponseTemplate::new(200).set_body_string(empty_s3_list_xml()))
-        .mount(&s3)
-        .await;
-
-    let remote_state = json!({
-        "users": {},
-        "auth_tokens": {},
-        "npm_tokens": [],
-        "login_sessions": {},
-        "packages": {
-            "from-s3": {
-                "manifest": {
-                    "_id": "from-s3",
-                    "name": "from-s3",
-                    "dist-tags": { "latest": "1.0.0" },
-                    "versions": {
-                        "1.0.0": {
-                            "name": "from-s3",
-                            "version": "1.0.0",
-                            "dist": {
-                                "tarball": "https://registry.example/from-s3/-/from-s3-1.0.0.tgz"
-                            }
-                        }
-                    }
-                },
-                "upstream_tarballs": {},
-                "updated_at": 1
-            }
-        }
-    });
-    Mock::given(method("GET"))
-        .and(|request: &wiremock::Request| {
-            request.url.path().starts_with("/registry-test/")
-                && request.url.path().contains("__rustaccio_meta")
-                && request.url.path().ends_with("state.json")
-        })
-        .respond_with(ResponseTemplate::new(200).set_body_json(remote_state))
-        .mount(&s3)
-        .await;
-
-    let dir = TempDir::new().expect("dir");
-    let cfg = s3_test_config(dir.path().to_path_buf(), s3.uri());
-    let store = Store::open(&cfg).await.expect("store");
-    assert!(
-        store.get_package_record("from-s3").await.is_some(),
-        "store should bootstrap package metadata from S3 shared snapshot"
-    );
-
-    let local_state_file = dir.path().join("state.json");
-    assert!(
-        tokio::fs::try_exists(local_state_file)
-            .await
-            .expect("state file existence"),
-        "S3-loaded snapshot should be mirrored to local state.json"
-    );
-}
-
-#[tokio::test]
-#[cfg(feature = "s3")]
-async fn s3_mode_persists_shared_state_snapshot_on_mutation() {
-    let s3 = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(|request: &wiremock::Request| {
-            request.url.path().starts_with("/registry-test")
-                && request
-                    .url
-                    .query_pairs()
-                    .any(|(k, v)| k == "list-type" && v == "2")
-        })
-        .respond_with(ResponseTemplate::new(200).set_body_string(empty_s3_list_xml()))
-        .mount(&s3)
-        .await;
-    Mock::given(method("GET"))
-        .and(|request: &wiremock::Request| {
-            request.url.path().starts_with("/registry-test/")
-                && request.url.path().contains("__rustaccio_meta")
-                && request.url.path().ends_with("state.json")
-        })
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&s3)
-        .await;
-    Mock::given(method("PUT"))
-        .and(|request: &wiremock::Request| {
-            request.url.path().starts_with("/registry-test/")
-                && request.url.path().contains("__rustaccio_meta")
-                && request.url.path().ends_with("state.json")
-        })
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&s3)
-        .await;
-
-    let dir = TempDir::new().expect("dir");
-    let cfg = s3_test_config(dir.path().to_path_buf(), s3.uri());
-    let store = Store::open(&cfg).await.expect("store");
-    let _token = store
-        .create_user("s3-user", "secret")
-        .await
-        .expect("create user");
-
-    let requests = s3.received_requests().await.expect("received requests");
-    let put_seen = requests.iter().any(|request| {
-        request.method.as_str() == "PUT"
-            && request.url.path().starts_with("/registry-test/")
-            && request.url.path().contains("__rustaccio_meta")
-            && request.url.path().ends_with("state.json")
-    });
-    assert!(
-        put_seen,
-        "mutations should persist a shared state snapshot back to S3"
-    );
-}
-
-#[tokio::test]
-#[cfg(feature = "s3")]
 async fn s3_mode_writes_verdaccio_package_sidecar_on_publish() {
     let s3 = MockServer::start().await;
 
@@ -3602,24 +3474,6 @@ async fn s3_mode_writes_verdaccio_package_sidecar_on_publish() {
                     .any(|(k, v)| k == "list-type" && v == "2")
         })
         .respond_with(ResponseTemplate::new(200).set_body_string(empty_s3_list_xml()))
-        .mount(&s3)
-        .await;
-    Mock::given(method("GET"))
-        .and(|request: &wiremock::Request| {
-            request.url.path().starts_with("/registry-test/")
-                && request.url.path().contains("__rustaccio_meta")
-                && request.url.path().ends_with("state.json")
-        })
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&s3)
-        .await;
-    Mock::given(method("PUT"))
-        .and(|request: &wiremock::Request| {
-            request.url.path().starts_with("/registry-test/")
-                && request.url.path().contains("__rustaccio_meta")
-                && request.url.path().ends_with("state.json")
-        })
-        .respond_with(ResponseTemplate::new(200))
         .mount(&s3)
         .await;
     Mock::given(method("PUT"))
@@ -3683,24 +3537,6 @@ async fn s3_mode_put_rev_unpublish_rewrites_sidecar_and_deletes_tarball_blob() {
                     .any(|(k, v)| k == "list-type" && v == "2")
         })
         .respond_with(ResponseTemplate::new(200).set_body_string(empty_s3_list_xml()))
-        .mount(&s3)
-        .await;
-    Mock::given(method("GET"))
-        .and(|request: &wiremock::Request| {
-            request.url.path().starts_with("/registry-test/")
-                && request.url.path().contains("__rustaccio_meta")
-                && request.url.path().ends_with("state.json")
-        })
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&s3)
-        .await;
-    Mock::given(method("PUT"))
-        .and(|request: &wiremock::Request| {
-            request.url.path().starts_with("/registry-test/")
-                && request.url.path().contains("__rustaccio_meta")
-                && request.url.path().ends_with("state.json")
-        })
-        .respond_with(ResponseTemplate::new(200))
         .mount(&s3)
         .await;
     Mock::given(method("PUT"))
@@ -3840,7 +3676,7 @@ async fn s3_mode_put_rev_unpublish_rewrites_sidecar_and_deletes_tarball_blob() {
 
 #[tokio::test]
 #[cfg(feature = "s3")]
-async fn s3_mode_indexes_tarballs_without_snapshot_for_search_and_browse() {
+async fn s3_mode_indexes_tarballs_for_search_and_browse_without_state_seed() {
     let s3 = MockServer::start().await;
     let tarball_key = "registry/s3-scan/s3-scan-1.2.3.tgz";
 
@@ -3853,14 +3689,6 @@ async fn s3_mode_indexes_tarballs_without_snapshot_for_search_and_browse() {
                     .any(|(k, v)| k == "list-type" && v == "2")
         })
         .respond_with(ResponseTemplate::new(200).set_body_string(s3_list_xml(&[tarball_key])))
-        .mount(&s3)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(|request: &wiremock::Request| {
-            request.url.path().contains("__rustaccio_meta/state.json")
-        })
-        .respond_with(ResponseTemplate::new(404))
         .mount(&s3)
         .await;
 
@@ -3881,14 +3709,6 @@ async fn s3_mode_indexes_tarballs_without_snapshot_for_search_and_browse() {
     Mock::given(method("GET"))
         .and(|request: &wiremock::Request| request.url.path().contains("s3-scan/package.json"))
         .respond_with(ResponseTemplate::new(200).set_body_json(package_sidecar))
-        .mount(&s3)
-        .await;
-
-    Mock::given(method("PUT"))
-        .and(|request: &wiremock::Request| {
-            request.url.path().contains("__rustaccio_meta/state.json")
-        })
-        .respond_with(ResponseTemplate::new(200))
         .mount(&s3)
         .await;
 
@@ -3946,14 +3766,6 @@ async fn s3_mode_prefers_package_sidecar_metadata_over_startup_tarball_downloads
         .mount(&s3)
         .await;
 
-    Mock::given(method("GET"))
-        .and(|request: &wiremock::Request| {
-            request.url.path().contains("__rustaccio_meta/state.json")
-        })
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&s3)
-        .await;
-
     let package_sidecar = json!({
         "_id": package,
         "name": package,
@@ -3989,14 +3801,6 @@ async fn s3_mode_prefers_package_sidecar_metadata_over_startup_tarball_downloads
                 .contains("maplibre-geoman-free-0.4.9.tgz")
         })
         .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tgz-0.4.9".to_vec()))
-        .mount(&s3)
-        .await;
-
-    Mock::given(method("PUT"))
-        .and(|request: &wiremock::Request| {
-            request.url.path().contains("__rustaccio_meta/state.json")
-        })
-        .respond_with(ResponseTemplate::new(200))
         .mount(&s3)
         .await;
 
@@ -4058,14 +3862,6 @@ async fn s3_mode_indexes_verdaccio_scoped_dash_layout_tarballs() {
         .mount(&s3)
         .await;
 
-    Mock::given(method("GET"))
-        .and(|request: &wiremock::Request| {
-            request.url.path().contains("__rustaccio_meta/state.json")
-        })
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&s3)
-        .await;
-
     let tarball = npm_tarball_with_package_json(&json!({
         "name": "@geoman-io/leaflet-geoman-free",
         "version": "1.0.0",
@@ -4076,14 +3872,6 @@ async fn s3_mode_indexes_verdaccio_scoped_dash_layout_tarballs() {
             request.url.path().contains("leaflet-geoman-free-1.0.0.tgz")
         })
         .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball))
-        .mount(&s3)
-        .await;
-
-    Mock::given(method("PUT"))
-        .and(|request: &wiremock::Request| {
-            request.url.path().contains("__rustaccio_meta/state.json")
-        })
-        .respond_with(ResponseTemplate::new(200))
         .mount(&s3)
         .await;
 

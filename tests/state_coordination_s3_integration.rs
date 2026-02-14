@@ -1,10 +1,14 @@
-#![cfg(feature = "redis")]
+#![cfg(feature = "s3")]
 
+use aws_sdk_s3::{
+    Client as S3Client,
+    config::{Builder as S3ConfigBuilder, Credentials, Region},
+    error::ProvideErrorMetadata,
+};
 use axum::{
     body::Body,
     http::{Method, Request, StatusCode, header},
 };
-use redis::aio::MultiplexedConnection;
 use rustaccio::{
     config::{AuthBackend, AuthPluginConfig, Config, TarballStorageBackend, TarballStorageConfig},
     runtime,
@@ -85,37 +89,75 @@ where
     result
 }
 
-fn redis_it_url() -> String {
-    std::env::var("RUSTACCIO_REDIS_IT_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:56379/".to_string())
+fn it_endpoint() -> String {
+    std::env::var("RUSTACCIO_S3_IT_ENDPOINT")
+        .unwrap_or_else(|_| "http://127.0.0.1:9002".to_string())
+}
+
+fn it_region() -> String {
+    std::env::var("RUSTACCIO_S3_IT_REGION").unwrap_or_else(|_| "us-east-1".to_string())
+}
+
+fn it_bucket() -> String {
+    std::env::var("RUSTACCIO_S3_IT_BUCKET").unwrap_or_else(|_| "rustaccio-it".to_string())
+}
+
+fn it_access_key() -> String {
+    std::env::var("RUSTACCIO_S3_IT_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".to_string())
+}
+
+fn it_secret_key() -> String {
+    std::env::var("RUSTACCIO_S3_IT_SECRET_KEY").unwrap_or_else(|_| "minioadmin".to_string())
+}
+
+async fn s3_client(endpoint: &str, region: &str, access_key: &str, secret_key: &str) -> S3Client {
+    let shared = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(Region::new(region.to_string()))
+        .credentials_provider(Credentials::new(
+            access_key.to_string(),
+            secret_key.to_string(),
+            None,
+            None,
+            "rustaccio-it",
+        ))
+        .load()
+        .await;
+
+    let conf = S3ConfigBuilder::from(&shared)
+        .endpoint_url(endpoint)
+        .force_path_style(true)
+        .build();
+    S3Client::from_conf(conf)
+}
+
+async fn wait_for_s3(client: &S3Client) {
+    for _ in 0..80 {
+        if client.list_buckets().send().await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("S3 endpoint was not reachable in time");
+}
+
+async fn ensure_bucket(client: &S3Client, bucket: &str) {
+    match client.create_bucket().bucket(bucket).send().await {
+        Ok(_) => {}
+        Err(err) => {
+            let code = err
+                .as_service_error()
+                .and_then(|service_err| service_err.code())
+                .unwrap_or_default();
+            if code != "BucketAlreadyOwnedByYou" && code != "BucketAlreadyExists" {
+                panic!("failed to create bucket `{bucket}`: {err}");
+            }
+        }
+    }
 }
 
 async fn app_with_env(cfg: &Config) -> axum::Router {
     let state = runtime::build_state(cfg, None).await.expect("state");
     rustaccio::app::build_router(state)
-}
-
-async fn redis_connection(redis_url: &str) -> MultiplexedConnection {
-    let client = redis::Client::open(redis_url).expect("redis url");
-    client
-        .get_multiplexed_async_connection()
-        .await
-        .expect("redis connection")
-}
-
-async fn wait_for_redis(redis_url: &str) {
-    for _ in 0..80 {
-        if let Ok(client) = redis::Client::open(redis_url)
-            && let Ok(mut conn) = client.get_multiplexed_async_connection().await
-        {
-            let ping = redis::cmd("PING").query_async::<String>(&mut conn).await;
-            if ping.is_ok() {
-                return;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    panic!("redis endpoint was not reachable in time");
 }
 
 async fn create_user(app: &axum::Router, username: &str) -> StatusCode {
@@ -131,15 +173,17 @@ async fn create_user(app: &axum::Router, username: &str) -> StatusCode {
 }
 
 #[tokio::test]
-async fn state_coordination_fail_open_allows_writes_when_backend_is_down() {
+async fn state_coordination_s3_fail_open_allows_writes_when_backend_is_down() {
     with_env(
         &[
             ("RUSTACCIO_RATE_LIMIT_BACKEND", Some("none")),
             ("RUSTACCIO_QUOTA_BACKEND", Some("none")),
-            ("RUSTACCIO_STATE_COORDINATION_BACKEND", Some("redis")),
+            ("RUSTACCIO_STATE_COORDINATION_BACKEND", Some("s3")),
+            ("RUSTACCIO_STATE_COORDINATION_S3_BUCKET", Some("unused")),
+            ("RUSTACCIO_STATE_COORDINATION_S3_REGION", Some("us-east-1")),
             (
-                "RUSTACCIO_STATE_COORDINATION_REDIS_URL",
-                Some("redis://127.0.0.1:1/"),
+                "RUSTACCIO_STATE_COORDINATION_S3_ENDPOINT",
+                Some("http://127.0.0.1:1"),
             ),
             ("RUSTACCIO_STATE_COORDINATION_FAIL_OPEN", Some("true")),
             (
@@ -159,15 +203,17 @@ async fn state_coordination_fail_open_allows_writes_when_backend_is_down() {
 }
 
 #[tokio::test]
-async fn state_coordination_fail_closed_rejects_writes_when_backend_is_down() {
+async fn state_coordination_s3_fail_closed_rejects_writes_when_backend_is_down() {
     with_env(
         &[
             ("RUSTACCIO_RATE_LIMIT_BACKEND", Some("none")),
             ("RUSTACCIO_QUOTA_BACKEND", Some("none")),
-            ("RUSTACCIO_STATE_COORDINATION_BACKEND", Some("redis")),
+            ("RUSTACCIO_STATE_COORDINATION_BACKEND", Some("s3")),
+            ("RUSTACCIO_STATE_COORDINATION_S3_BUCKET", Some("unused")),
+            ("RUSTACCIO_STATE_COORDINATION_S3_REGION", Some("us-east-1")),
             (
-                "RUSTACCIO_STATE_COORDINATION_REDIS_URL",
-                Some("redis://127.0.0.1:1/"),
+                "RUSTACCIO_STATE_COORDINATION_S3_ENDPOINT",
+                Some("http://127.0.0.1:1"),
             ),
             ("RUSTACCIO_STATE_COORDINATION_FAIL_OPEN", Some("false")),
             (
@@ -187,36 +233,68 @@ async fn state_coordination_fail_closed_rejects_writes_when_backend_is_down() {
 }
 
 #[tokio::test]
-#[ignore = "requires local Redis (`just governance-up`)"]
-async fn state_coordination_redis_lock_timeout_when_key_is_held() {
-    let redis_url = redis_it_url();
-    wait_for_redis(&redis_url).await;
-    let lock_key = format!("rustaccio:test:state-lock:{}", Uuid::new_v4().as_simple());
-    let scoped_lock_key = format!("{lock_key}:state");
+#[ignore = "requires local MinIO (`just minio-up`)"]
+async fn state_coordination_s3_lock_timeout_when_key_is_held() {
+    let endpoint = it_endpoint();
+    let region = it_region();
+    let bucket = it_bucket();
+    let access_key = it_access_key();
+    let secret_key = it_secret_key();
+    let client = s3_client(&endpoint, &region, &access_key, &secret_key).await;
+    wait_for_s3(&client).await;
+    ensure_bucket(&client, &bucket).await;
 
-    let mut conn = redis_connection(&redis_url).await;
-    let _: Option<String> = redis::cmd("SET")
-        .arg(&scoped_lock_key)
-        .arg("held")
-        .arg("NX")
-        .arg("PX")
-        .arg(10_000)
-        .query_async(&mut conn)
+    let prefix = format!("rustaccio-it-locks/{}/", Uuid::new_v4().as_simple());
+    let held_key = format!("{prefix}state.lock");
+    let lease_until_ms = chrono::Utc::now().timestamp_millis() + 10_000;
+    let payload = json!({
+        "token": "held-token",
+        "lease_until_ms": lease_until_ms,
+        "operation": "held",
+    });
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(&held_key)
+        .body(aws_sdk_s3::primitives::ByteStream::from(
+            serde_json::to_vec(&payload).expect("payload"),
+        ))
+        .send()
         .await
-        .expect("set lock");
+        .expect("set held lock");
 
     with_env(
         &[
             ("RUSTACCIO_RATE_LIMIT_BACKEND", Some("none")),
             ("RUSTACCIO_QUOTA_BACKEND", Some("none")),
-            ("RUSTACCIO_STATE_COORDINATION_BACKEND", Some("redis")),
+            ("RUSTACCIO_STATE_COORDINATION_BACKEND", Some("s3")),
             (
-                "RUSTACCIO_STATE_COORDINATION_REDIS_URL",
-                Some(redis_url.as_str()),
+                "RUSTACCIO_STATE_COORDINATION_S3_BUCKET",
+                Some(bucket.as_str()),
             ),
             (
-                "RUSTACCIO_STATE_COORDINATION_LOCK_KEY",
-                Some(lock_key.as_str()),
+                "RUSTACCIO_STATE_COORDINATION_S3_REGION",
+                Some(region.as_str()),
+            ),
+            (
+                "RUSTACCIO_STATE_COORDINATION_S3_ENDPOINT",
+                Some(endpoint.as_str()),
+            ),
+            (
+                "RUSTACCIO_STATE_COORDINATION_S3_ACCESS_KEY_ID",
+                Some(access_key.as_str()),
+            ),
+            (
+                "RUSTACCIO_STATE_COORDINATION_S3_SECRET_ACCESS_KEY",
+                Some(secret_key.as_str()),
+            ),
+            (
+                "RUSTACCIO_STATE_COORDINATION_S3_PREFIX",
+                Some(prefix.as_str()),
+            ),
+            (
+                "RUSTACCIO_STATE_COORDINATION_S3_FORCE_PATH_STYLE",
+                Some("true"),
             ),
             ("RUSTACCIO_STATE_COORDINATION_FAIL_OPEN", Some("false")),
             (
