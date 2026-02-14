@@ -383,6 +383,7 @@ Rustaccio targets Verdaccio-compatible npm client behavior for core flows, but i
 - `src/acl.rs`: package rule matching + access/publish/unpublish permission checks
 - `src/config.rs`: env + Verdaccio-style YAML parsing (`packages`, `uplinks`)
 - `src/storage.rs`: local state, persistence, auth/token/package operations + backend integration
+- `src/policy.rs`: policy engine abstraction (`external policy backend -> auth hook/plugin decisions -> ACL fallback`)
 - `src/auth_plugin.rs`: HTTP auth backend plugin client
 - `src/tarball_backend.rs`: tarball backend abstraction (`local`, `s3`)
 - `src/upstream.rs`: npm uplink proxy client for package/search/tarball
@@ -438,6 +439,36 @@ Behavior:
 
 - `2xx` means success.
 - Non-`2xx` propagates status and `error`/`message` from plugin JSON body when present.
+
+## External Policy Backend (HTTP, via Env)
+
+Policy decisions can be sourced from a dedicated HTTP backend and will run before auth-hook/plugin/ACL fallback.
+
+Environment variables:
+
+- `RUSTACCIO_POLICY_BACKEND=local|http` (default `local`)
+- `RUSTACCIO_POLICY_HTTP_BASE_URL` (required when backend=`http`)
+- `RUSTACCIO_POLICY_HTTP_DECISION_ENDPOINT` (default `/authorize`)
+- `RUSTACCIO_POLICY_HTTP_TIMEOUT_MS` (default `3000`)
+- `RUSTACCIO_POLICY_HTTP_CACHE_TTL_MS` (default `5000`, set `0` to disable cache)
+- `RUSTACCIO_POLICY_HTTP_FAIL_OPEN` (default `false`)
+
+Decision request payload includes:
+
+- `action` (`access|publish|unpublish`)
+- `package`
+- `method`
+- `path`
+- identity context: `username`, `groups`, `identity`
+- tenant context: `tenant`, `org_id`, `project_id` (from request headers when present)
+
+Decision response:
+
+- `{ "allowed": true|false }` or raw JSON boolean
+- `401/403` is treated as an explicit deny
+- Other non-`2xx`:
+  - with `RUSTACCIO_POLICY_HTTP_FAIL_OPEN=true`: fall back to local policy chain
+  - with `RUSTACCIO_POLICY_HTTP_FAIL_OPEN=false`: request fails with `502`
 
 ## License
 

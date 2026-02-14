@@ -411,7 +411,50 @@ async fn embedded_allow_access_can_deny_even_if_acl_allows() {
         .body(Body::empty())
         .expect("request");
     assert_eq!(
-        app.oneshot(req).await.expect("response").status(),
+        app.clone().oneshot(req).await.expect("response").status(),
         StatusCode::UNAUTHORIZED
     );
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/-/v1/search?text=access-deny-pkg")
+        .header(header::AUTHORIZATION, "Bearer embedded-token")
+        .body(Body::empty())
+        .expect("request");
+    let resp = app.clone().oneshot(req).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect")
+            .to_bytes(),
+    )
+    .expect("json");
+    assert_eq!(
+        body.get("objects")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/-/all")
+        .header(header::AUTHORIZATION, "Bearer embedded-token")
+        .body(Body::empty())
+        .expect("request");
+    let resp = app.oneshot(req).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect")
+            .to_bytes(),
+    )
+    .expect("json");
+    assert!(body.get("access-deny-pkg").is_none());
 }

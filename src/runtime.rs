@@ -5,6 +5,7 @@ use crate::{
     config::Config,
     error::RegistryError,
     observability,
+    policy::{DefaultPolicyEngine, HttpPolicyConfig},
     storage::{Store, StoreOptions},
     upstream::Upstream,
 };
@@ -29,6 +30,16 @@ pub async fn build_state(
     auth_hook: Option<Arc<dyn AuthHook>>,
 ) -> Result<AppState, RegistryError> {
     let store = Arc::new(Store::open_with_options(config, StoreOptions { auth_hook }).await?);
+    let acl = Acl::new(config.acl_rules.clone());
+    let policy = if let Some(policy_cfg) = HttpPolicyConfig::from_env() {
+        Arc::new(DefaultPolicyEngine::new_with_http(
+            store.clone(),
+            acl.clone(),
+            policy_cfg,
+        )?)
+    } else {
+        Arc::new(DefaultPolicyEngine::new(store.clone(), acl.clone()))
+    };
 
     let mut uplinks = HashMap::new();
     for (name, url) in &config.uplinks {
@@ -42,7 +53,8 @@ pub async fn build_state(
 
     Ok(AppState {
         store,
-        acl: Acl::new(config.acl_rules.clone()),
+        acl,
+        policy,
         uplinks,
         web_enabled: config.web_enabled,
         web_title: config.web_title.clone(),

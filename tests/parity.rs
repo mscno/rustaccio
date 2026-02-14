@@ -14,6 +14,7 @@ use rustaccio::{
         AuthBackend, AuthPluginConfig, Config, HttpAuthPluginConfig, TarballStorageBackend,
         TarballStorageConfig,
     },
+    policy::DefaultPolicyEngine,
     runtime,
     storage::Store,
     upstream::Upstream,
@@ -99,9 +100,12 @@ async fn test_app_with_rules_and_options(
         .iter()
         .map(|(name, url)| (name.clone(), Upstream::new(url.clone())))
         .collect::<HashMap<_, _>>();
+    let acl = Acl::new(cfg.acl_rules.clone());
+    let policy = Arc::new(DefaultPolicyEngine::new(store.clone(), acl.clone()));
     build_router(AppState {
         store,
-        acl: Acl::new(cfg.acl_rules.clone()),
+        acl,
+        policy,
         uplinks: upstream_clients,
         web_enabled: cfg.web_enabled,
         web_title: cfg.web_title.clone(),
@@ -210,9 +214,12 @@ async fn test_app_with_explicit_uplinks_and_options(
         .iter()
         .map(|(name, url)| (name.clone(), Upstream::new(url.clone())))
         .collect::<HashMap<_, _>>();
+    let acl = Acl::new(cfg.acl_rules.clone());
+    let policy = Arc::new(DefaultPolicyEngine::new(store.clone(), acl.clone()));
     build_router(AppState {
         store,
-        acl: Acl::new(cfg.acl_rules.clone()),
+        acl,
+        policy,
         uplinks: upstream_clients,
         web_enabled: cfg.web_enabled,
         web_title: cfg.web_title.clone(),
@@ -267,9 +274,12 @@ async fn test_app_with_http_auth_plugin(data_dir: PathBuf, auth_base_url: String
         },
     };
     let store = Arc::new(Store::open(&cfg).await.expect("store"));
+    let acl = Acl::new(cfg.acl_rules.clone());
+    let policy = Arc::new(DefaultPolicyEngine::new(store.clone(), acl.clone()));
     build_router(AppState {
         store,
-        acl: Acl::new(cfg.acl_rules.clone()),
+        acl,
+        policy,
         uplinks: HashMap::new(),
         web_enabled: cfg.web_enabled,
         web_title: cfg.web_title.clone(),

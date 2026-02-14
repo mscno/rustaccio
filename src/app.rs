@@ -1,4 +1,4 @@
-use crate::{acl::Acl, api, storage::Store, upstream::Upstream};
+use crate::{acl::Acl, api, policy::PolicyEngine, storage::Store, upstream::Upstream};
 use axum::{
     Router,
     http::{HeaderName, StatusCode},
@@ -18,6 +18,7 @@ use tracing::Level;
 pub struct AppState {
     pub store: Arc<Store>,
     pub acl: Acl,
+    pub policy: Arc<dyn PolicyEngine>,
     pub uplinks: HashMap<String, Upstream>,
     pub web_enabled: bool,
     pub web_title: String,

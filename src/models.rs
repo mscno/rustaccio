@@ -8,6 +8,12 @@ pub struct AuthIdentity {
     pub groups: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct TenantContext {
+    pub org_id: Option<String>,
+    pub project_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserRecord {
     pub password_hash: String,

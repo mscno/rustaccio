@@ -5,7 +5,8 @@ use crate::{
         HEADER_JSON_INSTALL, HEADER_OCTET,
     },
     error::RegistryError,
-    models::AuthIdentity,
+    models::{AuthIdentity, TenantContext},
+    policy::{PolicyAction, RequestContext},
     storage::{
         Store, bad_request, default_profile, forbidden, make_search_object, parse_authorization,
         parse_json_body, parse_json_string_body, unauthorized,
@@ -40,6 +41,11 @@ pub async fn dispatch(
     };
     let query = uri.query().map(ToOwned::to_owned);
     let headers = req.headers().clone();
+    let request_context = RequestContext {
+        method: method.to_string(),
+        path: path.clone(),
+        tenant: tenant_context_from_headers(&headers),
+    };
     let span = tracing::Span::current();
     span.record("method", tracing::field::display(&method));
     span.record("path", tracing::field::display(&raw_path));
@@ -83,11 +89,23 @@ pub async fn dispatch(
     }
 
     if method == Method::GET && (path == "/-/all" || path == "/-/all/since") {
-        return Ok(local_database_response(&state, query.as_deref()).await);
+        return local_database_response(
+            &state,
+            query.as_deref(),
+            auth_identity.as_ref(),
+            &request_context,
+        )
+        .await;
     }
 
     if path == "/-/v1/search" && method == Method::GET {
-        return handle_search(&state, query.as_deref(), auth_identity.as_ref()).await;
+        return handle_search(
+            &state,
+            query.as_deref(),
+            auth_identity.as_ref(),
+            &request_context,
+        )
+        .await;
     }
 
     if path == "/-/npm/v1/security/advisories/bulk" && method == Method::POST {
@@ -158,14 +176,26 @@ pub async fn dispatch(
 
     if let Some((package_name, tag)) = parse_canonical_dist_tags_path(&path) {
         if method == Method::GET && tag.is_none() {
-            ensure_access_permission(&state, &package_name, auth_identity.as_ref()).await?;
+            ensure_access_permission(
+                &state,
+                &package_name,
+                auth_identity.as_ref(),
+                &request_context,
+            )
+            .await?;
             ensure_package_cached(&state, &headers, &package_name).await?;
             let tags = state.store.dist_tags(&package_name).await?;
             return Ok(json_response(StatusCode::OK, tags, HEADER_JSON));
         }
 
         if method == Method::PUT {
-            ensure_publish_permission(&state, &package_name, auth_identity.as_ref()).await?;
+            ensure_publish_permission(
+                &state,
+                &package_name,
+                auth_identity.as_ref(),
+                &request_context,
+            )
+            .await?;
             ensure_package_owner_permission(&state, &package_name, auth_user.as_deref()).await?;
             let bytes = read_body(req, state.max_body_size).await?;
             let version = parse_json_string_body(&bytes)?;
@@ -185,7 +215,13 @@ pub async fn dispatch(
         }
 
         if method == Method::DELETE {
-            ensure_publish_permission(&state, &package_name, auth_identity.as_ref()).await?;
+            ensure_publish_permission(
+                &state,
+                &package_name,
+                auth_identity.as_ref(),
+                &request_context,
+            )
+            .await?;
             ensure_package_owner_permission(&state, &package_name, auth_user.as_deref()).await?;
             let message = state
                 .store
@@ -468,6 +504,7 @@ pub async fn dispatch(
             state,
             method,
             headers,
+            request_context,
             query,
             auth_user,
             auth_identity,
@@ -512,6 +549,7 @@ struct PackageRouteContext {
     state: AppState,
     method: Method,
     headers: HeaderMap,
+    request_context: RequestContext,
     query: Option<String>,
     auth_user: Option<String>,
     auth_identity: Option<AuthIdentity>,
@@ -526,6 +564,7 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
         state,
         method,
         headers,
+        request_context,
         query,
         auth_user,
         auth_identity,
@@ -543,7 +582,13 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
 
     if method == Method::GET {
         if tail.is_empty() {
-            ensure_access_permission(&state, &package_name, auth_identity.as_ref()).await?;
+            ensure_access_permission(
+                &state,
+                &package_name,
+                auth_identity.as_ref(),
+                &request_context,
+            )
+            .await?;
             return handle_get_package(
                 &state,
                 &headers,
@@ -555,19 +600,37 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
         }
 
         if tail.len() == 1 {
-            ensure_access_permission(&state, &package_name, auth_identity.as_ref()).await?;
+            ensure_access_permission(
+                &state,
+                &package_name,
+                auth_identity.as_ref(),
+                &request_context,
+            )
+            .await?;
             return handle_get_package_version(&state, &headers, &package_name, &tail[0]).await;
         }
 
         if tail.len() == 2 && tail[0] == "-" {
-            ensure_access_permission(&state, &package_name, auth_identity.as_ref()).await?;
+            ensure_access_permission(
+                &state,
+                &package_name,
+                auth_identity.as_ref(),
+                &request_context,
+            )
+            .await?;
             return handle_get_tarball(&state, &package_name, &tail[1]).await;
         }
     }
 
     if method == Method::HEAD {
         if tail.is_empty() {
-            ensure_access_permission(&state, &package_name, auth_identity.as_ref()).await?;
+            ensure_access_permission(
+                &state,
+                &package_name,
+                auth_identity.as_ref(),
+                &request_context,
+            )
+            .await?;
             let resp = handle_get_package(
                 &state,
                 &headers,
@@ -580,14 +643,26 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
         }
 
         if tail.len() == 1 {
-            ensure_access_permission(&state, &package_name, auth_identity.as_ref()).await?;
+            ensure_access_permission(
+                &state,
+                &package_name,
+                auth_identity.as_ref(),
+                &request_context,
+            )
+            .await?;
             let resp =
                 handle_get_package_version(&state, &headers, &package_name, &tail[0]).await?;
             return Ok(head_response(resp));
         }
 
         if tail.len() == 2 && tail[0] == "-" {
-            ensure_access_permission(&state, &package_name, auth_identity.as_ref()).await?;
+            ensure_access_permission(
+                &state,
+                &package_name,
+                auth_identity.as_ref(),
+                &request_context,
+            )
+            .await?;
             let resp = handle_get_tarball(&state, &package_name, &tail[1]).await?;
             return Ok(head_response(resp));
         }
@@ -595,7 +670,13 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
 
     if method == Method::PUT {
         if tail.is_empty() {
-            ensure_publish_permission(&state, &package_name, auth_identity.as_ref()).await?;
+            ensure_publish_permission(
+                &state,
+                &package_name,
+                auth_identity.as_ref(),
+                &request_context,
+            )
+            .await?;
             ensure_package_cached(&state, &headers, &package_name).await?;
             ensure_package_owner_permission(&state, &package_name, auth_user.as_deref()).await?;
             let user = auth_user.as_deref().unwrap_or(ANONYMOUS_USER);
@@ -612,7 +693,13 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
         }
 
         if tail.len() == 2 && tail[0] == "-rev" {
-            ensure_unpublish_permission(&state, &package_name, auth_identity.as_ref()).await?;
+            ensure_unpublish_permission(
+                &state,
+                &package_name,
+                auth_identity.as_ref(),
+                &request_context,
+            )
+            .await?;
             ensure_package_cached(&state, &headers, &package_name).await?;
             ensure_package_owner_permission(&state, &package_name, auth_user.as_deref()).await?;
             let user = auth_user.as_deref().unwrap_or(ANONYMOUS_USER);
@@ -629,7 +716,13 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
         }
 
         if tail.len() == 1 {
-            ensure_publish_permission(&state, &package_name, auth_identity.as_ref()).await?;
+            ensure_publish_permission(
+                &state,
+                &package_name,
+                auth_identity.as_ref(),
+                &request_context,
+            )
+            .await?;
             ensure_package_owner_permission(&state, &package_name, auth_user.as_deref()).await?;
             let version = parse_json_string_body(&read_body(req, state.max_body_size).await?)?;
             let message = state
@@ -646,7 +739,13 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
 
     if method == Method::DELETE {
         if tail.len() == 2 && tail[0] == "-rev" {
-            ensure_unpublish_permission(&state, &package_name, auth_identity.as_ref()).await?;
+            ensure_unpublish_permission(
+                &state,
+                &package_name,
+                auth_identity.as_ref(),
+                &request_context,
+            )
+            .await?;
             ensure_package_owner_permission(&state, &package_name, auth_user.as_deref()).await?;
             let message = state.store.remove_package(&package_name).await?;
             return Ok(json_response(
@@ -657,7 +756,13 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
         }
 
         if tail.len() == 4 && tail[0] == "-" && tail[2] == "-rev" {
-            ensure_unpublish_permission(&state, &package_name, auth_identity.as_ref()).await?;
+            ensure_unpublish_permission(
+                &state,
+                &package_name,
+                auth_identity.as_ref(),
+                &request_context,
+            )
+            .await?;
             ensure_package_owner_permission(&state, &package_name, auth_user.as_deref()).await?;
             let message = state.store.remove_tarball(&package_name, &tail[1]).await?;
             return Ok(json_response(
@@ -865,6 +970,7 @@ async fn handle_search(
     state: &AppState,
     query: Option<&str>,
     auth_identity: Option<&AuthIdentity>,
+    request_context: &RequestContext,
 ) -> Result<Response<Body>, RegistryError> {
     let params = query_params(query);
     let text = params
@@ -894,9 +1000,11 @@ async fn handle_search(
                 .to_string();
             let name_lc = name.to_lowercase();
 
-            if state.acl.can_access(&name, auth_identity)
-                && (text.is_empty() || name_lc.contains(&text))
-            {
+            let allowed = state
+                .policy
+                .authorize(PolicyAction::Access, &name, auth_identity, request_context)
+                .await?;
+            if allowed && (text.is_empty() || name_lc.contains(&text)) {
                 objects.push(item);
             }
         }
@@ -915,7 +1023,19 @@ async fn handle_search(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            if !package_name.is_empty() && state.acl.can_access(&package_name, auth_identity) {
+            if package_name.is_empty() {
+                continue;
+            }
+            let allowed = state
+                .policy
+                .authorize(
+                    PolicyAction::Access,
+                    &package_name,
+                    auth_identity,
+                    request_context,
+                )
+                .await?;
+            if allowed {
                 objects.push(item);
             }
         }
@@ -1020,28 +1140,24 @@ async fn ensure_access_permission(
     state: &AppState,
     package_name: &str,
     identity: Option<&AuthIdentity>,
+    request_context: &RequestContext,
 ) -> Result<(), RegistryError> {
-    if let Some(allowed) = state.store.allow_access(identity, package_name).await? {
-        if allowed {
-            return Ok(());
-        }
-        warn!(
-            package = package_name,
-            user = auth_identity_primary_name(identity).unwrap_or(ANONYMOUS_USER),
-            "access denied by auth hook"
-        );
-        return Err(unauthorized(&format!(
-            "authorization required to access package {package_name}"
-        )));
-    }
-
-    if state.acl.can_access(package_name, identity) {
+    let allowed = state
+        .policy
+        .authorize(
+            PolicyAction::Access,
+            package_name,
+            identity,
+            request_context,
+        )
+        .await?;
+    if allowed {
         return Ok(());
     }
     warn!(
         package = package_name,
         user = auth_identity_primary_name(identity).unwrap_or(ANONYMOUS_USER),
-        "access denied by ACL"
+        "access denied by policy engine"
     );
     Err(unauthorized(&format!(
         "authorization required to access package {package_name}"
@@ -1052,28 +1168,24 @@ async fn ensure_publish_permission(
     state: &AppState,
     package_name: &str,
     identity: Option<&AuthIdentity>,
+    request_context: &RequestContext,
 ) -> Result<(), RegistryError> {
-    if let Some(allowed) = state.store.allow_publish(identity, package_name).await? {
-        if allowed {
-            return Ok(());
-        }
-        warn!(
-            package = package_name,
-            user = auth_identity_primary_name(identity).unwrap_or(ANONYMOUS_USER),
-            "publish denied by auth hook"
-        );
-        return Err(unauthorized(&format!(
-            "authorization required to publish package {package_name}"
-        )));
-    }
-
-    if state.acl.can_publish(package_name, identity) {
+    let allowed = state
+        .policy
+        .authorize(
+            PolicyAction::Publish,
+            package_name,
+            identity,
+            request_context,
+        )
+        .await?;
+    if allowed {
         return Ok(());
     }
     warn!(
         package = package_name,
         user = auth_identity_primary_name(identity).unwrap_or(ANONYMOUS_USER),
-        "publish denied by ACL"
+        "publish denied by policy engine"
     );
     Err(unauthorized(&format!(
         "authorization required to publish package {package_name}"
@@ -1084,28 +1196,24 @@ async fn ensure_unpublish_permission(
     state: &AppState,
     package_name: &str,
     identity: Option<&AuthIdentity>,
+    request_context: &RequestContext,
 ) -> Result<(), RegistryError> {
-    if let Some(allowed) = state.store.allow_unpublish(identity, package_name).await? {
-        if allowed {
-            return Ok(());
-        }
-        warn!(
-            package = package_name,
-            user = auth_identity_primary_name(identity).unwrap_or(ANONYMOUS_USER),
-            "unpublish denied by auth hook"
-        );
-        return Err(unauthorized(&format!(
-            "authorization required to unpublish package {package_name}"
-        )));
-    }
-
-    if state.acl.can_unpublish(package_name, identity) {
+    let allowed = state
+        .policy
+        .authorize(
+            PolicyAction::Unpublish,
+            package_name,
+            identity,
+            request_context,
+        )
+        .await?;
+    if allowed {
         return Ok(());
     }
     warn!(
         package = package_name,
         user = auth_identity_primary_name(identity).unwrap_or(ANONYMOUS_USER),
-        "unpublish denied by ACL"
+        "unpublish denied by policy engine"
     );
     Err(unauthorized(&format!(
         "authorization required to unpublish package {package_name}"
@@ -1218,40 +1326,53 @@ fn is_transient_uplink_status(status: StatusCode) -> bool {
     )
 }
 
-async fn local_database_response(state: &AppState, query: Option<&str>) -> Response<Body> {
+async fn local_database_response(
+    state: &AppState,
+    query: Option<&str>,
+    auth_identity: Option<&AuthIdentity>,
+    request_context: &RequestContext,
+) -> Result<Response<Body>, RegistryError> {
     let params = query_params(query);
     let start_key = params
         .get("since")
         .or_else(|| params.get("startkey"))
         .cloned();
 
-    let mut rows: Vec<(String, Value)> = state
-        .store
-        .all_packages()
-        .await
-        .into_iter()
-        .filter_map(|record| {
-            let name = record
-                .manifest
-                .get("name")
-                .and_then(Value::as_str)?
-                .to_string();
-            let latest = record
-                .manifest
-                .get("dist-tags")
-                .and_then(|tags| tags.get("latest"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            Some((
-                name.clone(),
-                json!({
-                    "name": name,
-                    "version": latest,
-                }),
-            ))
-        })
-        .collect();
+    let mut rows: Vec<(String, Value)> = Vec::new();
+    for record in state.store.all_packages().await {
+        let Some(name) = record
+            .manifest
+            .get("name")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+
+        let allowed = state
+            .policy
+            .authorize(PolicyAction::Access, &name, auth_identity, request_context)
+            .await?;
+        if !allowed {
+            continue;
+        }
+
+        let latest = record
+            .manifest
+            .get("dist-tags")
+            .and_then(|tags| tags.get("latest"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        rows.push((
+            name.clone(),
+            json!({
+                "name": name,
+                "version": latest,
+            }),
+        ));
+    }
     rows.sort_by(|(left, _), (right, _)| left.cmp(right));
 
     let mut out = serde_json::Map::new();
@@ -1264,7 +1385,11 @@ async fn local_database_response(state: &AppState, query: Option<&str>) -> Respo
         out.insert(name, row);
     }
 
-    json_response(StatusCode::OK, Value::Object(out), HEADER_JSON)
+    Ok(json_response(
+        StatusCode::OK,
+        Value::Object(out),
+        HEADER_JSON,
+    ))
 }
 
 fn empty_quick_audit_response() -> Value {
@@ -1318,6 +1443,24 @@ fn query_params(query: Option<&str>) -> HashMap<String, String> {
     }
 
     out
+}
+
+fn tenant_context_from_headers(headers: &HeaderMap) -> TenantContext {
+    TenantContext {
+        org_id: first_header_value(headers, &["x-rustaccio-org-id", "x-org-id"]),
+        project_id: first_header_value(headers, &["x-rustaccio-project-id", "x-project-id"]),
+    }
+}
+
+fn first_header_value(headers: &HeaderMap, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
 }
 
 fn parse_canonical_dist_tags_path(path: &str) -> Option<(String, Option<String>)> {
