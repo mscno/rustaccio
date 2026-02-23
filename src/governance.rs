@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use chrono::Utc;
 #[cfg(feature = "postgres")]
 use tokio_postgres::NoTls;
-use tracing::debug;
+use tracing::{debug, error};
 
 use std::{
     collections::HashMap,
@@ -153,13 +153,25 @@ impl GovernanceMetrics for PrometheusTextMetrics {
         }
         .to_string();
 
-        let mut lock = self.counters.lock().expect("metrics mutex");
+        let mut lock = match self.counters.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => {
+                error!("governance metrics mutex was poisoned; continuing with recovered state");
+                poisoned.into_inner()
+            }
+        };
         let entry = lock.entry((action, outcome)).or_insert(0);
         *entry += 1;
     }
 
     async fn render(&self) -> Option<String> {
-        let lock = self.counters.lock().expect("metrics mutex");
+        let lock = match self.counters.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => {
+                error!("governance metrics mutex was poisoned; rendering recovered state");
+                poisoned.into_inner()
+            }
+        };
         let mut lines = vec![
             "# HELP rustaccio_governance_requests_total Governance request decisions.".to_string(),
             "# TYPE rustaccio_governance_requests_total counter".to_string(),

@@ -111,7 +111,7 @@ fn it_secret_key() -> String {
 }
 
 async fn s3_client(endpoint: &str, region: &str, access_key: &str, secret_key: &str) -> S3Client {
-    let shared = aws_config::defaults(aws_config::BehaviorVersion::latest())
+    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(Region::new(region.to_string()))
         .credentials_provider(Credentials::new(
             access_key.to_string(),
@@ -119,9 +119,18 @@ async fn s3_client(endpoint: &str, region: &str, access_key: &str, secret_key: &
             None,
             None,
             "rustaccio-it",
-        ))
-        .load()
-        .await;
+        ));
+
+    if endpoint
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("http://")
+    {
+        let http_client = aws_smithy_http_client::Builder::new().build_http();
+        loader = loader.http_client(http_client);
+    }
+
+    let shared = loader.load().await;
 
     let conf = S3ConfigBuilder::from(&shared)
         .endpoint_url(endpoint)

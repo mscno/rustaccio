@@ -36,6 +36,66 @@ async fn test_app(data_dir: PathBuf, upstream: Option<String>) -> axum::Router {
     test_app_with_rules(data_dir, upstream, vec![PackageRule::open("**")]).await
 }
 
+fn base_test_config(data_dir: PathBuf) -> Config {
+    Config {
+        bind: "127.0.0.1:0".parse().expect("bind"),
+        data_dir,
+        listen: vec!["127.0.0.1:0".to_string()],
+        upstream_registry: None,
+        uplinks: HashMap::new(),
+        acl_rules: vec![PackageRule::open("**")],
+        web_enabled: true,
+        web_title: "Rustaccio".to_string(),
+        web_login: true,
+        publish_check_owners: false,
+        password_min_length: 3,
+        login_session_ttl_seconds: 120,
+        max_body_size: 50 * 1024 * 1024,
+        audit_enabled: true,
+        url_prefix: "/".to_string(),
+        trust_proxy: false,
+        keep_alive_timeout_secs: None,
+        log_level: "info".to_string(),
+        auth_plugin: AuthPluginConfig {
+            backend: AuthBackend::Local,
+            external_mode: false,
+            http: None,
+        },
+        tarball_storage: TarballStorageConfig {
+            backend: TarballStorageBackend::Local,
+            s3: None,
+        },
+    }
+}
+
+async fn build_test_app_from_config(cfg: Config) -> axum::Router {
+    let store = Arc::new(Store::open(&cfg).await.expect("store"));
+    let upstream_clients = cfg
+        .uplinks
+        .iter()
+        .map(|(name, url)| (name.clone(), Upstream::new(url.clone())))
+        .collect::<HashMap<_, _>>();
+    let acl = Acl::new(cfg.acl_rules.clone());
+    let policy = Arc::new(DefaultPolicyEngine::new(store.clone(), acl.clone()));
+    build_router(AppState {
+        store,
+        acl,
+        policy,
+        governance: Arc::new(rustaccio::governance::GovernanceEngine::default()),
+        admin_access: rustaccio::app::AdminAccessConfig::default(),
+        uplinks: upstream_clients,
+        web_enabled: cfg.web_enabled,
+        web_title: cfg.web_title.clone(),
+        web_login_enabled: cfg.web_login,
+        publish_check_owners: cfg.publish_check_owners,
+        max_body_size: cfg.max_body_size,
+        audit_enabled: cfg.audit_enabled,
+        url_prefix: cfg.url_prefix.clone(),
+        trust_proxy: cfg.trust_proxy,
+        auth_external_mode: cfg.auth_plugin.external_mode,
+    })
+}
+
 async fn test_app_with_rules(
     data_dir: PathBuf,
     upstream: Option<String>,
@@ -60,65 +120,15 @@ async fn test_app_with_rules_and_options(
     web_login: bool,
     publish_check_owners: bool,
 ) -> axum::Router {
-    let mut uplinks = HashMap::new();
-    if let Some(url) = upstream.clone() {
-        uplinks.insert("default".to_string(), url);
+    let mut cfg = base_test_config(data_dir);
+    cfg.upstream_registry = upstream.clone();
+    if let Some(url) = upstream {
+        cfg.uplinks.insert("default".to_string(), url);
     }
-
-    let cfg = Config {
-        bind: "127.0.0.1:0".parse().expect("bind"),
-        data_dir,
-        listen: vec!["127.0.0.1:0".to_string()],
-        upstream_registry: upstream,
-        uplinks,
-        acl_rules: rules,
-        web_enabled: true,
-        web_title: "Rustaccio".to_string(),
-        web_login,
-        publish_check_owners,
-        password_min_length: 3,
-        login_session_ttl_seconds: 120,
-        max_body_size: 50 * 1024 * 1024,
-        audit_enabled: true,
-        url_prefix: "/".to_string(),
-        trust_proxy: false,
-        keep_alive_timeout_secs: None,
-        log_level: "info".to_string(),
-        auth_plugin: AuthPluginConfig {
-            backend: AuthBackend::Local,
-            external_mode: false,
-            http: None,
-        },
-        tarball_storage: TarballStorageConfig {
-            backend: TarballStorageBackend::Local,
-            s3: None,
-        },
-    };
-    let store = Arc::new(Store::open(&cfg).await.expect("store"));
-    let upstream_clients = cfg
-        .uplinks
-        .iter()
-        .map(|(name, url)| (name.clone(), Upstream::new(url.clone())))
-        .collect::<HashMap<_, _>>();
-    let acl = Acl::new(cfg.acl_rules.clone());
-    let policy = Arc::new(DefaultPolicyEngine::new(store.clone(), acl.clone()));
-    build_router(AppState {
-        store,
-        acl,
-        policy,
-        governance: Arc::new(rustaccio::governance::GovernanceEngine::default()),
-        admin_access: rustaccio::app::AdminAccessConfig::default(),
-        uplinks: upstream_clients,
-        web_enabled: cfg.web_enabled,
-        web_title: cfg.web_title.clone(),
-        web_login_enabled: cfg.web_login,
-        publish_check_owners: cfg.publish_check_owners,
-        max_body_size: cfg.max_body_size,
-        audit_enabled: cfg.audit_enabled,
-        url_prefix: cfg.url_prefix.clone(),
-        trust_proxy: cfg.trust_proxy,
-        auth_external_mode: cfg.auth_plugin.external_mode,
-    })
+    cfg.acl_rules = rules;
+    cfg.web_login = web_login;
+    cfg.publish_check_owners = publish_check_owners;
+    build_test_app_from_config(cfg).await
 }
 
 async fn test_app_with_runtime_settings(
@@ -127,40 +137,13 @@ async fn test_app_with_runtime_settings(
     url_prefix: &str,
     trust_proxy: bool,
 ) -> axum::Router {
-    let mut uplinks = HashMap::new();
-    if let Some(url) = upstream.clone() {
-        uplinks.insert("default".to_string(), url);
+    let mut cfg = base_test_config(data_dir);
+    cfg.upstream_registry = upstream.clone();
+    if let Some(url) = upstream {
+        cfg.uplinks.insert("default".to_string(), url);
     }
-
-    let cfg = Config {
-        bind: "127.0.0.1:0".parse().expect("bind"),
-        data_dir,
-        listen: vec!["127.0.0.1:0".to_string()],
-        upstream_registry: upstream,
-        uplinks,
-        acl_rules: vec![PackageRule::open("**")],
-        web_enabled: true,
-        web_title: "Rustaccio".to_string(),
-        web_login: true,
-        publish_check_owners: false,
-        password_min_length: 3,
-        login_session_ttl_seconds: 120,
-        max_body_size: 50 * 1024 * 1024,
-        audit_enabled: true,
-        url_prefix: url_prefix.to_string(),
-        trust_proxy,
-        keep_alive_timeout_secs: None,
-        log_level: "info".to_string(),
-        auth_plugin: AuthPluginConfig {
-            backend: AuthBackend::Local,
-            external_mode: false,
-            http: None,
-        },
-        tarball_storage: TarballStorageConfig {
-            backend: TarballStorageBackend::Local,
-            s3: None,
-        },
-    };
+    cfg.url_prefix = url_prefix.to_string();
+    cfg.trust_proxy = trust_proxy;
     let state = runtime::build_state(&cfg, None).await.expect("state");
     build_router(state)
 }
@@ -181,122 +164,33 @@ async fn test_app_with_explicit_uplinks_and_options(
     web_login: bool,
     publish_check_owners: bool,
 ) -> axum::Router {
-    let cfg = Config {
-        bind: "127.0.0.1:0".parse().expect("bind"),
-        data_dir,
-        listen: vec!["127.0.0.1:0".to_string()],
-        upstream_registry: uplinks.values().next().cloned(),
-        uplinks,
-        acl_rules: rules,
-        web_enabled: true,
-        web_title: "Rustaccio".to_string(),
-        web_login,
-        publish_check_owners,
-        password_min_length: 3,
-        login_session_ttl_seconds: 120,
-        max_body_size: 50 * 1024 * 1024,
-        audit_enabled: true,
-        url_prefix: "/".to_string(),
-        trust_proxy: false,
-        keep_alive_timeout_secs: None,
-        log_level: "info".to_string(),
-        auth_plugin: AuthPluginConfig {
-            backend: AuthBackend::Local,
-            external_mode: false,
-            http: None,
-        },
-        tarball_storage: TarballStorageConfig {
-            backend: TarballStorageBackend::Local,
-            s3: None,
-        },
-    };
-    let store = Arc::new(Store::open(&cfg).await.expect("store"));
-    let upstream_clients = cfg
-        .uplinks
-        .iter()
-        .map(|(name, url)| (name.clone(), Upstream::new(url.clone())))
-        .collect::<HashMap<_, _>>();
-    let acl = Acl::new(cfg.acl_rules.clone());
-    let policy = Arc::new(DefaultPolicyEngine::new(store.clone(), acl.clone()));
-    build_router(AppState {
-        store,
-        acl,
-        policy,
-        governance: Arc::new(rustaccio::governance::GovernanceEngine::default()),
-        admin_access: rustaccio::app::AdminAccessConfig::default(),
-        uplinks: upstream_clients,
-        web_enabled: cfg.web_enabled,
-        web_title: cfg.web_title.clone(),
-        web_login_enabled: cfg.web_login,
-        publish_check_owners: cfg.publish_check_owners,
-        max_body_size: cfg.max_body_size,
-        audit_enabled: cfg.audit_enabled,
-        url_prefix: cfg.url_prefix.clone(),
-        trust_proxy: cfg.trust_proxy,
-        auth_external_mode: cfg.auth_plugin.external_mode,
-    })
+    let mut cfg = base_test_config(data_dir);
+    cfg.upstream_registry = uplinks.values().next().cloned();
+    cfg.uplinks = uplinks;
+    cfg.acl_rules = rules;
+    cfg.web_login = web_login;
+    cfg.publish_check_owners = publish_check_owners;
+    build_test_app_from_config(cfg).await
 }
 
 async fn test_app_with_http_auth_plugin(data_dir: PathBuf, auth_base_url: String) -> axum::Router {
-    let cfg = Config {
-        bind: "127.0.0.1:0".parse().expect("bind"),
-        data_dir,
-        listen: vec!["127.0.0.1:0".to_string()],
-        upstream_registry: None,
-        uplinks: HashMap::new(),
-        acl_rules: vec![PackageRule::open("**")],
-        web_enabled: true,
-        web_title: "Rustaccio".to_string(),
-        web_login: true,
-        publish_check_owners: false,
-        password_min_length: 3,
-        login_session_ttl_seconds: 120,
-        max_body_size: 50 * 1024 * 1024,
-        audit_enabled: true,
-        url_prefix: "/".to_string(),
-        trust_proxy: false,
-        keep_alive_timeout_secs: None,
-        log_level: "info".to_string(),
-        auth_plugin: AuthPluginConfig {
-            backend: AuthBackend::Http,
-            external_mode: false,
-            http: Some(HttpAuthPluginConfig {
-                base_url: auth_base_url,
-                add_user_endpoint: "/adduser".to_string(),
-                login_endpoint: "/authenticate".to_string(),
-                change_password_endpoint: "/change-password".to_string(),
-                request_auth_endpoint: None,
-                allow_access_endpoint: None,
-                allow_publish_endpoint: None,
-                allow_unpublish_endpoint: None,
-                timeout_ms: 2_000,
-            }),
-        },
-        tarball_storage: TarballStorageConfig {
-            backend: TarballStorageBackend::Local,
-            s3: None,
-        },
+    let mut cfg = base_test_config(data_dir);
+    cfg.auth_plugin = AuthPluginConfig {
+        backend: AuthBackend::Http,
+        external_mode: false,
+        http: Some(HttpAuthPluginConfig {
+            base_url: auth_base_url,
+            add_user_endpoint: "/adduser".to_string(),
+            login_endpoint: "/authenticate".to_string(),
+            change_password_endpoint: "/change-password".to_string(),
+            request_auth_endpoint: None,
+            allow_access_endpoint: None,
+            allow_publish_endpoint: None,
+            allow_unpublish_endpoint: None,
+            timeout_ms: 2_000,
+        }),
     };
-    let store = Arc::new(Store::open(&cfg).await.expect("store"));
-    let acl = Acl::new(cfg.acl_rules.clone());
-    let policy = Arc::new(DefaultPolicyEngine::new(store.clone(), acl.clone()));
-    build_router(AppState {
-        store,
-        acl,
-        policy,
-        governance: Arc::new(rustaccio::governance::GovernanceEngine::default()),
-        admin_access: rustaccio::app::AdminAccessConfig::default(),
-        uplinks: HashMap::new(),
-        web_enabled: cfg.web_enabled,
-        web_title: cfg.web_title.clone(),
-        web_login_enabled: cfg.web_login,
-        publish_check_owners: cfg.publish_check_owners,
-        max_body_size: cfg.max_body_size,
-        audit_enabled: cfg.audit_enabled,
-        url_prefix: cfg.url_prefix.clone(),
-        trust_proxy: cfg.trust_proxy,
-        auth_external_mode: cfg.auth_plugin.external_mode,
-    })
+    build_test_app_from_config(cfg).await
 }
 
 async fn send(app: &axum::Router, req: Request<Body>) -> axum::http::Response<Body> {

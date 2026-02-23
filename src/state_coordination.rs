@@ -500,6 +500,20 @@ impl S3StateWriteCoordinator {
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .region(aws_sdk_s3::config::Region::new(region));
 
+        let endpoint_is_http = endpoint
+            .as_deref()
+            .map(|value| {
+                value
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("http://")
+            })
+            .unwrap_or(false);
+        if endpoint_is_http {
+            let http_client = aws_smithy_http_client::Builder::new().build_http();
+            loader = loader.http_client(http_client);
+        }
+
         if let (Some(access_key), Some(secret_key)) = (access_key_id, secret_access_key) {
             loader = loader.credentials_provider(aws_sdk_s3::config::Credentials::new(
                 access_key,
