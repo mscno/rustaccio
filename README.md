@@ -142,6 +142,7 @@ Environment variables:
 - `RUSTACCIO_AUTH_HTTP_ALLOW_UNPUBLISH_ENDPOINT` (optional ACL override hook endpoint)
 - `RUSTACCIO_AUTH_EXTERNAL_MODE` (default `false`; disables local user/token/web-login endpoints)
 - `RUSTACCIO_AUTH_HTTP_TIMEOUT_MS` (default `5000`)
+- `RUSTACCIO_RUNTIME_PROFILE` (`local`, `s3`, or `managed`; optional override, otherwise inferred from config)
 - `RUSTACCIO_TARBALL_BACKEND` (`local` or `s3`, default `local`)
 - `RUSTACCIO_S3_BUCKET` (required for `s3` backend)
 - `RUSTACCIO_S3_REGION` (default `us-east-1`)
@@ -480,14 +481,15 @@ auth:
     timeoutMs: 5000
 
 store:
-  aws-s3-storage:
+  backend: s3
+  s3:
     bucket: npm-cache
     region: us-east-1
     endpoint: http://127.0.0.1:9002
     accessKeyId: minio
     secretAccessKey: miniopass
     prefix: tarballs/
-    s3ForcePathStyle: true
+    forcePathStyle: true
 ```
 
 ## HTTP Auth Plugin Contract
@@ -646,23 +648,39 @@ Rustaccio now runs sidecar-authoritative package metadata in all modes.
 | Simple local | `local` | package sidecars (`package.json`) | none/memory | single-node, low ops |
 | Shared object store | `s3` | package sidecars (`package.json`) | none/memory | multi-node with shared blob storage |
 | Managed governance | `local` or `s3` | package sidecars (`package.json`) | Redis/Postgres/Prometheus/OTel | managed platform with limits/observability |
-| External control-plane auth/policy | `local` or `s3` | package sidecars (`package.json`) | same as above | centralized identity/policy decisions |
 
 Simple local mode defaults:
 
+- `RUSTACCIO_RUNTIME_PROFILE=local`
 - `RUSTACCIO_TARBALL_BACKEND=local`
 - `RUSTACCIO_PACKAGE_METADATA_AUTHORITY=sidecar`
 - `RUSTACCIO_RATE_LIMIT_BACKEND=none`
 - `RUSTACCIO_QUOTA_BACKEND=none`
 - `RUSTACCIO_POLICY_BACKEND=local`
 - `RUSTACCIO_MANAGED_MODE=false`
+- `RUSTACCIO_STATE_COORDINATION_BACKEND=none`
+
+Shared object store mode defaults:
+
+- `RUSTACCIO_RUNTIME_PROFILE=s3`
+- `RUSTACCIO_TARBALL_BACKEND=s3`
+- `RUSTACCIO_S3_BUCKET=<tarball-bucket>`
+- `RUSTACCIO_MANAGED_MODE=false`
+- `RUSTACCIO_RATE_LIMIT_BACKEND=none|memory`
+- `RUSTACCIO_QUOTA_BACKEND=none|memory`
+- `RUSTACCIO_STATE_COORDINATION_BACKEND=none|s3`
 
 Managed hardening mode:
 
+- `RUSTACCIO_RUNTIME_PROFILE=managed`
 - `RUSTACCIO_MANAGED_MODE=true` enforces:
   - `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false`
   - explicit admin principals (`RUSTACCIO_ADMIN_USERS` or `RUSTACCIO_ADMIN_GROUPS`)
   - `auth.plugin.externalMode=true` (env: `RUSTACCIO_AUTH_EXTERNAL_MODE=true`)
+- Managed profile additionally requires:
+  - `RUSTACCIO_RATE_LIMIT_BACKEND=redis`
+  - `RUSTACCIO_QUOTA_BACKEND=postgres`
+  - `RUSTACCIO_STATE_COORDINATION_BACKEND=redis|s3`
 
 ## Deploying with Redis/Postgres Backends
 
@@ -676,6 +694,11 @@ docker build \
 
 ### 2) Runtime env for managed governance
 
+Required profile and mode:
+
+- `RUSTACCIO_RUNTIME_PROFILE=managed`
+- `RUSTACCIO_MANAGED_MODE=true`
+
 Required for Redis rate limiter:
 
 - `RUSTACCIO_RATE_LIMIT_BACKEND=redis`
@@ -688,7 +711,6 @@ Required for Postgres quotas:
 
 Recommended managed security baseline:
 
-- `RUSTACCIO_MANAGED_MODE=true`
 - `RUSTACCIO_AUTH_EXTERNAL_MODE=true`
 - `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false`
 - `RUSTACCIO_ADMIN_GROUPS=<control-plane-admin-group>`
@@ -709,6 +731,7 @@ docker run --rm -p 4873:4873 \
   -v "$(pwd)/.rustaccio-data:/var/lib/rustaccio/data" \
   -v "$(pwd)/config.yml:/etc/rustaccio/config.yml:ro" \
   -e RUSTACCIO_CONFIG=/etc/rustaccio/config.yml \
+  -e RUSTACCIO_RUNTIME_PROFILE=managed \
   -e RUSTACCIO_MANAGED_MODE=true \
   -e RUSTACCIO_AUTH_EXTERNAL_MODE=true \
   -e RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false \

@@ -37,12 +37,20 @@ pub struct HttpPolicyConfig {
 }
 
 impl HttpPolicyConfig {
-    pub fn from_env() -> Option<Self> {
+    pub fn from_env() -> Result<Option<Self>, RegistryError> {
         let backend = std::env::var("RUSTACCIO_POLICY_BACKEND")
             .ok()
             .unwrap_or_else(|| "local".to_string());
-        if !backend.eq_ignore_ascii_case("http") {
-            return None;
+        let backend = backend.trim().to_ascii_lowercase();
+        match backend.as_str() {
+            "local" => return Ok(None),
+            "http" => {}
+            other => {
+                return Err(RegistryError::http(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("unsupported RUSTACCIO_POLICY_BACKEND: {other}"),
+                ));
+            }
         }
 
         let base_url = std::env::var("RUSTACCIO_POLICY_HTTP_BASE_URL")
@@ -52,10 +60,10 @@ impl HttpPolicyConfig {
             .trim_end_matches('/')
             .to_string();
         if base_url.is_empty() {
-            warn!(
-                "RUSTACCIO_POLICY_BACKEND=http but RUSTACCIO_POLICY_HTTP_BASE_URL is empty; external policy backend is disabled"
-            );
-            return None;
+            return Err(RegistryError::http(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "RUSTACCIO_POLICY_BACKEND=http requires RUSTACCIO_POLICY_HTTP_BASE_URL",
+            ));
         }
 
         let decision_endpoint = std::env::var("RUSTACCIO_POLICY_HTTP_DECISION_ENDPOINT")
@@ -66,13 +74,13 @@ impl HttpPolicyConfig {
         let cache_ttl_ms = parse_u64_env("RUSTACCIO_POLICY_HTTP_CACHE_TTL_MS", 5_000);
         let fail_open = parse_bool_env("RUSTACCIO_POLICY_HTTP_FAIL_OPEN", false);
 
-        Some(Self {
+        Ok(Some(Self {
             base_url,
             decision_endpoint: normalize_endpoint(&decision_endpoint),
             timeout_ms,
             cache_ttl_ms,
             fail_open,
-        })
+        }))
     }
 }
 

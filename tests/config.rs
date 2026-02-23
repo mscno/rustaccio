@@ -123,14 +123,15 @@ url_prefix: /verdaccio/
 log:
   level: debug
 store:
-  aws-s3-storage:
+  backend: s3
+  s3:
     bucket: npm-cache
     region: eu-north-1
     endpoint: http://127.0.0.1:9001
     accessKeyId: minio
     secretAccessKey: miniopass
     prefix: tarballs/
-    s3ForcePathStyle: true
+    forcePathStyle: true
 "#
     )
     .expect("write");
@@ -147,6 +148,39 @@ store:
     assert_eq!(cfg.url_prefix, "/verdaccio");
     assert_eq!(cfg.log_level, "debug");
     assert_eq!(cfg.tarball_storage.backend, TarballStorageBackend::S3);
+}
+
+#[test]
+fn from_yaml_errors_for_invalid_auth_backend() {
+    let mut file = tempfile::NamedTempFile::new().expect("temp file");
+    writeln!(
+        file,
+        r#"
+auth:
+  backend: kerberos
+"#
+    )
+    .expect("write");
+
+    let err = Config::from_yaml_file(file.path().to_path_buf()).expect_err("invalid auth backend");
+    assert!(err.contains("unsupported auth backend"));
+}
+
+#[test]
+fn from_yaml_errors_for_invalid_tarball_backend() {
+    let mut file = tempfile::NamedTempFile::new().expect("temp file");
+    writeln!(
+        file,
+        r#"
+store:
+  backend: glacier
+"#
+    )
+    .expect("write");
+
+    let err =
+        Config::from_yaml_file(file.path().to_path_buf()).expect_err("invalid tarball backend");
+    assert!(err.contains("unsupported tarball backend"));
 }
 
 #[test]
@@ -279,6 +313,38 @@ fn from_env_uses_port_env_for_platform_compatibility() {
         || {
             let cfg = Config::from_env().expect("config from env");
             assert_eq!(cfg.listen, vec!["0.0.0.0:6123".to_string()]);
+        },
+    );
+}
+
+#[test]
+fn from_env_errors_for_invalid_auth_backend() {
+    with_env_vars(
+        &[
+            ("RUSTACCIO_AUTH_BACKEND", Some("kerberos")),
+            ("RUSTACCIO_CONFIG", None),
+            ("RUSTACCIO_CONFIG_BASE64", None),
+            ("PORT", None),
+        ],
+        || {
+            let err = Config::from_env().expect_err("invalid auth backend");
+            assert!(err.contains("RUSTACCIO_AUTH_BACKEND"));
+        },
+    );
+}
+
+#[test]
+fn from_env_errors_for_invalid_tarball_backend() {
+    with_env_vars(
+        &[
+            ("RUSTACCIO_TARBALL_BACKEND", Some("glacier")),
+            ("RUSTACCIO_CONFIG", None),
+            ("RUSTACCIO_CONFIG_BASE64", None),
+            ("PORT", None),
+        ],
+        || {
+            let err = Config::from_env().expect_err("invalid tarball backend");
+            assert!(err.contains("RUSTACCIO_TARBALL_BACKEND"));
         },
     );
 }

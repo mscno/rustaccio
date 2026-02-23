@@ -15,11 +15,13 @@ pub enum AuthBackend {
 }
 
 impl AuthBackend {
-    fn from_str(value: &str) -> Self {
-        if value.eq_ignore_ascii_case("http") {
-            Self::Http
-        } else {
-            Self::Local
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "local" => Ok(Self::Local),
+            "http" => Ok(Self::Http),
+            other => Err(format!(
+                "unsupported auth backend `{other}` (expected `local` or `http`)"
+            )),
         }
     }
 }
@@ -61,11 +63,13 @@ pub enum TarballStorageBackend {
 }
 
 impl TarballStorageBackend {
-    fn from_str(value: &str) -> Self {
-        if value.eq_ignore_ascii_case("s3") {
-            Self::S3
-        } else {
-            Self::Local
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "local" => Ok(Self::Local),
+            "s3" => Ok(Self::S3),
+            other => Err(format!(
+                "unsupported tarball backend `{other}` (expected `local` or `s3`)"
+            )),
         }
     }
 }
@@ -166,7 +170,7 @@ impl Config {
         let env_cfg = load_rustaccio_env()?;
         let mut cfg = Self::defaults();
         cfg.apply_env_config_sources_if_present(&env_cfg)?;
-        cfg.apply_env_overrides(&env_cfg);
+        cfg.apply_env_overrides(&env_cfg)?;
         cfg.apply_port_override(load_process_env_value("port")?);
         cfg.ensure_default_uplink();
         Ok(cfg)
@@ -177,7 +181,7 @@ impl Config {
         let mut cfg = Self::defaults();
         cfg.apply_env_config_sources_if_present(&env_cfg)?;
         cfg.apply_yaml_overrides(Self::from_yaml_file(config_path)?);
-        cfg.apply_env_overrides(&env_cfg);
+        cfg.apply_env_overrides(&env_cfg)?;
         cfg.apply_port_override(load_process_env_value("port")?);
         cfg.ensure_default_uplink();
         Ok(cfg)
@@ -263,7 +267,7 @@ impl Config {
         }
     }
 
-    fn apply_env_overrides(&mut self, env_cfg: &RawEnvConfig) {
+    fn apply_env_overrides(&mut self, env_cfg: &RawEnvConfig) -> Result<(), String> {
         if let Some(bind) = parse_env_value::<SocketAddr>(env_cfg.bind.as_deref()) {
             self.bind = bind;
             self.listen = vec![bind.to_string()];
@@ -330,8 +334,9 @@ impl Config {
             self.log_level = value.to_string();
         }
 
-        self.apply_auth_env_overrides(env_cfg);
-        self.apply_storage_env_overrides(env_cfg);
+        self.apply_auth_env_overrides(env_cfg)?;
+        self.apply_storage_env_overrides(env_cfg)?;
+        Ok(())
     }
 
     fn apply_port_override(&mut self, port_value: Option<String>) {
@@ -343,9 +348,10 @@ impl Config {
         }
     }
 
-    fn apply_auth_env_overrides(&mut self, env_cfg: &RawEnvConfig) {
+    fn apply_auth_env_overrides(&mut self, env_cfg: &RawEnvConfig) -> Result<(), String> {
         if let Some(value) = env_cfg.auth_backend.as_deref() {
-            self.auth_plugin.backend = AuthBackend::from_str(value);
+            self.auth_plugin.backend = AuthBackend::parse(value)
+                .map_err(|err| format!("RUSTACCIO_AUTH_BACKEND: {err}"))?;
         }
         if let Some(parsed) = parse_env_value::<bool>(env_cfg.auth_external_mode.as_deref()) {
             self.auth_plugin.external_mode = parsed;
@@ -353,7 +359,7 @@ impl Config {
 
         if self.auth_plugin.backend == AuthBackend::Local {
             self.auth_plugin.http = None;
-            return;
+            return Ok(());
         }
 
         let mut http = self
@@ -390,16 +396,18 @@ impl Config {
             http.timeout_ms = parsed;
         }
         self.auth_plugin.http = Some(http);
+        Ok(())
     }
 
-    fn apply_storage_env_overrides(&mut self, env_cfg: &RawEnvConfig) {
+    fn apply_storage_env_overrides(&mut self, env_cfg: &RawEnvConfig) -> Result<(), String> {
         if let Some(value) = env_cfg.tarball_backend.as_deref() {
-            self.tarball_storage.backend = TarballStorageBackend::from_str(value);
+            self.tarball_storage.backend = TarballStorageBackend::parse(value)
+                .map_err(|err| format!("RUSTACCIO_TARBALL_BACKEND: {err}"))?;
         }
 
         if self.tarball_storage.backend == TarballStorageBackend::Local {
             self.tarball_storage.s3 = None;
-            return;
+            return Ok(());
         }
 
         let mut s3 = self
@@ -435,6 +443,7 @@ impl Config {
         }
 
         self.tarball_storage.s3 = Some(s3);
+        Ok(())
     }
 
     fn apply_yaml_overrides(&mut self, loaded: Self) {
@@ -532,7 +541,7 @@ impl Config {
         }
 
         let upstream_registry = uplinks.values().next().cloned();
-        let tarball_storage = parse_storage_from_yaml(parsed.storage.as_ref(), parsed.store);
+        let tarball_storage = parse_storage_from_yaml(parsed.storage.as_ref(), parsed.store)?;
 
         Ok(Self {
             bind,
@@ -735,7 +744,8 @@ fn parse_auth_from_yaml(auth: Option<YamlAuth>) -> Result<AuthPluginConfig, Stri
     let backend = auth
         .backend
         .as_deref()
-        .map(AuthBackend::from_str)
+        .map(AuthBackend::parse)
+        .transpose()?
         .unwrap_or(AuthBackend::Local);
     let external_mode = auth.external.unwrap_or(false);
 
@@ -778,56 +788,59 @@ fn parse_auth_from_yaml(auth: Option<YamlAuth>) -> Result<AuthPluginConfig, Stri
 fn parse_storage_from_yaml(
     storage: Option<&serde_yaml::Value>,
     store: Option<serde_yaml::Value>,
-) -> TarballStorageConfig {
-    if let Some(store_cfg) = store
-        .and_then(parse_store_storage_config)
-        .or_else(|| storage.and_then(parse_storage_storage_config))
+) -> Result<TarballStorageConfig, String> {
+    if let Some(store_value) = store
+        && let Some(store_cfg) = parse_store_storage_config(store_value)?
     {
-        return store_cfg;
+        return Ok(store_cfg);
     }
-    TarballStorageConfig::default()
+    if let Some(storage_cfg) = parse_storage_storage_config(storage)? {
+        return Ok(storage_cfg);
+    }
+    Ok(TarballStorageConfig::default())
 }
 
-fn parse_storage_storage_config(value: &serde_yaml::Value) -> Option<TarballStorageConfig> {
-    let parsed = serde_yaml::from_value::<YamlStorage>(value.clone()).ok()?;
-    Some(parse_storage_config(parsed))
+fn parse_storage_storage_config(
+    value: Option<&serde_yaml::Value>,
+) -> Result<Option<TarballStorageConfig>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if !value.is_mapping() {
+        return Ok(None);
+    }
+    let parsed = serde_yaml::from_value::<YamlStorage>(value.clone())
+        .map_err(|err| format!("invalid storage config: {err}"))?;
+    Ok(Some(parse_storage_config(parsed)?))
 }
 
-fn parse_store_storage_config(value: serde_yaml::Value) -> Option<TarballStorageConfig> {
-    let mapping = value.as_mapping()?;
+fn parse_store_storage_config(
+    value: serde_yaml::Value,
+) -> Result<Option<TarballStorageConfig>, String> {
+    let Some(mapping) = value.as_mapping() else {
+        return Ok(None);
+    };
     if mapping.contains_key(serde_yaml::Value::String("backend".to_string())) {
-        let parsed = serde_yaml::from_value::<YamlStorage>(value).ok()?;
-        return Some(parse_storage_config(parsed));
+        let parsed = serde_yaml::from_value::<YamlStorage>(value)
+            .map_err(|err| format!("invalid store config: {err}"))?;
+        return Ok(Some(parse_storage_config(parsed)?));
     }
-
-    let legacy = mapping.get(serde_yaml::Value::String("aws-s3-storage".to_string()))?;
-    let parsed = serde_yaml::from_value::<YamlStorageS3Legacy>(legacy.clone()).ok()?;
-    Some(TarballStorageConfig {
-        backend: TarballStorageBackend::S3,
-        s3: Some(S3TarballStorageConfig {
-            bucket: parsed.bucket.unwrap_or_default(),
-            region: parsed.region.unwrap_or_else(|| "us-east-1".to_string()),
-            endpoint: parsed.endpoint,
-            access_key_id: parsed.access_key_id,
-            secret_access_key: parsed.secret_access_key,
-            prefix: parsed.prefix.unwrap_or_default(),
-            force_path_style: parsed.s3_force_path_style.unwrap_or(true),
-        }),
-    })
+    Ok(None)
 }
 
-fn parse_storage_config(storage: YamlStorage) -> TarballStorageConfig {
+fn parse_storage_config(storage: YamlStorage) -> Result<TarballStorageConfig, String> {
     let backend = storage
         .backend
         .as_deref()
-        .map(TarballStorageBackend::from_str)
+        .map(TarballStorageBackend::parse)
+        .transpose()?
         .unwrap_or(TarballStorageBackend::Local);
 
     match backend {
-        TarballStorageBackend::Local => TarballStorageConfig::default(),
+        TarballStorageBackend::Local => Ok(TarballStorageConfig::default()),
         TarballStorageBackend::S3 => {
             let s3 = storage.s3.unwrap_or_default();
-            TarballStorageConfig {
+            Ok(TarballStorageConfig {
                 backend,
                 s3: Some(S3TarballStorageConfig {
                     bucket: s3.bucket.unwrap_or_default(),
@@ -838,7 +851,7 @@ fn parse_storage_config(storage: YamlStorage) -> TarballStorageConfig {
                     prefix: s3.prefix.unwrap_or_default(),
                     force_path_style: s3.force_path_style.unwrap_or(true),
                 }),
-            }
+            })
         }
     }
 }
@@ -958,20 +971,6 @@ struct YamlStorageS3 {
     prefix: Option<String>,
     #[serde(rename = "forcePathStyle")]
     force_path_style: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct YamlStorageS3Legacy {
-    bucket: Option<String>,
-    region: Option<String>,
-    endpoint: Option<String>,
-    #[serde(rename = "accessKeyId")]
-    access_key_id: Option<String>,
-    #[serde(rename = "secretAccessKey")]
-    secret_access_key: Option<String>,
-    prefix: Option<String>,
-    #[serde(rename = "s3ForcePathStyle")]
-    s3_force_path_style: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

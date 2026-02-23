@@ -2,7 +2,7 @@ use crate::{
     acl::Acl,
     app::{AdminAccessConfig, AppState, build_router},
     auth::AuthHook,
-    config::Config,
+    config::{Config, TarballStorageBackend},
     error::RegistryError,
     governance::GovernanceEngine,
     observability,
@@ -30,12 +30,13 @@ pub async fn build_state(
     config: &Config,
     auth_hook: Option<Arc<dyn AuthHook>>,
 ) -> Result<AppState, RegistryError> {
+    validate_runtime_profile(config)?;
     let store = Arc::new(Store::open_with_options(config, StoreOptions { auth_hook }).await?);
     let acl = Acl::new(config.acl_rules.clone());
     let governance = Arc::new(GovernanceEngine::from_env().await?);
     let admin_access = AdminAccessConfig::from_env();
     validate_managed_mode_guardrails(config, &admin_access)?;
-    let policy = if let Some(policy_cfg) = HttpPolicyConfig::from_env() {
+    let policy = if let Some(policy_cfg) = HttpPolicyConfig::from_env()? {
         Arc::new(DefaultPolicyEngine::new_with_http(
             store.clone(),
             acl.clone(),
@@ -126,6 +127,174 @@ pub async fn run_from_env() -> Result<(), RegistryError> {
 
 fn startup_log_level(config: &Config) -> &str {
     config.log_level.as_str()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeProfile {
+    Local,
+    S3,
+    Managed,
+}
+
+fn validate_runtime_profile(config: &Config) -> Result<(), RegistryError> {
+    let managed_mode = managed_mode_enabled_from_env();
+    let inferred_profile = if managed_mode {
+        RuntimeProfile::Managed
+    } else if config.tarball_storage.backend == TarballStorageBackend::S3 {
+        RuntimeProfile::S3
+    } else {
+        RuntimeProfile::Local
+    };
+    let profile = runtime_profile_from_env(inferred_profile)?;
+    let rate_limit_backend = backend_env("RUSTACCIO_RATE_LIMIT_BACKEND", "none");
+    let quota_backend = backend_env("RUSTACCIO_QUOTA_BACKEND", "none");
+    let state_coord_backend = backend_env("RUSTACCIO_STATE_COORDINATION_BACKEND", "none");
+
+    validate_runtime_profile_with_inputs(
+        profile,
+        managed_mode,
+        config.tarball_storage.backend.clone(),
+        &rate_limit_backend,
+        &quota_backend,
+        &state_coord_backend,
+    )
+}
+
+fn runtime_profile_from_env(
+    default_profile: RuntimeProfile,
+) -> Result<RuntimeProfile, RegistryError> {
+    let profile = std::env::var("RUSTACCIO_RUNTIME_PROFILE")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase());
+    let Some(profile) = profile else {
+        return Ok(default_profile);
+    };
+
+    match profile.as_str() {
+        "local" => Ok(RuntimeProfile::Local),
+        "s3" => Ok(RuntimeProfile::S3),
+        "managed" => Ok(RuntimeProfile::Managed),
+        other => Err(RegistryError::http(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unsupported RUSTACCIO_RUNTIME_PROFILE: {other} (expected local|s3|managed)"),
+        )),
+    }
+}
+
+fn backend_env(key: &str, default: &str) -> String {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+fn is_none_or_memory(backend: &str) -> bool {
+    matches!(backend, "" | "none" | "memory")
+}
+
+fn validate_runtime_profile_with_inputs(
+    profile: RuntimeProfile,
+    managed_mode: bool,
+    tarball_backend: TarballStorageBackend,
+    rate_limit_backend: &str,
+    quota_backend: &str,
+    state_coord_backend: &str,
+) -> Result<(), RegistryError> {
+    match profile {
+        RuntimeProfile::Local => {
+            if managed_mode {
+                return Err(RegistryError::http(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "RUSTACCIO_RUNTIME_PROFILE=local requires RUSTACCIO_MANAGED_MODE=false",
+                ));
+            }
+            if tarball_backend != TarballStorageBackend::Local {
+                return Err(RegistryError::http(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "RUSTACCIO_RUNTIME_PROFILE=local requires RUSTACCIO_TARBALL_BACKEND=local",
+                ));
+            }
+            if !is_none_or_memory(rate_limit_backend) {
+                return Err(RegistryError::http(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "RUSTACCIO_RUNTIME_PROFILE=local requires RUSTACCIO_RATE_LIMIT_BACKEND=none|memory",
+                ));
+            }
+            if !is_none_or_memory(quota_backend) {
+                return Err(RegistryError::http(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "RUSTACCIO_RUNTIME_PROFILE=local requires RUSTACCIO_QUOTA_BACKEND=none|memory",
+                ));
+            }
+            if !matches!(state_coord_backend, "" | "none") {
+                return Err(RegistryError::http(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "RUSTACCIO_RUNTIME_PROFILE=local requires RUSTACCIO_STATE_COORDINATION_BACKEND=none",
+                ));
+            }
+        }
+        RuntimeProfile::S3 => {
+            if managed_mode {
+                return Err(RegistryError::http(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "RUSTACCIO_RUNTIME_PROFILE=s3 requires RUSTACCIO_MANAGED_MODE=false",
+                ));
+            }
+            if tarball_backend != TarballStorageBackend::S3 {
+                return Err(RegistryError::http(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "RUSTACCIO_RUNTIME_PROFILE=s3 requires RUSTACCIO_TARBALL_BACKEND=s3",
+                ));
+            }
+            if !is_none_or_memory(rate_limit_backend) {
+                return Err(RegistryError::http(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "RUSTACCIO_RUNTIME_PROFILE=s3 requires RUSTACCIO_RATE_LIMIT_BACKEND=none|memory",
+                ));
+            }
+            if !is_none_or_memory(quota_backend) {
+                return Err(RegistryError::http(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "RUSTACCIO_RUNTIME_PROFILE=s3 requires RUSTACCIO_QUOTA_BACKEND=none|memory",
+                ));
+            }
+            if !matches!(state_coord_backend, "" | "none" | "s3") {
+                return Err(RegistryError::http(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "RUSTACCIO_RUNTIME_PROFILE=s3 requires RUSTACCIO_STATE_COORDINATION_BACKEND=none|s3",
+                ));
+            }
+        }
+        RuntimeProfile::Managed => {
+            if !managed_mode {
+                return Err(RegistryError::http(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "RUSTACCIO_RUNTIME_PROFILE=managed requires RUSTACCIO_MANAGED_MODE=true",
+                ));
+            }
+            if rate_limit_backend != "redis" {
+                return Err(RegistryError::http(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "RUSTACCIO_RUNTIME_PROFILE=managed requires RUSTACCIO_RATE_LIMIT_BACKEND=redis",
+                ));
+            }
+            if quota_backend != "postgres" {
+                return Err(RegistryError::http(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "RUSTACCIO_RUNTIME_PROFILE=managed requires RUSTACCIO_QUOTA_BACKEND=postgres",
+                ));
+            }
+            if !matches!(state_coord_backend, "redis" | "s3") {
+                return Err(RegistryError::http(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "RUSTACCIO_RUNTIME_PROFILE=managed requires RUSTACCIO_STATE_COORDINATION_BACKEND=redis|s3",
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_managed_mode_guardrails(
@@ -320,7 +489,10 @@ fn is_connection_error(error: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{startup_log_level, validate_managed_mode_guardrails_with_flag};
+    use super::{
+        RuntimeProfile, startup_log_level, validate_managed_mode_guardrails_with_flag,
+        validate_runtime_profile_with_inputs,
+    };
     use crate::{
         app::AdminAccessConfig,
         config::{
@@ -428,5 +600,82 @@ mod tests {
             groups: vec!["platform-admins".to_string()],
         };
         assert!(validate_managed_mode_guardrails_with_flag(true, &config, &admin).is_ok());
+    }
+
+    #[test]
+    fn runtime_profile_local_accepts_local_simple_settings() {
+        let result = validate_runtime_profile_with_inputs(
+            RuntimeProfile::Local,
+            false,
+            TarballStorageBackend::Local,
+            "none",
+            "memory",
+            "none",
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn runtime_profile_local_rejects_s3_tarballs() {
+        let err = validate_runtime_profile_with_inputs(
+            RuntimeProfile::Local,
+            false,
+            TarballStorageBackend::S3,
+            "none",
+            "none",
+            "none",
+        )
+        .expect_err("must fail");
+        assert!(
+            err.to_string().contains(
+                "RUSTACCIO_RUNTIME_PROFILE=local requires RUSTACCIO_TARBALL_BACKEND=local"
+            )
+        );
+    }
+
+    #[test]
+    fn runtime_profile_s3_rejects_managed_mode() {
+        let err = validate_runtime_profile_with_inputs(
+            RuntimeProfile::S3,
+            true,
+            TarballStorageBackend::S3,
+            "none",
+            "none",
+            "none",
+        )
+        .expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("RUSTACCIO_RUNTIME_PROFILE=s3 requires RUSTACCIO_MANAGED_MODE=false")
+        );
+    }
+
+    #[test]
+    fn runtime_profile_managed_requires_redis_and_postgres() {
+        let err = validate_runtime_profile_with_inputs(
+            RuntimeProfile::Managed,
+            true,
+            TarballStorageBackend::S3,
+            "memory",
+            "postgres",
+            "redis",
+        )
+        .expect_err("must fail");
+        assert!(err.to_string().contains(
+            "RUSTACCIO_RUNTIME_PROFILE=managed requires RUSTACCIO_RATE_LIMIT_BACKEND=redis"
+        ));
+    }
+
+    #[test]
+    fn runtime_profile_managed_accepts_strict_backends() {
+        let result = validate_runtime_profile_with_inputs(
+            RuntimeProfile::Managed,
+            true,
+            TarballStorageBackend::S3,
+            "redis",
+            "postgres",
+            "redis",
+        );
+        assert!(result.is_ok());
     }
 }

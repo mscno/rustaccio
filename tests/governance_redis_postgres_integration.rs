@@ -222,17 +222,28 @@ async fn create_user(app: &axum::Router, username: &str, password: &str) -> Stri
 #[ignore = "requires local Redis (`just governance-up`)"]
 async fn redis_rate_limiter_enforces_limit() {
     let redis_url = redis_it_url();
+    let postgres_url = postgres_it_url();
     wait_for_redis(&redis_url).await;
+    wait_for_postgres(&postgres_url).await;
     reset_redis(&redis_url).await;
 
     with_env(
         &[
+            ("RUSTACCIO_RUNTIME_PROFILE", Some("managed")),
+            ("RUSTACCIO_MANAGED_MODE", Some("true")),
+            ("RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED", Some("false")),
+            ("RUSTACCIO_ADMIN_USERS", Some("ops")),
+            ("RUSTACCIO_AUTH_EXTERNAL_MODE", Some("true")),
             ("RUSTACCIO_RATE_LIMIT_BACKEND", Some("redis")),
             ("RUSTACCIO_RATE_LIMIT_REDIS_URL", Some(redis_url.as_str())),
             ("RUSTACCIO_RATE_LIMIT_REQUESTS_PER_WINDOW", Some("2")),
             ("RUSTACCIO_RATE_LIMIT_WINDOW_SECS", Some("60")),
             ("RUSTACCIO_RATE_LIMIT_FAIL_OPEN", Some("false")),
-            ("RUSTACCIO_QUOTA_BACKEND", Some("none")),
+            ("RUSTACCIO_QUOTA_BACKEND", Some("postgres")),
+            ("RUSTACCIO_QUOTA_POSTGRES_URL", Some(postgres_url.as_str())),
+            ("RUSTACCIO_QUOTA_REQUESTS_PER_DAY", Some("0")),
+            ("RUSTACCIO_QUOTA_DOWNLOADS_PER_DAY", Some("0")),
+            ("RUSTACCIO_QUOTA_PUBLISHES_PER_DAY", Some("0")),
             ("RUSTACCIO_METRICS_BACKEND", Some("none")),
         ],
         async {
@@ -259,9 +270,18 @@ async fn redis_rate_limiter_enforces_limit() {
 }
 
 #[tokio::test]
+#[ignore = "requires managed profile baseline (`just governance-up`)"]
 async fn redis_rate_limiter_fail_open_allows_when_backend_is_down() {
+    let postgres_url = postgres_it_url();
+    wait_for_postgres(&postgres_url).await;
+
     with_env(
         &[
+            ("RUSTACCIO_RUNTIME_PROFILE", Some("managed")),
+            ("RUSTACCIO_MANAGED_MODE", Some("true")),
+            ("RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED", Some("false")),
+            ("RUSTACCIO_ADMIN_USERS", Some("ops")),
+            ("RUSTACCIO_AUTH_EXTERNAL_MODE", Some("true")),
             ("RUSTACCIO_RATE_LIMIT_BACKEND", Some("redis")),
             (
                 "RUSTACCIO_RATE_LIMIT_REDIS_URL",
@@ -270,7 +290,11 @@ async fn redis_rate_limiter_fail_open_allows_when_backend_is_down() {
             ("RUSTACCIO_RATE_LIMIT_REQUESTS_PER_WINDOW", Some("1")),
             ("RUSTACCIO_RATE_LIMIT_WINDOW_SECS", Some("60")),
             ("RUSTACCIO_RATE_LIMIT_FAIL_OPEN", Some("true")),
-            ("RUSTACCIO_QUOTA_BACKEND", Some("none")),
+            ("RUSTACCIO_QUOTA_BACKEND", Some("postgres")),
+            ("RUSTACCIO_QUOTA_POSTGRES_URL", Some(postgres_url.as_str())),
+            ("RUSTACCIO_QUOTA_REQUESTS_PER_DAY", Some("0")),
+            ("RUSTACCIO_QUOTA_DOWNLOADS_PER_DAY", Some("0")),
+            ("RUSTACCIO_QUOTA_PUBLISHES_PER_DAY", Some("0")),
             ("RUSTACCIO_METRICS_BACKEND", Some("none")),
         ],
         async {
@@ -293,9 +317,18 @@ async fn redis_rate_limiter_fail_open_allows_when_backend_is_down() {
 }
 
 #[tokio::test]
+#[ignore = "requires managed profile baseline (`just governance-up`)"]
 async fn redis_rate_limiter_fail_closed_rejects_when_backend_is_down() {
+    let postgres_url = postgres_it_url();
+    wait_for_postgres(&postgres_url).await;
+
     with_env(
         &[
+            ("RUSTACCIO_RUNTIME_PROFILE", Some("managed")),
+            ("RUSTACCIO_MANAGED_MODE", Some("true")),
+            ("RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED", Some("false")),
+            ("RUSTACCIO_ADMIN_USERS", Some("ops")),
+            ("RUSTACCIO_AUTH_EXTERNAL_MODE", Some("true")),
             ("RUSTACCIO_RATE_LIMIT_BACKEND", Some("redis")),
             (
                 "RUSTACCIO_RATE_LIMIT_REDIS_URL",
@@ -304,7 +337,11 @@ async fn redis_rate_limiter_fail_closed_rejects_when_backend_is_down() {
             ("RUSTACCIO_RATE_LIMIT_REQUESTS_PER_WINDOW", Some("1")),
             ("RUSTACCIO_RATE_LIMIT_WINDOW_SECS", Some("60")),
             ("RUSTACCIO_RATE_LIMIT_FAIL_OPEN", Some("false")),
-            ("RUSTACCIO_QUOTA_BACKEND", Some("none")),
+            ("RUSTACCIO_QUOTA_BACKEND", Some("postgres")),
+            ("RUSTACCIO_QUOTA_POSTGRES_URL", Some(postgres_url.as_str())),
+            ("RUSTACCIO_QUOTA_REQUESTS_PER_DAY", Some("0")),
+            ("RUSTACCIO_QUOTA_DOWNLOADS_PER_DAY", Some("0")),
+            ("RUSTACCIO_QUOTA_PUBLISHES_PER_DAY", Some("0")),
             ("RUSTACCIO_METRICS_BACKEND", Some("none")),
         ],
         async {
@@ -327,13 +364,23 @@ async fn redis_rate_limiter_fail_closed_rejects_when_backend_is_down() {
 #[tokio::test]
 #[ignore = "requires local Postgres (`just governance-up`)"]
 async fn postgres_quota_migrations_and_limits_are_enforced() {
+    let redis_url = redis_it_url();
     let postgres_url = postgres_it_url();
+    wait_for_redis(&redis_url).await;
     wait_for_postgres(&postgres_url).await;
     reset_postgres(&postgres_url).await;
 
     with_env(
         &[
-            ("RUSTACCIO_RATE_LIMIT_BACKEND", Some("none")),
+            ("RUSTACCIO_RUNTIME_PROFILE", Some("managed")),
+            ("RUSTACCIO_MANAGED_MODE", Some("true")),
+            ("RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED", Some("false")),
+            ("RUSTACCIO_ADMIN_USERS", Some("ops")),
+            ("RUSTACCIO_AUTH_EXTERNAL_MODE", Some("true")),
+            ("RUSTACCIO_RATE_LIMIT_BACKEND", Some("redis")),
+            ("RUSTACCIO_RATE_LIMIT_REDIS_URL", Some(redis_url.as_str())),
+            ("RUSTACCIO_RATE_LIMIT_REQUESTS_PER_WINDOW", Some("0")),
+            ("RUSTACCIO_RATE_LIMIT_WINDOW_SECS", Some("60")),
             ("RUSTACCIO_QUOTA_BACKEND", Some("postgres")),
             ("RUSTACCIO_QUOTA_POSTGRES_URL", Some(postgres_url.as_str())),
             ("RUSTACCIO_QUOTA_PUBLISHES_PER_DAY", Some("1")),

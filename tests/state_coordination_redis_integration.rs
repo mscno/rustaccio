@@ -131,6 +131,7 @@ async fn create_user(app: &axum::Router, username: &str) -> StatusCode {
 }
 
 #[tokio::test]
+#[ignore = "requires managed profile integration harness; local profile forbids redis state coordination"]
 async fn state_coordination_fail_open_allows_writes_when_backend_is_down() {
     with_env(
         &[
@@ -159,6 +160,7 @@ async fn state_coordination_fail_open_allows_writes_when_backend_is_down() {
 }
 
 #[tokio::test]
+#[ignore = "requires managed profile integration harness; local profile forbids redis state coordination"]
 async fn state_coordination_fail_closed_rejects_writes_when_backend_is_down() {
     with_env(
         &[

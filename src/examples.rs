@@ -243,6 +243,7 @@ fn env_defaults() -> BTreeMap<&'static str, &'static str> {
         ("RUSTACCIO_RATE_LIMIT_WINDOW_SECS", "60"),
         ("RUSTACCIO_PUBLISH_CHECK_OWNERS", "false"),
         ("RUSTACCIO_REQUEST_TIMEOUT_SECS", "30"),
+        ("RUSTACCIO_RUNTIME_PROFILE", "local"),
         ("RUSTACCIO_STATE_COORDINATION_ACQUIRE_TIMEOUT_MS", "15000"),
         ("RUSTACCIO_STATE_COORDINATION_BACKEND", "none"),
         ("RUSTACCIO_STATE_COORDINATION_FAIL_OPEN", "false"),
