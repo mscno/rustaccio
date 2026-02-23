@@ -65,6 +65,26 @@ where
     result
 }
 
+async fn with_unset_authority_env<T, F>(run: F) -> T
+where
+    F: Future<Output = T>,
+{
+    let _guard = env_lock().lock().await;
+    let previous = std::env::var("RUSTACCIO_PACKAGE_METADATA_AUTHORITY").ok();
+    unsafe {
+        std::env::remove_var("RUSTACCIO_PACKAGE_METADATA_AUTHORITY");
+    }
+    let result = run.await;
+    unsafe {
+        if let Some(value) = previous {
+            std::env::set_var("RUSTACCIO_PACKAGE_METADATA_AUTHORITY", value);
+        } else {
+            std::env::remove_var("RUSTACCIO_PACKAGE_METADATA_AUTHORITY");
+        }
+    }
+    result
+}
+
 fn publish_body(
     package_name: &str,
     version: &str,
@@ -135,6 +155,43 @@ async fn sidecar_authority_keeps_state_auth_only() {
             .await
             .expect("publish");
         let bytes = tokio::fs::read(&state_file).await.expect("read state");
+        let state_json: Value = serde_json::from_slice(&bytes).expect("state json");
+        assert!(
+            state_json
+                .get("packages")
+                .and_then(Value::as_object)
+                .is_some_and(|packages| packages.is_empty())
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn sidecar_authority_is_default_when_env_is_unset() {
+    with_unset_authority_env(async {
+        let dir = TempDir::new().expect("dir");
+        let data_dir = dir.path().to_path_buf();
+        let cfg = base_config(data_dir.clone());
+        let store = Store::open(&cfg).await.expect("store");
+
+        store
+            .create_user("default-authority", "secret")
+            .await
+            .expect("create user");
+        let body = publish_body(
+            "default-authority-pkg",
+            "1.0.0",
+            "default-authority-pkg-1.0.0.tgz",
+            b"default",
+        );
+        store
+            .publish_manifest("default-authority-pkg", body, "default-authority")
+            .await
+            .expect("publish");
+
+        let bytes = tokio::fs::read(data_dir.join("state.json"))
+            .await
+            .expect("read state");
         let state_json: Value = serde_json::from_slice(&bytes).expect("state json");
         assert!(
             state_json

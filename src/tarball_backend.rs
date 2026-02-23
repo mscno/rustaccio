@@ -75,7 +75,17 @@ impl TarballBackend {
         match self {
             Self::Local(backend) => backend.put(package, filename, content).await,
             #[cfg(feature = "s3")]
-            Self::S3(backend) => backend.put(package, filename, content).await,
+            Self::S3(backend) => {
+                // Keep S3 SDK publish writes on a fresh task stack; this avoids stack
+                // overflows in all-features parity runs with mocked S3 backends.
+                let backend = backend.clone();
+                let package = package.to_string();
+                let filename = filename.to_string();
+                let content = content.to_vec();
+                tokio::spawn(async move { backend.put(&package, &filename, &content).await })
+                    .await
+                    .map_err(|_| RegistryError::Internal)?
+            }
         }
     }
 
@@ -95,7 +105,14 @@ impl TarballBackend {
         match self {
             Self::Local(backend) => backend.delete(package, filename).await,
             #[cfg(feature = "s3")]
-            Self::S3(backend) => backend.delete(package, filename).await,
+            Self::S3(backend) => {
+                let backend = backend.clone();
+                let package = package.to_string();
+                let filename = filename.to_string();
+                tokio::spawn(async move { backend.delete(&package, &filename).await })
+                    .await
+                    .map_err(|_| RegistryError::Internal)?
+            }
         }
     }
 
@@ -116,12 +133,11 @@ impl TarballBackend {
     }
 
     pub async fn list_package_tarballs(&self, package: &str) -> Result<Vec<String>, RegistryError> {
-        let refs = self.list().await?;
-        Ok(refs
-            .into_iter()
-            .filter(|reference| reference.package == package)
-            .map(|reference| reference.filename)
-            .collect())
+        match self {
+            Self::Local(backend) => backend.list_package_tarballs(package).await,
+            #[cfg(feature = "s3")]
+            Self::S3(backend) => backend.list_package_tarballs(package).await,
+        }
     }
 
     pub async fn list_packages(&self) -> Result<Vec<String>, RegistryError> {
@@ -151,7 +167,16 @@ impl TarballBackend {
         match self {
             Self::Local(backend) => backend.write_package_metadata(package, metadata).await,
             #[cfg(feature = "s3")]
-            Self::S3(backend) => backend.write_package_metadata(package, metadata).await,
+            Self::S3(backend) => {
+                let backend = backend.clone();
+                let package = package.to_string();
+                let metadata = metadata.clone();
+                tokio::spawn(
+                    async move { backend.write_package_metadata(&package, &metadata).await },
+                )
+                .await
+                .map_err(|_| RegistryError::Internal)?
+            }
         }
     }
 
@@ -186,7 +211,6 @@ impl LocalTarballBackend {
         self.root.join(Self::package_dir(package)).join(filename)
     }
 
-    #[instrument(skip(self, content), fields(package, filename, bytes = content.len()))]
     pub async fn put(
         &self,
         package: &str,
@@ -202,7 +226,6 @@ impl LocalTarballBackend {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(package, filename))]
     pub async fn get(
         &self,
         package: &str,
@@ -217,7 +240,6 @@ impl LocalTarballBackend {
         Ok(Some(tokio::fs::read(path).await?))
     }
 
-    #[instrument(skip(self), fields(package, filename))]
     pub async fn delete(&self, package: &str, filename: &str) -> Result<bool, RegistryError> {
         let path = self.tarball_path(package, filename);
         if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
@@ -281,6 +303,27 @@ impl LocalTarballBackend {
         Ok(out)
     }
 
+    pub async fn list_package_tarballs(&self, package: &str) -> Result<Vec<String>, RegistryError> {
+        let path = self.root.join(Self::package_dir(package));
+        let metadata = match tokio::fs::metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(_) => return Ok(Vec::new()),
+        };
+        if !metadata.is_dir() {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        let mut files = tokio::fs::read_dir(path).await?;
+        while let Some(file) = files.next_entry().await? {
+            if !file.file_type().await?.is_file() {
+                continue;
+            }
+            out.push(file.file_name().to_string_lossy().to_string());
+        }
+        Ok(out)
+    }
+
     pub async fn read_package_metadata(
         &self,
         package: &str,
@@ -336,10 +379,21 @@ impl S3TarballBackend {
             ));
         }
 
+        let endpoint_is_https = cfg
+            .endpoint
+            .as_deref()
+            .map(|endpoint| {
+                endpoint
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("https://")
+            })
+            .unwrap_or(true);
+
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .region(aws_sdk_s3::config::Region::new(cfg.region.clone()));
 
-        if let Some(ca_bundle) = load_s3_ca_bundle_pem()? {
+        if endpoint_is_https && let Some(ca_bundle) = load_s3_ca_bundle_pem()? {
             let tls_context = aws_smithy_http_client::tls::TlsContext::builder()
                 .with_trust_store(
                     aws_smithy_http_client::tls::TrustStore::empty()
@@ -693,6 +747,50 @@ impl S3TarballBackend {
         Ok(out)
     }
 
+    pub async fn list_package_tarballs(&self, package: &str) -> Result<Vec<String>, RegistryError> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+
+        for prefix in self.candidate_prefixes_for_package(package) {
+            let mut continuation: Option<String> = None;
+            loop {
+                let mut request = self
+                    .client
+                    .list_objects_v2()
+                    .bucket(&self.bucket)
+                    .prefix(prefix.clone());
+                if let Some(token) = continuation.clone() {
+                    request = request.continuation_token(token);
+                }
+
+                let response = request
+                    .send()
+                    .await
+                    .map_err(|err| map_s3_sdk_error("list_objects_v2", &err))?;
+                for object in response.contents() {
+                    let Some(key) = object.key() else {
+                        continue;
+                    };
+                    let Some(reference) = self.parse_ref_from_key(key) else {
+                        continue;
+                    };
+                    if reference.package == package && seen.insert(reference.filename.clone()) {
+                        out.push(reference.filename);
+                    }
+                }
+
+                if response.is_truncated.unwrap_or(false) {
+                    continuation = response.next_continuation_token;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        out.sort();
+        Ok(out)
+    }
+
     pub async fn read_package_metadata(
         &self,
         package: &str,
@@ -901,16 +999,11 @@ where
         http_status = http_status.as_u16(),
         aws_code = ?err.code(),
         aws_message = ?err.message(),
-        error = ?err,
         "s3 operation failed"
     );
 
     let detail = if aws_message.is_empty() {
-        if aws_code == "unknown" {
-            format!("{err:?}")
-        } else {
-            aws_code.to_string()
-        }
+        aws_code.to_string()
     } else {
         format!("{aws_code} - {aws_message}")
     };

@@ -827,6 +827,7 @@ impl Store {
     async fn refresh_package_from_authority_cache(
         &self,
         package_name: &str,
+        retain_local_on_miss: bool,
     ) -> Result<(), RegistryError> {
         let authoritative = self.load_authoritative_package_record(package_name).await?;
         let mut state = self.state.write().await;
@@ -835,11 +836,13 @@ impl Store {
                 state.packages.insert(package_name.to_string(), record);
             }
             None => {
+                let keep_existing_local =
+                    retain_local_on_miss && state.packages.contains_key(package_name);
                 let keep_uplink = state
                     .packages
                     .get(package_name)
                     .is_some_and(|record| record.cached_from_uplink);
-                if !keep_uplink {
+                if !keep_existing_local && !keep_uplink {
                     state.packages.remove(package_name);
                 }
             }
@@ -1599,7 +1602,7 @@ impl Store {
         username: &str,
     ) -> Result<String, RegistryError> {
         self.run_package_exclusive(package_name, "publish_manifest", || async {
-            self.refresh_package_from_authority_cache(package_name)
+            self.refresh_package_from_authority_cache(package_name, true)
                 .await?;
             self.publish_manifest_inner(package_name, body, username)
                 .await
@@ -1617,32 +1620,12 @@ impl Store {
             && (body.get("users").is_some() || body.get("maintainers").is_some());
 
         if is_owner_or_star_update {
-            {
-                let mut state = self.state.write().await;
-                let record = Self::package_record(&mut state, package_name)?;
-                let Some(manifest) = record.manifest.as_object_mut() else {
-                    return Err(RegistryError::Internal);
-                };
-
-                if let Some(users) = body.get("users") {
-                    manifest.insert("users".to_string(), users.clone());
-                }
-                if let Some(maintainers) = body.get("maintainers") {
-                    manifest.insert("maintainers".to_string(), maintainers.clone());
-                }
-
-                Self::ensure_manifest_defaults(manifest, package_name, username);
-                Self::bump_revision(manifest);
-                record.updated_at = Self::now_ms();
-                record.cached_from_uplink = false;
-            }
-
-            self.sync_package_sidecar(package_name).await?;
-            debug!("updated package owner/star metadata");
-            return Ok(API_MESSAGE_PKG_CHANGED.to_string());
+            return self
+                .publish_owner_or_star_update(package_name, &body, username)
+                .await;
         }
 
-        let versions = body
+        let _versions = body
             .get("versions")
             .and_then(Value::as_object)
             .ok_or_else(|| {
@@ -1650,61 +1633,9 @@ impl Store {
             })?;
 
         if !Self::has_attachment_data(&body) {
-            let (merged_manifest, tarballs_to_delete) = {
-                let state = self.state.read().await;
-                let Some(record) = state.packages.get(package_name) else {
-                    return Err(RegistryError::http(
-                        StatusCode::BAD_REQUEST,
-                        API_ERROR_UNSUPPORTED_REGISTRY_CALL,
-                    ));
-                };
-                let Some(mut manifest) = record.manifest.as_object().cloned() else {
-                    return Err(RegistryError::Internal);
-                };
-
-                let merge_result = Self::merge_metadata_only_manifest(&mut manifest, &body)?;
-                Self::ensure_manifest_defaults(&mut manifest, package_name, username);
-                Self::bump_revision(&mut manifest);
-
-                if let Some(time_obj) = manifest.get_mut("time").and_then(Value::as_object_mut) {
-                    time_obj.insert(
-                        "modified".to_string(),
-                        Value::String(Utc::now().to_rfc3339()),
-                    );
-                }
-
-                (
-                    manifest,
-                    merge_result
-                        .tarballs_to_delete
-                        .into_iter()
-                        .collect::<Vec<_>>(),
-                )
-            };
-
-            for filename in &tarballs_to_delete {
-                self.tarball_backend.delete(package_name, filename).await?;
-            }
-
-            {
-                let mut state = self.state.write().await;
-                let Some(record) = state.packages.get_mut(package_name) else {
-                    return Err(RegistryError::http(
-                        StatusCode::BAD_REQUEST,
-                        API_ERROR_UNSUPPORTED_REGISTRY_CALL,
-                    ));
-                };
-                for filename in &tarballs_to_delete {
-                    record.upstream_tarballs.remove(filename);
-                }
-                record.manifest = Value::Object(merged_manifest);
-                record.updated_at = Self::now_ms();
-                record.cached_from_uplink = false;
-            }
-
-            self.sync_package_sidecar(package_name).await?;
-            debug!("applied metadata-only publish update");
-            return Ok(API_MESSAGE_PKG_CHANGED.to_string());
+            return self
+                .publish_metadata_only_update(package_name, &body, username)
+                .await;
         }
 
         let attachments = body
@@ -1720,6 +1651,118 @@ impl Store {
             ));
         }
 
+        let versions = body
+            .get("versions")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                RegistryError::http(StatusCode::BAD_REQUEST, API_ERROR_UNSUPPORTED_REGISTRY_CALL)
+            })?;
+        self.publish_with_attachments(package_name, &body, versions, attachments, username)
+            .await
+    }
+
+    async fn publish_owner_or_star_update(
+        &self,
+        package_name: &str,
+        body: &Value,
+        username: &str,
+    ) -> Result<String, RegistryError> {
+        {
+            let mut state = self.state.write().await;
+            let record = Self::package_record(&mut state, package_name)?;
+            let Some(manifest) = record.manifest.as_object_mut() else {
+                return Err(RegistryError::Internal);
+            };
+
+            if let Some(users) = body.get("users") {
+                manifest.insert("users".to_string(), users.clone());
+            }
+            if let Some(maintainers) = body.get("maintainers") {
+                manifest.insert("maintainers".to_string(), maintainers.clone());
+            }
+
+            Self::ensure_manifest_defaults(manifest, package_name, username);
+            Self::bump_revision(manifest);
+            record.updated_at = Self::now_ms();
+            record.cached_from_uplink = false;
+        }
+
+        self.sync_package_sidecar(package_name).await?;
+        debug!("updated package owner/star metadata");
+        Ok(API_MESSAGE_PKG_CHANGED.to_string())
+    }
+
+    async fn publish_metadata_only_update(
+        &self,
+        package_name: &str,
+        body: &Value,
+        username: &str,
+    ) -> Result<String, RegistryError> {
+        let (merged_manifest, tarballs_to_delete) = {
+            let state = self.state.read().await;
+            let Some(record) = state.packages.get(package_name) else {
+                return Err(RegistryError::http(
+                    StatusCode::BAD_REQUEST,
+                    API_ERROR_UNSUPPORTED_REGISTRY_CALL,
+                ));
+            };
+            let Some(mut manifest) = record.manifest.as_object().cloned() else {
+                return Err(RegistryError::Internal);
+            };
+
+            let merge_result = Self::merge_metadata_only_manifest(&mut manifest, body)?;
+            Self::ensure_manifest_defaults(&mut manifest, package_name, username);
+            Self::bump_revision(&mut manifest);
+
+            if let Some(time_obj) = manifest.get_mut("time").and_then(Value::as_object_mut) {
+                time_obj.insert(
+                    "modified".to_string(),
+                    Value::String(Utc::now().to_rfc3339()),
+                );
+            }
+
+            (
+                manifest,
+                merge_result
+                    .tarballs_to_delete
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        for filename in &tarballs_to_delete {
+            self.tarball_backend.delete(package_name, filename).await?;
+        }
+
+        {
+            let mut state = self.state.write().await;
+            let Some(record) = state.packages.get_mut(package_name) else {
+                return Err(RegistryError::http(
+                    StatusCode::BAD_REQUEST,
+                    API_ERROR_UNSUPPORTED_REGISTRY_CALL,
+                ));
+            };
+            for filename in &tarballs_to_delete {
+                record.upstream_tarballs.remove(filename);
+            }
+            record.manifest = Value::Object(merged_manifest);
+            record.updated_at = Self::now_ms();
+            record.cached_from_uplink = false;
+        }
+
+        self.sync_package_sidecar(package_name).await?;
+        debug!("applied metadata-only publish update");
+        Ok(API_MESSAGE_PKG_CHANGED.to_string())
+    }
+
+    async fn publish_with_attachments(
+        &self,
+        package_name: &str,
+        body: &Value,
+        versions: &Map<String, Value>,
+        attachments: &Map<String, Value>,
+        username: &str,
+    ) -> Result<String, RegistryError> {
         for (filename, attachment) in attachments {
             let Some(data_b64) = attachment.get("data").and_then(Value::as_str) else {
                 return Err(RegistryError::http(
@@ -1849,7 +1892,7 @@ impl Store {
     #[instrument(skip(self), fields(package = package_name))]
     pub async fn remove_package(&self, package_name: &str) -> Result<String, RegistryError> {
         self.run_package_exclusive(package_name, "remove_package", || async {
-            self.refresh_package_from_authority_cache(package_name)
+            self.refresh_package_from_authority_cache(package_name, false)
                 .await?;
             self.remove_package_inner(package_name).await
         })
@@ -1890,7 +1933,7 @@ impl Store {
         filename: &str,
     ) -> Result<String, RegistryError> {
         self.run_package_exclusive(package_name, "remove_tarball", || async {
-            self.refresh_package_from_authority_cache(package_name)
+            self.refresh_package_from_authority_cache(package_name, true)
                 .await?;
             self.remove_tarball_inner(package_name, filename).await
         })
@@ -1989,7 +2032,7 @@ impl Store {
         version: Option<&str>,
     ) -> Result<String, RegistryError> {
         self.run_package_exclusive(package_name, "merge_dist_tag", || async {
-            self.refresh_package_from_authority_cache(package_name)
+            self.refresh_package_from_authority_cache(package_name, true)
                 .await?;
             self.merge_dist_tag_inner(package_name, tag, version).await
         })
@@ -2126,18 +2169,18 @@ impl Store {
             .await
     }
 
-    pub async fn all_packages(&self) -> Vec<PackageRecord> {
+    pub async fn all_packages(&self) -> Result<Vec<PackageRecord>, RegistryError> {
+        let packages = self.tarball_backend.list_packages().await?;
         let mut records = Vec::new();
-        if let Ok(packages) = self.tarball_backend.list_packages().await {
-            for package_name in packages {
-                if let Ok(Some(record)) =
-                    self.load_authoritative_package_record(&package_name).await
-                {
-                    records.push(record);
-                }
+        for package_name in packages {
+            if let Some(record) = self
+                .load_authoritative_package_record(&package_name)
+                .await?
+            {
+                records.push(record);
             }
         }
-        records
+        Ok(records)
     }
 
     pub async fn reindex_from_backend(&self) -> Result<Value, RegistryError> {
@@ -2198,7 +2241,7 @@ impl Store {
             }
         }
 
-        let local_packages = self.all_packages().await;
+        let local_packages = self.all_packages().await?;
         let mut state_package_set = HashSet::new();
         let mut state_attachments: HashMap<String, HashSet<String>> = HashMap::new();
         for record in local_packages {
@@ -2298,9 +2341,9 @@ impl Store {
         }))
     }
 
-    pub async fn starred_packages(&self, user_key: &str) -> Vec<String> {
+    pub async fn starred_packages(&self, user_key: &str) -> Result<Vec<String>, RegistryError> {
         let mut rows = Vec::new();
-        for record in self.all_packages().await {
+        for record in self.all_packages().await? {
             let Some(name) = record
                 .manifest
                 .get("name")
@@ -2316,7 +2359,7 @@ impl Store {
             }
         }
         rows.sort();
-        rows
+        Ok(rows)
     }
 
     pub fn normalize_package_response(

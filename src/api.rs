@@ -145,54 +145,13 @@ pub async fn dispatch(
         .await;
     }
 
-    if path == "/-/npm/v1/security/advisories/bulk" && method == Method::POST {
+    if method == Method::POST
+        && let Some(kind) = security_audit_kind(&path)
+    {
         ensure_audit_enabled(&state)?;
         let payload = parse_json_body(&read_body(req, state.max_body_size).await?)?;
-        for upstream in select_default_uplinks(&state) {
-            match upstream.post_security_advisories_bulk(&payload).await {
-                Ok(Some(body)) => return Ok(json_response(StatusCode::OK, body, HEADER_JSON)),
-                Ok(None) => continue,
-                Err(err) if is_uplink_transient_error(&err) => continue,
-                Err(err) => return Err(err),
-            }
-        }
-        return Ok(json_response(StatusCode::OK, json!({}), HEADER_JSON));
-    }
-
-    if path == "/-/npm/v1/security/audits/quick" && method == Method::POST {
-        ensure_audit_enabled(&state)?;
-        let payload = parse_json_body(&read_body(req, state.max_body_size).await?)?;
-        for upstream in select_default_uplinks(&state) {
-            match upstream.post_security_audits_quick(&payload).await {
-                Ok(Some(body)) => return Ok(json_response(StatusCode::OK, body, HEADER_JSON)),
-                Ok(None) => continue,
-                Err(err) if is_uplink_transient_error(&err) => continue,
-                Err(err) => return Err(err),
-            }
-        }
-        return Ok(json_response(
-            StatusCode::OK,
-            empty_quick_audit_response(),
-            HEADER_JSON,
-        ));
-    }
-
-    if path == "/-/npm/v1/security/audits" && method == Method::POST {
-        ensure_audit_enabled(&state)?;
-        let payload = parse_json_body(&read_body(req, state.max_body_size).await?)?;
-        for upstream in select_default_uplinks(&state) {
-            match upstream.post_security_audits(&payload).await {
-                Ok(Some(body)) => return Ok(json_response(StatusCode::OK, body, HEADER_JSON)),
-                Ok(None) => continue,
-                Err(err) if is_uplink_transient_error(&err) => continue,
-                Err(err) => return Err(err),
-            }
-        }
-        return Ok(json_response(
-            StatusCode::OK,
-            empty_audit_response(),
-            HEADER_JSON,
-        ));
+        let body = proxy_security_audit_request(&state, &payload, kind).await?;
+        return Ok(json_response(StatusCode::OK, body, HEADER_JSON));
     }
 
     if path == "/-/_view/starredByUser" && method == Method::GET {
@@ -201,7 +160,7 @@ pub async fn dispatch(
             return Err(bad_request("missing query key username"));
         };
         let key = Store::parse_star_key(raw_key);
-        let rows = state.store.starred_packages(&key).await;
+        let rows = state.store.starred_packages(&key).await?;
         return Ok(json_response(
             StatusCode::OK,
             json!({
@@ -617,91 +576,56 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
         "handling package route"
     );
 
-    if method == Method::GET {
-        if tail.is_empty() {
-            ensure_access_permission(
-                &state,
-                &package_name,
-                auth_identity.as_ref(),
-                &request_context,
-            )
-            .await?;
-            return handle_get_package(
-                &state,
-                &headers,
-                query.as_deref(),
-                &package_name,
-                auth_user.as_deref(),
-            )
-            .await;
-        }
+    if method == Method::GET || method == Method::HEAD {
+        let response = match tail.as_slice() {
+            [] => {
+                ensure_access_permission(
+                    &state,
+                    &package_name,
+                    auth_identity.as_ref(),
+                    &request_context,
+                )
+                .await?;
+                Some(
+                    handle_get_package(
+                        &state,
+                        &headers,
+                        query.as_deref(),
+                        &package_name,
+                        auth_user.as_deref(),
+                    )
+                    .await?,
+                )
+            }
+            [version] => {
+                ensure_access_permission(
+                    &state,
+                    &package_name,
+                    auth_identity.as_ref(),
+                    &request_context,
+                )
+                .await?;
+                Some(handle_get_package_version(&state, &headers, &package_name, version).await?)
+            }
+            [dash, filename] if dash == "-" => {
+                ensure_access_permission(
+                    &state,
+                    &package_name,
+                    auth_identity.as_ref(),
+                    &request_context,
+                )
+                .await?;
+                Some(handle_get_tarball(&state, &package_name, filename).await?)
+            }
+            _ => None,
+        };
 
-        if tail.len() == 1 {
-            ensure_access_permission(
-                &state,
-                &package_name,
-                auth_identity.as_ref(),
-                &request_context,
-            )
-            .await?;
-            return handle_get_package_version(&state, &headers, &package_name, &tail[0]).await;
-        }
-
-        if tail.len() == 2 && tail[0] == "-" {
-            ensure_access_permission(
-                &state,
-                &package_name,
-                auth_identity.as_ref(),
-                &request_context,
-            )
-            .await?;
-            return handle_get_tarball(&state, &package_name, &tail[1]).await;
-        }
-    }
-
-    if method == Method::HEAD {
-        if tail.is_empty() {
-            ensure_access_permission(
-                &state,
-                &package_name,
-                auth_identity.as_ref(),
-                &request_context,
-            )
-            .await?;
-            let resp = handle_get_package(
-                &state,
-                &headers,
-                query.as_deref(),
-                &package_name,
-                auth_user.as_deref(),
-            )
-            .await?;
-            return Ok(head_response(resp));
-        }
-
-        if tail.len() == 1 {
-            ensure_access_permission(
-                &state,
-                &package_name,
-                auth_identity.as_ref(),
-                &request_context,
-            )
-            .await?;
-            let resp =
-                handle_get_package_version(&state, &headers, &package_name, &tail[0]).await?;
-            return Ok(head_response(resp));
-        }
-
-        if tail.len() == 2 && tail[0] == "-" {
-            ensure_access_permission(
-                &state,
-                &package_name,
-                auth_identity.as_ref(),
-                &request_context,
-            )
-            .await?;
-            let resp = handle_get_tarball(&state, &package_name, &tail[1]).await?;
-            return Ok(head_response(resp));
+        if let Some(response) = response {
+            return Ok(if method == Method::HEAD {
+                head_response(response)
+            } else {
+                response
+            });
         }
     }
 
@@ -1027,7 +951,7 @@ async fn handle_search(
 
     let mut objects = Vec::new();
 
-    for package in state.store.all_packages().await {
+    for package in state.store.all_packages().await? {
         if let Some(item) = make_search_object(&package.manifest) {
             let name = item
                 .get("package")
@@ -1363,6 +1287,50 @@ fn is_transient_uplink_status(status: StatusCode) -> bool {
     )
 }
 
+#[derive(Clone, Copy)]
+enum SecurityAuditKind {
+    AdvisoriesBulk,
+    AuditsQuick,
+    Audits,
+}
+
+fn security_audit_kind(path: &str) -> Option<SecurityAuditKind> {
+    match path {
+        "/-/npm/v1/security/advisories/bulk" => Some(SecurityAuditKind::AdvisoriesBulk),
+        "/-/npm/v1/security/audits/quick" => Some(SecurityAuditKind::AuditsQuick),
+        "/-/npm/v1/security/audits" => Some(SecurityAuditKind::Audits),
+        _ => None,
+    }
+}
+
+async fn proxy_security_audit_request(
+    state: &AppState,
+    payload: &Value,
+    kind: SecurityAuditKind,
+) -> Result<Value, RegistryError> {
+    for upstream in select_default_uplinks(state) {
+        let response = match kind {
+            SecurityAuditKind::AdvisoriesBulk => {
+                upstream.post_security_advisories_bulk(payload).await
+            }
+            SecurityAuditKind::AuditsQuick => upstream.post_security_audits_quick(payload).await,
+            SecurityAuditKind::Audits => upstream.post_security_audits(payload).await,
+        };
+        match response {
+            Ok(Some(body)) => return Ok(body),
+            Ok(None) => continue,
+            Err(err) if is_uplink_transient_error(&err) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(match kind {
+        SecurityAuditKind::AdvisoriesBulk => json!({}),
+        SecurityAuditKind::AuditsQuick => empty_quick_audit_response(),
+        SecurityAuditKind::Audits => empty_audit_response(),
+    })
+}
+
 async fn local_database_response(
     state: &AppState,
     query: Option<&str>,
@@ -1376,7 +1344,7 @@ async fn local_database_response(
         .cloned();
 
     let mut rows: Vec<(String, Value)> = Vec::new();
-    for record in state.store.all_packages().await {
+    for record in state.store.all_packages().await? {
         let Some(name) = record
             .manifest
             .get("name")

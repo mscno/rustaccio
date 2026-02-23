@@ -151,6 +151,7 @@ Environment variables:
 - `RUSTACCIO_S3_FORCE_PATH_STYLE` (default `true`)
 - `RUSTACCIO_S3_CA_BUNDLE` (optional PEM bundle path for S3 TLS trust; falls back to common system bundle paths when present)
 - `RUSTACCIO_PACKAGE_METADATA_AUTHORITY` (`sidecar`, default `sidecar`)
+  - Any non-empty value other than `sidecar` is rejected at startup.
 - `RUSTACCIO_STATE_COORDINATION_BACKEND` (`none`, `redis`, or `s3`, default `none`)
 - `RUSTACCIO_STATE_COORDINATION_REDIS_URL` (required for `redis` state coordination backend)
 - `RUSTACCIO_STATE_COORDINATION_LOCK_KEY` (default `rustaccio:state:lock`)
