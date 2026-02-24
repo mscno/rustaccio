@@ -9,7 +9,14 @@ use axum::http::StatusCode;
 use chrono::Utc;
 use reqwest::{Client, redirect::Policy};
 use serde_json::{Value, json};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
+    time::Duration,
+};
 use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 
@@ -33,6 +40,8 @@ pub struct HttpPolicyConfig {
     pub decision_endpoint: String,
     pub timeout_ms: u64,
     pub cache_ttl_ms: u64,
+    pub cache_max_entries: usize,
+    pub cache_prune_interval_ms: u64,
     pub fail_open: bool,
 }
 
@@ -72,6 +81,10 @@ impl HttpPolicyConfig {
             .unwrap_or_else(|| "/authorize".to_string());
         let timeout_ms = parse_u64_env("RUSTACCIO_POLICY_HTTP_TIMEOUT_MS", 3_000).max(250);
         let cache_ttl_ms = parse_u64_env("RUSTACCIO_POLICY_HTTP_CACHE_TTL_MS", 5_000);
+        let cache_max_entries =
+            parse_u64_env("RUSTACCIO_POLICY_HTTP_CACHE_MAX_ENTRIES", 10_000) as usize;
+        let cache_prune_interval_ms =
+            parse_u64_env("RUSTACCIO_POLICY_HTTP_CACHE_PRUNE_INTERVAL_MS", 30_000).max(1_000);
         let fail_open = parse_bool_env("RUSTACCIO_POLICY_HTTP_FAIL_OPEN", false);
 
         Ok(Some(Self {
@@ -79,6 +92,8 @@ impl HttpPolicyConfig {
             decision_endpoint: normalize_endpoint(&decision_endpoint),
             timeout_ms,
             cache_ttl_ms,
+            cache_max_entries,
+            cache_prune_interval_ms,
             fail_open,
         }))
     }
@@ -181,6 +196,7 @@ struct HttpPolicyBackend {
     cfg: HttpPolicyConfig,
     client: Client,
     cache: Arc<RwLock<HashMap<String, CachedDecision>>>,
+    last_cache_prune_ms: Arc<AtomicI64>,
 }
 
 impl HttpPolicyBackend {
@@ -203,6 +219,8 @@ impl HttpPolicyBackend {
             decision_endpoint = cfg.decision_endpoint,
             timeout_ms = cfg.timeout_ms,
             cache_ttl_ms = cfg.cache_ttl_ms,
+            cache_max_entries = cfg.cache_max_entries,
+            cache_prune_interval_ms = cfg.cache_prune_interval_ms,
             fail_open = cfg.fail_open,
             "initialized external policy backend"
         );
@@ -210,6 +228,7 @@ impl HttpPolicyBackend {
             cfg,
             client,
             cache: Arc::new(RwLock::new(HashMap::new())),
+            last_cache_prune_ms: Arc::new(AtomicI64::new(0)),
         })
     }
 
@@ -220,6 +239,7 @@ impl HttpPolicyBackend {
         identity: Option<&AuthIdentity>,
         request: &RequestContext,
     ) -> Result<Option<bool>, RegistryError> {
+        self.prune_cache(false).await;
         let cache_key = self.cache_key(action, package_name, identity, request);
         if self.cfg.cache_ttl_ms > 0
             && let Some(allowed) = self.cached_decision(&cache_key).await
@@ -373,11 +393,41 @@ impl HttpPolicyBackend {
                 expires_at_ms,
             },
         );
+        drop(cache);
+        self.prune_cache(true).await;
     }
 
     async fn invalidate_cache(&self) {
         let mut cache = self.cache.write().await;
         cache.clear();
+        self.last_cache_prune_ms.store(0, Ordering::Relaxed);
+    }
+
+    async fn prune_cache(&self, force: bool) {
+        let now_ms = Utc::now().timestamp_millis();
+        if !force {
+            let last_prune_ms = self.last_cache_prune_ms.load(Ordering::Relaxed);
+            if last_prune_ms > 0
+                && now_ms.saturating_sub(last_prune_ms) < self.cfg.cache_prune_interval_ms as i64
+            {
+                return;
+            }
+        }
+
+        let mut cache = self.cache.write().await;
+        cache.retain(|_, decision| decision.expires_at_ms > now_ms);
+        if self.cfg.cache_max_entries > 0 && cache.len() > self.cfg.cache_max_entries {
+            let mut by_expiry = cache
+                .iter()
+                .map(|(key, decision)| (key.clone(), decision.expires_at_ms))
+                .collect::<Vec<_>>();
+            by_expiry.sort_by_key(|(_, expires_at_ms)| *expires_at_ms);
+            let remove_count = cache.len().saturating_sub(self.cfg.cache_max_entries);
+            for (key, _) in by_expiry.into_iter().take(remove_count) {
+                cache.remove(&key);
+            }
+        }
+        self.last_cache_prune_ms.store(now_ms, Ordering::Relaxed);
     }
 }
 

@@ -192,6 +192,7 @@ pub struct RateLimitConfig {
     pub window_secs: u64,
     pub redis_url: Option<String>,
     pub fail_open: bool,
+    pub memory_max_keys: usize,
 }
 
 impl Default for RateLimitConfig {
@@ -202,6 +203,7 @@ impl Default for RateLimitConfig {
             window_secs: 60,
             redis_url: None,
             fail_open: true,
+            memory_max_keys: 10_000,
         }
     }
 }
@@ -214,6 +216,8 @@ pub struct QuotaConfig {
     pub publishes_per_day: u64,
     pub postgres_url: Option<String>,
     pub fail_open: bool,
+    pub memory_max_keys: usize,
+    pub memory_retention_days: u64,
 }
 
 impl Default for QuotaConfig {
@@ -225,6 +229,8 @@ impl Default for QuotaConfig {
             publishes_per_day: 0,
             postgres_url: None,
             fail_open: true,
+            memory_max_keys: 50_000,
+            memory_retention_days: 2,
         }
     }
 }
@@ -263,6 +269,8 @@ impl GovernanceConfig {
         cfg.rate_limit.window_secs = parse_u64_env("RUSTACCIO_RATE_LIMIT_WINDOW_SECS", 60).max(1);
         cfg.rate_limit.redis_url = env_value("RUSTACCIO_RATE_LIMIT_REDIS_URL");
         cfg.rate_limit.fail_open = parse_bool_env("RUSTACCIO_RATE_LIMIT_FAIL_OPEN", true);
+        cfg.rate_limit.memory_max_keys =
+            parse_u64_env("RUSTACCIO_RATE_LIMIT_MEMORY_MAX_KEYS", 10_000) as usize;
 
         cfg.quota.backend =
             env_value("RUSTACCIO_QUOTA_BACKEND").unwrap_or_else(|| "none".to_string());
@@ -271,6 +279,10 @@ impl GovernanceConfig {
         cfg.quota.publishes_per_day = parse_u64_env("RUSTACCIO_QUOTA_PUBLISHES_PER_DAY", 0);
         cfg.quota.postgres_url = env_value("RUSTACCIO_QUOTA_POSTGRES_URL");
         cfg.quota.fail_open = parse_bool_env("RUSTACCIO_QUOTA_FAIL_OPEN", true);
+        cfg.quota.memory_max_keys =
+            parse_u64_env("RUSTACCIO_QUOTA_MEMORY_MAX_KEYS", 50_000) as usize;
+        cfg.quota.memory_retention_days =
+            parse_u64_env("RUSTACCIO_QUOTA_MEMORY_RETENTION_DAYS", 2).max(1);
 
         cfg.metrics.backend =
             env_value("RUSTACCIO_METRICS_BACKEND").unwrap_or_else(|| "none".to_string());
@@ -298,6 +310,7 @@ impl GovernanceEngine {
             "memory" => Arc::new(InMemoryRateLimiter::new(
                 cfg.rate_limit.requests_per_window,
                 cfg.rate_limit.window_secs,
+                cfg.rate_limit.memory_max_keys.max(100),
             )),
             "redis" => {
                 #[cfg(feature = "redis")]
@@ -441,14 +454,16 @@ struct WindowState {
 struct InMemoryRateLimiter {
     limit: u64,
     window_secs: u64,
+    max_keys: usize,
     windows: AsyncMutex<HashMap<String, WindowState>>,
 }
 
 impl InMemoryRateLimiter {
-    fn new(limit: u64, window_secs: u64) -> Self {
+    fn new(limit: u64, window_secs: u64, max_keys: usize) -> Self {
         Self {
             limit,
             window_secs,
+            max_keys,
             windows: AsyncMutex::new(HashMap::new()),
         }
     }
@@ -465,6 +480,17 @@ impl GovernanceGuard for InMemoryRateLimiter {
         let now_ms = Utc::now().timestamp_millis();
         let window_ms = (self.window_secs as i64) * 1000;
         let mut windows = self.windows.lock().await;
+        if windows.len() >= self.max_keys && !windows.contains_key(&key) {
+            windows.retain(|_, state| now_ms.saturating_sub(state.window_start_ms) < window_ms);
+            if windows.len() >= self.max_keys
+                && let Some(oldest_key) = windows
+                    .iter()
+                    .min_by_key(|(_, state)| state.window_start_ms)
+                    .map(|(key, _)| key.clone())
+            {
+                windows.remove(&oldest_key);
+            }
+        }
         let entry = windows.entry(key).or_insert(WindowState {
             window_start_ms: now_ms,
             count: 0,
@@ -488,6 +514,8 @@ struct InMemoryQuotaGuard {
     requests_per_day: u64,
     downloads_per_day: u64,
     publishes_per_day: u64,
+    max_keys: usize,
+    retention_days: u64,
     usage: AsyncMutex<HashMap<(String, String, String), u64>>,
 }
 
@@ -497,6 +525,8 @@ impl InMemoryQuotaGuard {
             requests_per_day: cfg.requests_per_day,
             downloads_per_day: cfg.downloads_per_day,
             publishes_per_day: cfg.publishes_per_day,
+            max_keys: cfg.memory_max_keys.max(100),
+            retention_days: cfg.memory_retention_days.max(1),
             usage: AsyncMutex::new(HashMap::new()),
         }
     }
@@ -519,6 +549,19 @@ impl GovernanceGuard for InMemoryQuotaGuard {
         let tenant_key = tenant_key(ctx);
         let day = Utc::now().format("%Y-%m-%d").to_string();
         let mut usage = self.usage.lock().await;
+        let oldest_allowed_day = (Utc::now().date_naive()
+            - chrono::Days::new(self.retention_days.saturating_sub(1)))
+        .format("%Y-%m-%d")
+        .to_string();
+        usage.retain(|(entry_day, _, _), _| entry_day >= &oldest_allowed_day);
+        if usage.len() >= self.max_keys {
+            let mut keys = usage.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            let remove_count = usage.len().saturating_sub(self.max_keys.saturating_sub(1));
+            for key in keys.into_iter().take(remove_count) {
+                usage.remove(&key);
+            }
+        }
         let key = (day, tenant_key, metric.to_string());
         let entry = usage.entry(key).or_insert(0);
         if *entry >= limit {

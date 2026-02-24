@@ -143,6 +143,12 @@ Environment variables:
 - `RUSTACCIO_AUTH_EXTERNAL_MODE` (default `false`; disables local user/token/web-login endpoints)
 - `RUSTACCIO_AUTH_HTTP_TIMEOUT_MS` (default `5000`)
 - `RUSTACCIO_RUNTIME_PROFILE` (`local`, `s3`, or `managed`; optional override, otherwise inferred from config)
+- `RUSTACCIO_PACKAGE_DISCOVERY_MODE` (`single-node` or `multi-node`, default `single-node`)
+- `RUSTACCIO_PACKAGE_CACHE_MAX_ENTRIES` (default `5000`; bounded in-memory package cache cap)
+- `RUSTACCIO_PACKAGE_CACHE_TTL_SECS` (default `0` in `single-node`, `120` in `multi-node`; `0` keeps strict sidecar revalidation)
+- `RUSTACCIO_PACKAGE_CACHE_PRUNE_INTERVAL_SECS` (default `30`; periodic package-cache pruning)
+- `RUSTACCIO_PACKAGE_NEGATIVE_CACHE_TTL_SECS` (default `30` in `single-node`, `5` in `multi-node`)
+- `RUSTACCIO_PACKAGE_DISCOVERY_REFRESH_SECS` (default `0` in `single-node`, `15` in `multi-node`; periodic shared-backend package-name refresh)
 - `RUSTACCIO_TARBALL_BACKEND` (`local` or `s3`, default `local`)
 - `RUSTACCIO_S3_BUCKET` (required for `s3` backend)
 - `RUSTACCIO_S3_REGION` (default `us-east-1`)
@@ -166,6 +172,11 @@ Environment variables:
 - `RUSTACCIO_STATE_COORDINATION_S3_ACCESS_KEY_ID` / `RUSTACCIO_STATE_COORDINATION_S3_SECRET_ACCESS_KEY` (optional static credentials)
 - `RUSTACCIO_STATE_COORDINATION_S3_PREFIX` (default `rustaccio/state-locks/`)
 - `RUSTACCIO_STATE_COORDINATION_S3_FORCE_PATH_STYLE` (default `false`)
+- `RUSTACCIO_RATE_LIMIT_MEMORY_MAX_KEYS` (default `10000`; in-memory rate-limit key bound)
+- `RUSTACCIO_QUOTA_MEMORY_MAX_KEYS` (default `50000`; in-memory quota key bound)
+- `RUSTACCIO_QUOTA_MEMORY_RETENTION_DAYS` (default `2`; in-memory quota day retention window)
+- `RUSTACCIO_POLICY_HTTP_CACHE_MAX_ENTRIES` (default `10000`; bounded policy decision cache)
+- `RUSTACCIO_POLICY_HTTP_CACHE_PRUNE_INTERVAL_MS` (default `30000`; periodic policy-cache pruning)
 
 Build features:
 
@@ -547,6 +558,8 @@ Decision response:
 Cache control:
 
 - `POST /-/admin/policy-cache/invalidate` clears in-memory external policy decision cache for the running instance.
+- `RUSTACCIO_POLICY_HTTP_CACHE_MAX_ENTRIES` bounds in-memory policy decisions (default `10000`).
+- `RUSTACCIO_POLICY_HTTP_CACHE_PRUNE_INTERVAL_MS` controls periodic expired-entry pruning (default `30000`).
 
 ## Governance Controls (Opt-In)
 
@@ -559,6 +572,7 @@ Rate limiting:
 - `RUSTACCIO_RATE_LIMIT_WINDOW_SECS` (default `60`)
 - `RUSTACCIO_RATE_LIMIT_REDIS_URL` (required when backend=`redis`)
 - `RUSTACCIO_RATE_LIMIT_FAIL_OPEN` (default `true`)
+- `RUSTACCIO_RATE_LIMIT_MEMORY_MAX_KEYS` (default `10000`; bounds in-memory limiter key cardinality)
 
 Quota enforcement:
 
@@ -568,6 +582,8 @@ Quota enforcement:
 - `RUSTACCIO_QUOTA_PUBLISHES_PER_DAY` (default `0`, disabled)
 - `RUSTACCIO_QUOTA_POSTGRES_URL` (required when backend=`postgres`)
 - `RUSTACCIO_QUOTA_FAIL_OPEN` (default `true`)
+- `RUSTACCIO_QUOTA_MEMORY_MAX_KEYS` (default `50000`; bounds in-memory quota cardinality)
+- `RUSTACCIO_QUOTA_MEMORY_RETENTION_DAYS` (default `2`; prunes old in-memory quota day buckets)
 
 Postgres quota migrations:
 
@@ -659,6 +675,8 @@ Simple local mode defaults:
 - `RUSTACCIO_POLICY_BACKEND=local`
 - `RUSTACCIO_MANAGED_MODE=false`
 - `RUSTACCIO_STATE_COORDINATION_BACKEND=none`
+- `RUSTACCIO_PACKAGE_DISCOVERY_MODE=single-node`
+- `RUSTACCIO_PACKAGE_DISCOVERY_REFRESH_SECS=0`
 
 Shared object store mode defaults:
 
@@ -669,6 +687,8 @@ Shared object store mode defaults:
 - `RUSTACCIO_RATE_LIMIT_BACKEND=none|memory`
 - `RUSTACCIO_QUOTA_BACKEND=none|memory`
 - `RUSTACCIO_STATE_COORDINATION_BACKEND=none|s3`
+- `RUSTACCIO_PACKAGE_DISCOVERY_MODE=multi-node`
+- `RUSTACCIO_PACKAGE_DISCOVERY_REFRESH_SECS=15`
 
 Managed hardening mode:
 
@@ -681,6 +701,15 @@ Managed hardening mode:
   - `RUSTACCIO_RATE_LIMIT_BACKEND=redis`
   - `RUSTACCIO_QUOTA_BACKEND=postgres`
   - `RUSTACCIO_STATE_COORDINATION_BACKEND=redis|s3`
+
+Package discovery and cache behavior:
+
+- Rustaccio keeps an in-memory package record cache and a package-name index to avoid storage-backend round-trips on every request.
+- `RUSTACCIO_PACKAGE_DISCOVERY_MODE=single-node` favors local cache hits and on-demand backend probes (no periodic list refresh by default).
+- `RUSTACCIO_PACKAGE_DISCOVERY_MODE=multi-node` enables periodic backend list refresh (`RUSTACCIO_PACKAGE_DISCOVERY_REFRESH_SECS`) to detect package adds/removals from other nodes.
+- Package cache growth is bounded by `RUSTACCIO_PACKAGE_CACHE_MAX_ENTRIES`, TTL-controlled by `RUSTACCIO_PACKAGE_CACHE_TTL_SECS`, and pruned periodically by `RUSTACCIO_PACKAGE_CACHE_PRUNE_INTERVAL_SECS`.
+- Missing-package probes are negative-cached with `RUSTACCIO_PACKAGE_NEGATIVE_CACHE_TTL_SECS` to suppress repeated misses.
+- For strict multi-node write safety, still configure `RUSTACCIO_STATE_COORDINATION_BACKEND=redis|s3`; package discovery refresh is not a write lock.
 
 ## Deploying with Redis/Postgres Backends
 

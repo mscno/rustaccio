@@ -146,6 +146,8 @@ async fn external_policy_deny_overrides_open_acl() {
         decision_endpoint: "/authorize".to_string(),
         timeout_ms: 1_000,
         cache_ttl_ms: 0,
+        cache_max_entries: 10_000,
+        cache_prune_interval_ms: 30_000,
         fail_open: false,
     };
     let (app, token) = seeded_app(cfg, Some(policy_cfg), "deny-by-policy").await;
@@ -180,6 +182,8 @@ async fn external_policy_allow_overrides_acl_deny() {
         decision_endpoint: "/authorize".to_string(),
         timeout_ms: 1_000,
         cache_ttl_ms: 0,
+        cache_max_entries: 10_000,
+        cache_prune_interval_ms: 30_000,
         fail_open: false,
     };
     let (app, token) = seeded_app(cfg, Some(policy_cfg), "allow-by-policy").await;
@@ -197,6 +201,8 @@ async fn external_policy_fail_open_falls_back_to_acl() {
         decision_endpoint: "/authorize".to_string(),
         timeout_ms: 250,
         cache_ttl_ms: 0,
+        cache_max_entries: 10_000,
+        cache_prune_interval_ms: 30_000,
         fail_open: true,
     };
     let (app, token) = seeded_app(cfg, Some(policy_cfg), "fail-open").await;
@@ -214,6 +220,8 @@ async fn external_policy_fail_closed_returns_bad_gateway() {
         decision_endpoint: "/authorize".to_string(),
         timeout_ms: 250,
         cache_ttl_ms: 0,
+        cache_max_entries: 10_000,
+        cache_prune_interval_ms: 30_000,
         fail_open: false,
     };
     let (app, token) = seeded_app(cfg, Some(policy_cfg), "fail-closed").await;
@@ -248,6 +256,8 @@ async fn external_policy_cache_reuses_decision() {
         decision_endpoint: "/authorize".to_string(),
         timeout_ms: 1_000,
         cache_ttl_ms: 60_000,
+        cache_max_entries: 10_000,
+        cache_prune_interval_ms: 30_000,
         fail_open: false,
     };
     let (app, token) = seeded_app(cfg, Some(policy_cfg), "cache-hit").await;
@@ -291,6 +301,8 @@ async fn admin_policy_cache_invalidate_forces_recheck() {
         decision_endpoint: "/authorize".to_string(),
         timeout_ms: 1_000,
         cache_ttl_ms: 60_000,
+        cache_max_entries: 10_000,
+        cache_prune_interval_ms: 30_000,
         fail_open: false,
     };
     let (app, token) = seeded_app(cfg, Some(policy_cfg), "cache-invalidate").await;

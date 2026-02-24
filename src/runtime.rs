@@ -32,6 +32,7 @@ pub async fn build_state(
 ) -> Result<AppState, RegistryError> {
     validate_runtime_profile(config)?;
     let store = Arc::new(Store::open_with_options(config, StoreOptions { auth_hook }).await?);
+    store.start_background_maintenance();
     let acl = Acl::new(config.acl_rules.clone());
     let governance = Arc::new(GovernanceEngine::from_env().await?);
     let admin_access = AdminAccessConfig::from_env();

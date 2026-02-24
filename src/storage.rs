@@ -35,7 +35,11 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicI64, Ordering as AtomicOrdering},
+    },
+    time::Duration,
 };
 use tokio::sync::RwLock;
 use tracing::{debug, instrument, warn};
@@ -44,6 +48,90 @@ use uuid::Uuid;
 #[derive(Default)]
 pub struct StoreOptions {
     pub auth_hook: Option<Arc<dyn AuthHook>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackageDiscoveryMode {
+    SingleNode,
+    MultiNode,
+}
+
+impl PackageDiscoveryMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SingleNode => "single-node",
+            Self::MultiNode => "multi-node",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PackageCacheSettings {
+    discovery_mode: PackageDiscoveryMode,
+    max_entries: usize,
+    record_ttl_ms: i64,
+    prune_interval_ms: i64,
+    negative_ttl_ms: i64,
+    discovery_refresh_interval_ms: i64,
+}
+
+impl PackageCacheSettings {
+    fn from_env() -> Self {
+        let discovery_mode = match std::env::var("RUSTACCIO_PACKAGE_DISCOVERY_MODE")
+            .ok()
+            .unwrap_or_else(|| "single-node".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "single" | "single-node" | "single_node" | "local" => PackageDiscoveryMode::SingleNode,
+            "multi" | "multi-node" | "multi_node" | "cluster" => PackageDiscoveryMode::MultiNode,
+            _ => PackageDiscoveryMode::SingleNode,
+        };
+
+        let (default_ttl_secs, default_negative_ttl_secs, default_refresh_secs) =
+            match discovery_mode {
+                PackageDiscoveryMode::SingleNode => (0_u64, 30_u64, 0_u64),
+                PackageDiscoveryMode::MultiNode => (120_u64, 5_u64, 15_u64),
+            };
+
+        let max_entries = parse_usize_env("RUSTACCIO_PACKAGE_CACHE_MAX_ENTRIES", 5_000).max(100);
+        let ttl_secs = parse_u64_env("RUSTACCIO_PACKAGE_CACHE_TTL_SECS", default_ttl_secs);
+        let prune_interval_secs =
+            parse_u64_env("RUSTACCIO_PACKAGE_CACHE_PRUNE_INTERVAL_SECS", 30).max(1);
+        let negative_ttl_secs = parse_u64_env(
+            "RUSTACCIO_PACKAGE_NEGATIVE_CACHE_TTL_SECS",
+            default_negative_ttl_secs,
+        );
+        let refresh_secs = parse_u64_env(
+            "RUSTACCIO_PACKAGE_DISCOVERY_REFRESH_SECS",
+            default_refresh_secs,
+        );
+
+        Self {
+            discovery_mode,
+            max_entries,
+            record_ttl_ms: (ttl_secs as i64).saturating_mul(1_000),
+            prune_interval_ms: (prune_interval_secs as i64).saturating_mul(1_000),
+            negative_ttl_ms: (negative_ttl_secs as i64).saturating_mul(1_000),
+            discovery_refresh_interval_ms: (refresh_secs as i64).saturating_mul(1_000),
+        }
+    }
+}
+
+#[derive(Default)]
+struct KnownPackagesIndex {
+    initialized: bool,
+    last_refresh_ms: i64,
+    packages: HashSet<String>,
+    missing: HashMap<String, i64>,
+}
+
+impl KnownPackagesIndex {
+    fn prune_missing(&mut self, now_ms: i64) {
+        self.missing
+            .retain(|_, expires_at_ms| *expires_at_ms > now_ms);
+    }
 }
 
 pub struct Store {
@@ -55,6 +143,10 @@ pub struct Store {
     auth_hook: Option<Arc<dyn AuthHook>>,
     password_min_length: usize,
     login_session_ttl_seconds: i64,
+    package_cache: PackageCacheSettings,
+    known_packages: RwLock<KnownPackagesIndex>,
+    last_package_cache_prune_ms: AtomicI64,
+    maintenance_started: AtomicBool,
 }
 
 #[derive(Serialize)]
@@ -86,6 +178,7 @@ impl Store {
         tokio::fs::create_dir_all(&config.data_dir).await?;
         let tarball_backend = TarballBackend::from_config(config).await?;
         let state_coordinator = StateWriteCoordinator::from_env().await?;
+        let package_cache = PackageCacheSettings::from_env();
 
         let state_file = config.data_dir.join("state.json");
         let mut state = Self::read_local_snapshot(&state_file).await?;
@@ -113,13 +206,218 @@ impl Store {
             auth_hook: options.auth_hook,
             password_min_length: config.password_min_length,
             login_session_ttl_seconds: config.login_session_ttl_seconds,
+            package_cache: package_cache.clone(),
+            known_packages: RwLock::new(KnownPackagesIndex::default()),
+            last_package_cache_prune_ms: AtomicI64::new(0),
+            maintenance_started: AtomicBool::new(false),
         };
-        debug!("store initialized");
+        debug!(
+            discovery_mode = package_cache.discovery_mode.as_str(),
+            max_entries = package_cache.max_entries,
+            cache_ttl_ms = package_cache.record_ttl_ms,
+            prune_interval_ms = package_cache.prune_interval_ms,
+            negative_ttl_ms = package_cache.negative_ttl_ms,
+            discovery_refresh_interval_ms = package_cache.discovery_refresh_interval_ms,
+            "store initialized"
+        );
         Ok(store)
     }
 
     fn now_ms() -> i64 {
         Utc::now().timestamp_millis()
+    }
+
+    pub fn start_background_maintenance(self: &Arc<Self>) {
+        let prune_enabled = self.package_cache.prune_interval_ms > 0;
+        let refresh_enabled = self.package_cache.discovery_refresh_interval_ms > 0;
+        if !prune_enabled && !refresh_enabled {
+            return;
+        }
+        if self.maintenance_started.swap(true, AtomicOrdering::SeqCst) {
+            return;
+        }
+
+        let interval_ms = [
+            self.package_cache.prune_interval_ms,
+            self.package_cache.discovery_refresh_interval_ms,
+        ]
+        .into_iter()
+        .filter(|value| *value > 0)
+        .min()
+        .unwrap_or(30_000)
+        .max(1_000);
+
+        let store = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(interval_ms as u64));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                interval.tick().await;
+                store.prune_package_cache_if_due(false).await;
+                if let Err(error) = store.refresh_known_packages_if_due(false).await {
+                    warn!(error = ?error, "failed to refresh known package index");
+                }
+            }
+        });
+    }
+
+    fn authoritative_cache_entry_fresh(&self, record: &PackageRecord, now_ms: i64) -> bool {
+        if record.cached_from_uplink {
+            return true;
+        }
+        if self.package_cache.record_ttl_ms <= 0 {
+            return false;
+        }
+        now_ms.saturating_sub(record.updated_at) <= self.package_cache.record_ttl_ms
+    }
+
+    async fn refresh_known_packages_if_due(&self, force: bool) -> Result<(), RegistryError> {
+        let refresh_interval_ms = self.package_cache.discovery_refresh_interval_ms;
+        if refresh_interval_ms <= 0 && !force {
+            return Ok(());
+        }
+
+        let now_ms = Self::now_ms();
+        {
+            let known = self.known_packages.read().await;
+            if !force
+                && known.initialized
+                && now_ms.saturating_sub(known.last_refresh_ms) < refresh_interval_ms
+            {
+                return Ok(());
+            }
+        }
+
+        let packages = self.tarball_backend.list_packages().await?;
+        let package_set = packages.into_iter().collect::<HashSet<_>>();
+        let package_count = package_set.len();
+
+        let mut known = self.known_packages.write().await;
+        known.initialized = true;
+        known.last_refresh_ms = now_ms;
+        known.packages = package_set;
+        let known_packages = known.packages.clone();
+        known.missing.retain(|package, expires_at_ms| {
+            *expires_at_ms > now_ms && !known_packages.contains(package)
+        });
+
+        debug!(
+            package_count,
+            discovery_mode = self.package_cache.discovery_mode.as_str(),
+            "refreshed known package index"
+        );
+        Ok(())
+    }
+
+    async fn should_probe_authoritative_backend(&self, package_name: &str) -> bool {
+        if let Err(error) = self.refresh_known_packages_if_due(false).await {
+            warn!(error = ?error, "known package index refresh failed; falling back to direct probe");
+        }
+
+        let now_ms = Self::now_ms();
+        let mut known = self.known_packages.write().await;
+        known.prune_missing(now_ms);
+        if known.packages.contains(package_name) {
+            return true;
+        }
+        if known.missing.contains_key(package_name) {
+            return false;
+        }
+        if self.package_cache.discovery_mode == PackageDiscoveryMode::MultiNode && known.initialized
+        {
+            if self.package_cache.negative_ttl_ms > 0 {
+                known.missing.insert(
+                    package_name.to_string(),
+                    now_ms.saturating_add(self.package_cache.negative_ttl_ms),
+                );
+            }
+            return false;
+        }
+        true
+    }
+
+    async fn mark_known_package(&self, package_name: &str) {
+        let mut known = self.known_packages.write().await;
+        known.packages.insert(package_name.to_string());
+        known.missing.remove(package_name);
+    }
+
+    async fn mark_missing_package(&self, package_name: &str) {
+        let mut known = self.known_packages.write().await;
+        known.packages.remove(package_name);
+        if self.package_cache.negative_ttl_ms > 0 {
+            known.missing.insert(
+                package_name.to_string(),
+                Self::now_ms().saturating_add(self.package_cache.negative_ttl_ms),
+            );
+        } else {
+            known.missing.remove(package_name);
+        }
+    }
+
+    fn prune_package_cache_with_settings(
+        state: &mut PersistedState,
+        settings: &PackageCacheSettings,
+        now_ms: i64,
+    ) -> usize {
+        let before = state.packages.len();
+        if settings.record_ttl_ms > 0 {
+            state.packages.retain(|_, record| {
+                now_ms.saturating_sub(record.updated_at) <= settings.record_ttl_ms
+            });
+        }
+
+        if settings.max_entries > 0 && state.packages.len() > settings.max_entries {
+            let mut by_age = state
+                .packages
+                .iter()
+                .map(|(name, record)| (name.clone(), record.updated_at))
+                .collect::<Vec<_>>();
+            by_age.sort_by_key(|(_, updated_at)| *updated_at);
+
+            let remove_count = state.packages.len().saturating_sub(settings.max_entries);
+            for (package_name, _) in by_age.into_iter().take(remove_count) {
+                state.packages.remove(&package_name);
+            }
+        }
+
+        before.saturating_sub(state.packages.len())
+    }
+
+    async fn prune_package_cache_now(&self, reason: &str) {
+        let now_ms = Self::now_ms();
+        let removed = {
+            let mut state = self.state.write().await;
+            Self::prune_package_cache_with_settings(&mut state, &self.package_cache, now_ms)
+        };
+        {
+            let mut known = self.known_packages.write().await;
+            known.prune_missing(now_ms);
+        }
+        self.last_package_cache_prune_ms
+            .store(now_ms, AtomicOrdering::Relaxed);
+        if removed > 0 {
+            debug!(removed, reason, "pruned package cache");
+        }
+    }
+
+    async fn prune_package_cache_if_due(&self, force: bool) {
+        if self.package_cache.prune_interval_ms <= 0 && !force {
+            return;
+        }
+        if !force {
+            let now_ms = Self::now_ms();
+            let last_prune_ms = self
+                .last_package_cache_prune_ms
+                .load(AtomicOrdering::Relaxed);
+            if last_prune_ms > 0
+                && now_ms.saturating_sub(last_prune_ms) < self.package_cache.prune_interval_ms
+            {
+                return;
+            }
+        }
+        self.prune_package_cache_now("scheduled").await;
     }
 
     fn ensure_sidecar_metadata_authority() -> Result<(), RegistryError> {
@@ -830,6 +1128,7 @@ impl Store {
         retain_local_on_miss: bool,
     ) -> Result<(), RegistryError> {
         let authoritative = self.load_authoritative_package_record(package_name).await?;
+        let authoritative_found = authoritative.is_some();
         let mut state = self.state.write().await;
         match authoritative {
             Some(record) => {
@@ -847,6 +1146,13 @@ impl Store {
                 }
             }
         }
+        drop(state);
+        if authoritative_found {
+            self.mark_known_package(package_name).await;
+        } else {
+            self.mark_missing_package(package_name).await;
+        }
+        self.prune_package_cache_if_due(false).await;
         Ok(())
     }
 
@@ -1885,6 +2191,8 @@ impl Store {
         };
 
         self.sync_package_sidecar(package_name).await?;
+        self.mark_known_package(package_name).await;
+        self.prune_package_cache_if_due(false).await;
         debug!(message = message.as_str(), "published package manifest");
         Ok(message)
     }
@@ -1921,6 +2229,7 @@ impl Store {
                 ));
             }
         }
+        self.mark_missing_package(package_name).await;
 
         debug!("removed package");
         Ok(API_MESSAGE_PKG_REMOVED.to_string())
@@ -2092,27 +2401,58 @@ impl Store {
     }
 
     pub async fn get_package_record(&self, package_name: &str) -> Option<PackageRecord> {
+        let now_ms = Self::now_ms();
         {
             let state = self.state.read().await;
             if let Some(record) = state.packages.get(package_name)
-                && record.cached_from_uplink
+                && (record.cached_from_uplink
+                    || self.authoritative_cache_entry_fresh(record, now_ms))
             {
                 return Some(record.clone());
             }
         }
 
-        let authoritative = self
-            .load_authoritative_package_record(package_name)
-            .await
-            .ok()
-            .flatten()?;
-        {
-            let mut state = self.state.write().await;
-            state
-                .packages
-                .insert(package_name.to_string(), authoritative.clone());
+        if !self.should_probe_authoritative_backend(package_name).await {
+            return None;
         }
-        Some(authoritative)
+
+        let authoritative = match self.load_authoritative_package_record(package_name).await {
+            Ok(record) => record,
+            Err(error) => {
+                warn!(
+                    error = ?error,
+                    package = package_name,
+                    "authoritative package lookup failed"
+                );
+                return None;
+            }
+        };
+
+        match authoritative {
+            Some(record) => {
+                self.mark_known_package(package_name).await;
+                {
+                    let mut state = self.state.write().await;
+                    state
+                        .packages
+                        .insert(package_name.to_string(), record.clone());
+                }
+                self.prune_package_cache_if_due(false).await;
+                Some(record)
+            }
+            None => {
+                if self.package_cache.discovery_mode == PackageDiscoveryMode::SingleNode {
+                    let state = self.state.read().await;
+                    if let Some(local) = state.packages.get(package_name)
+                        && !local.cached_from_uplink
+                    {
+                        return Some(local.clone());
+                    }
+                }
+                self.mark_missing_package(package_name).await;
+                None
+            }
+        }
     }
 
     #[instrument(skip(self, manifest, upstream_tarballs), fields(package = package_name, upstream_tarball_count = upstream_tarballs.len()))]
@@ -2122,18 +2462,21 @@ impl Store {
         manifest: Value,
         upstream_tarballs: HashMap<String, String>,
     ) -> Result<(), RegistryError> {
-        let mut state = self.state.write().await;
-        state.packages.insert(
-            package_name.to_string(),
-            PackageRecord {
-                manifest,
-                upstream_tarballs,
-                updated_at: Self::now_ms(),
-                cached_from_uplink: true,
-            },
-        );
+        {
+            let mut state = self.state.write().await;
+            state.packages.insert(
+                package_name.to_string(),
+                PackageRecord {
+                    manifest,
+                    upstream_tarballs,
+                    updated_at: Self::now_ms(),
+                    cached_from_uplink: true,
+                },
+            );
+        }
 
         debug!("upserted upstream package cache");
+        self.prune_package_cache_if_due(false).await;
         Ok(())
     }
 
@@ -2192,6 +2535,10 @@ impl Store {
             let after_packages = state.packages.len();
             (changed, before_packages, after_packages)
         };
+        if let Err(error) = self.refresh_known_packages_if_due(true).await {
+            warn!(error = ?error, "failed to refresh known package index after reindex");
+        }
+        self.prune_package_cache_now("reindex").await;
         let sidecars_synced = if changed {
             self.sync_all_package_sidecars().await?
         } else {
@@ -2816,6 +3163,20 @@ pub fn normalize_scope_path(parts: &[&str]) -> String {
     parts.join("/")
 }
 
+fn parse_u64_env(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn parse_usize_env(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
 pub fn parse_authorization(header: Option<&str>) -> Option<String> {
     let value = header?.trim();
     if let Some(token) = value.strip_prefix("Bearer ") {
@@ -2843,8 +3204,9 @@ pub fn ok_object() -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::Store;
-    use crate::config::Config;
+    use super::{PackageCacheSettings, PackageDiscoveryMode, Store};
+    use crate::{config::Config, models::PackageRecord};
+    use serde_json::json;
     use std::{io::Write, path::Path};
 
     fn config_for_data_dir(data_dir: &Path) -> Config {
@@ -2924,5 +3286,90 @@ mod tests {
                 .and_then(serde_json::Value::as_object)
                 .is_some_and(|versions| versions.contains_key("2.3.4"))
         );
+    }
+
+    #[test]
+    fn package_cache_prune_enforces_max_entries() {
+        let mut state = crate::models::PersistedState::default();
+        state.packages.insert(
+            "pkg-a".to_string(),
+            PackageRecord {
+                manifest: json!({}),
+                upstream_tarballs: std::collections::HashMap::new(),
+                updated_at: 10,
+                cached_from_uplink: false,
+            },
+        );
+        state.packages.insert(
+            "pkg-b".to_string(),
+            PackageRecord {
+                manifest: json!({}),
+                upstream_tarballs: std::collections::HashMap::new(),
+                updated_at: 20,
+                cached_from_uplink: false,
+            },
+        );
+        state.packages.insert(
+            "pkg-c".to_string(),
+            PackageRecord {
+                manifest: json!({}),
+                upstream_tarballs: std::collections::HashMap::new(),
+                updated_at: 30,
+                cached_from_uplink: false,
+            },
+        );
+
+        let settings = PackageCacheSettings {
+            discovery_mode: PackageDiscoveryMode::SingleNode,
+            max_entries: 2,
+            record_ttl_ms: 0,
+            prune_interval_ms: 1_000,
+            negative_ttl_ms: 1_000,
+            discovery_refresh_interval_ms: 0,
+        };
+
+        let removed = Store::prune_package_cache_with_settings(&mut state, &settings, 30);
+        assert_eq!(removed, 1);
+        assert_eq!(state.packages.len(), 2);
+        assert!(!state.packages.contains_key("pkg-a"));
+        assert!(state.packages.contains_key("pkg-b"));
+        assert!(state.packages.contains_key("pkg-c"));
+    }
+
+    #[test]
+    fn package_cache_prune_drops_expired_entries() {
+        let mut state = crate::models::PersistedState::default();
+        state.packages.insert(
+            "expired".to_string(),
+            PackageRecord {
+                manifest: json!({}),
+                upstream_tarballs: std::collections::HashMap::new(),
+                updated_at: 1_000,
+                cached_from_uplink: false,
+            },
+        );
+        state.packages.insert(
+            "fresh".to_string(),
+            PackageRecord {
+                manifest: json!({}),
+                upstream_tarballs: std::collections::HashMap::new(),
+                updated_at: 9_700,
+                cached_from_uplink: false,
+            },
+        );
+
+        let settings = PackageCacheSettings {
+            discovery_mode: PackageDiscoveryMode::SingleNode,
+            max_entries: 10,
+            record_ttl_ms: 2_000,
+            prune_interval_ms: 1_000,
+            negative_ttl_ms: 1_000,
+            discovery_refresh_interval_ms: 0,
+        };
+
+        let removed = Store::prune_package_cache_with_settings(&mut state, &settings, 10_000);
+        assert_eq!(removed, 1);
+        assert!(!state.packages.contains_key("expired"));
+        assert!(state.packages.contains_key("fresh"));
     }
 }

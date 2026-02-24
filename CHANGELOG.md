@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Breaking: removed snapshot-based package metadata persistence and shared S3 `__rustaccio_meta/state.json` package snapshots. Package metadata is now always sidecar-authoritative (`package.json`), and local `state.json` persists auth/session/token records only.
 - Breaking: runtime startup now enforces deployment profiles (`local|s3|managed`) with `RUSTACCIO_RUNTIME_PROFILE` override or automatic profile inference from config, including strict backend requirements for the managed profile (`redis` rate limiting + `postgres` quotas + `redis|s3` state coordination).
 - Breaking: backend selector parsing is now strict for auth, tarball, and policy backends (invalid backend values fail fast at startup instead of silently falling back).
+- Added bounded in-memory caches with periodic pruning for package metadata and external policy decisions; added package discovery modes (`single-node|multi-node`) with optional periodic shared-backend package-name refresh.
+- Added memory-cardinality bounds for in-memory governance backends (rate limiter/quota) to prevent unbounded key growth.
 
 ### Removed
 

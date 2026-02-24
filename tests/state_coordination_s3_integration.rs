@@ -10,7 +10,10 @@ use axum::{
     http::{Method, Request, StatusCode, header},
 };
 use rustaccio::{
-    config::{AuthBackend, AuthPluginConfig, Config, TarballStorageBackend, TarballStorageConfig},
+    config::{
+        AuthBackend, AuthPluginConfig, Config, S3TarballStorageConfig, TarballStorageBackend,
+        TarballStorageConfig,
+    },
     runtime,
 };
 use serde_json::json;
@@ -47,8 +50,16 @@ fn base_config(data_dir: std::path::PathBuf) -> Config {
             http: None,
         },
         tarball_storage: TarballStorageConfig {
-            backend: TarballStorageBackend::Local,
-            s3: None,
+            backend: TarballStorageBackend::S3,
+            s3: Some(S3TarballStorageConfig {
+                bucket: "rustaccio-it".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: Some("http://127.0.0.1:9002".to_string()),
+                access_key_id: Some("minioadmin".to_string()),
+                secret_access_key: Some("minioadmin".to_string()),
+                prefix: "registry/".to_string(),
+                force_path_style: true,
+            }),
         },
     }
 }
