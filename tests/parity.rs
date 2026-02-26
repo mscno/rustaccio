@@ -1671,6 +1671,95 @@ async fn scoped_and_encoded_package_routes() {
 }
 
 #[tokio::test]
+async fn scoped_publish_normalizes_scoped_attachment_keys() {
+    let dir = TempDir::new().expect("dir");
+    let app = test_app(dir.path().to_path_buf(), None).await;
+    let token = create_user(&app, "scope-normalize-user", "secret").await;
+
+    let package = "@scope/normalize";
+    let tarball = "normalize-1.0.0.tgz";
+    let mut manifest = pkg_manifest(package, "1.0.0", tarball, b"normalize-bytes");
+    manifest["versions"]["1.0.0"]["dist"]["tarball"] =
+        json!("http://localhost:5555/@scope/normalize/-/@scope/normalize-1.0.0.tgz");
+    let attachment = manifest["_attachments"][tarball].clone();
+    manifest["_attachments"] = json!({
+        "@scope/normalize-1.0.0.tgz": attachment
+    });
+
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri("/%40scope%2Fnormalize")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(serde_json::to_vec(&manifest).expect("payload")))
+        .expect("request");
+    assert_eq!(send(&app, req).await.status(), StatusCode::CREATED);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/%40scope%2Fnormalize")
+        .header(header::HOST, "localhost:4873")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["versions"]["1.0.0"]["dist"]["tarball"].as_str(),
+        Some("http://localhost:4873/%40scope%2Fnormalize/-/normalize-1.0.0.tgz")
+    );
+    assert!(body["_attachments"].get("normalize-1.0.0.tgz").is_some());
+    assert_eq!(
+        body["_attachments"]["normalize-1.0.0.tgz"]["version"].as_str(),
+        Some("1.0.0")
+    );
+    assert_eq!(
+        body["_attachments"]["normalize-1.0.0.tgz"]["shasum"].as_str(),
+        Some("2c03764f651a9f016ca0b7620421457b619151b9")
+    );
+    assert!(
+        body["_attachments"]
+            .get("@scope/normalize-1.0.0.tgz")
+            .is_none()
+    );
+    assert!(body["time"]["1.0.0"].as_str().is_some());
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/%40scope%2Fnormalize/-/normalize-1.0.0.tgz")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(bytes_body(resp).await, b"normalize-bytes");
+
+    let stored = dir
+        .path()
+        .join("tarballs")
+        .join("@scope__normalize")
+        .join("normalize-1.0.0.tgz");
+    assert!(
+        tokio::fs::try_exists(&stored)
+            .await
+            .expect("stored tarball exists check"),
+        "normalized tarball filename should be written to canonical location"
+    );
+
+    let nested = dir
+        .path()
+        .join("tarballs")
+        .join("@scope__normalize")
+        .join("@scope")
+        .join("normalize-1.0.0.tgz");
+    assert!(
+        !tokio::fs::try_exists(&nested)
+            .await
+            .expect("nested tarball exists check"),
+        "scoped attachment key should not create nested tarball path"
+    );
+}
+
+#[tokio::test]
 async fn install_v1_manifest_strips_non_install_fields() {
     let dir = TempDir::new().expect("dir");
     let app = test_app(dir.path().to_path_buf(), None).await;

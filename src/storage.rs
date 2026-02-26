@@ -24,7 +24,7 @@ use crate::{
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::http::StatusCode;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-use chrono::Utc;
+use chrono::{SecondsFormat, Utc};
 use password_hash::{SaltString, rand_core::OsRng};
 use rand::RngCore;
 use serde::Serialize;
@@ -1790,6 +1790,10 @@ impl Store {
         Value::Object(obj)
     }
 
+    fn now_rfc3339_timestamp() -> String {
+        Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    }
+
     fn ensure_manifest_defaults(
         manifest: &mut Map<String, Value>,
         package_name: &str,
@@ -1826,7 +1830,7 @@ impl Store {
             }
         }
 
-        let now = Utc::now().to_rfc3339();
+        let now = Self::now_rfc3339_timestamp();
         let time = manifest
             .entry("time")
             .or_insert_with(|| Value::Object(Map::new()));
@@ -1850,6 +1854,121 @@ impl Store {
                         .all(|attachment| attachment.get("data").and_then(Value::as_str).is_some())
             })
             .unwrap_or(false)
+    }
+
+    fn attachment_basename(name: &str) -> Option<&str> {
+        name.rsplit(['/', '\\']).find(|segment| !segment.is_empty())
+    }
+
+    fn normalized_attachment_filename(name: &str) -> Result<String, RegistryError> {
+        let Some(filename) = Self::attachment_basename(name) else {
+            return Err(RegistryError::http(
+                StatusCode::BAD_REQUEST,
+                API_ERROR_UNSUPPORTED_REGISTRY_CALL,
+            ));
+        };
+        if filename == "." || filename == ".." {
+            return Err(RegistryError::http(
+                StatusCode::BAD_REQUEST,
+                API_ERROR_UNSUPPORTED_REGISTRY_CALL,
+            ));
+        }
+        Ok(filename.to_string())
+    }
+
+    fn normalized_attachment_names(
+        attachments: &Map<String, Value>,
+    ) -> Result<Vec<(String, String)>, RegistryError> {
+        let mut names = Vec::with_capacity(attachments.len());
+        let mut seen = HashSet::with_capacity(attachments.len());
+        for raw_name in attachments.keys() {
+            let normalized_name = Self::normalized_attachment_filename(raw_name)?;
+            if !seen.insert(normalized_name.clone()) {
+                return Err(RegistryError::http(
+                    StatusCode::BAD_REQUEST,
+                    API_ERROR_UNSUPPORTED_REGISTRY_CALL,
+                ));
+            }
+            names.push((raw_name.clone(), normalized_name));
+        }
+        Ok(names)
+    }
+
+    fn normalize_version_dist_tarball(package_name: &str, payload: &mut Value) {
+        let Some(dist_obj) = payload.get_mut("dist").and_then(Value::as_object_mut) else {
+            return;
+        };
+        let Some(raw_tarball) = dist_obj
+            .get("tarball")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let Some(raw_filename) = package_filename_from_tarball_url(&raw_tarball) else {
+            return;
+        };
+        let Ok(filename) = Self::normalized_attachment_filename(&raw_filename) else {
+            return;
+        };
+        let normalized_tarball = Self::inferred_tarball_url(package_name, &filename);
+        if raw_tarball != normalized_tarball {
+            dist_obj.insert("tarball".to_string(), Value::String(normalized_tarball));
+        }
+    }
+
+    fn attachment_metadata_for_publish(
+        versions: &Map<String, Value>,
+        filename: &str,
+        attachment: &Value,
+    ) -> Value {
+        let mut version_for_file: Option<String> = None;
+        let mut shasum_for_file: Option<String> = None;
+
+        for (version, payload) in versions {
+            let Some(dist) = payload.get("dist").and_then(Value::as_object) else {
+                continue;
+            };
+            let Some(tarball_filename) = dist
+                .get("tarball")
+                .and_then(Value::as_str)
+                .and_then(package_filename_from_tarball_url)
+            else {
+                continue;
+            };
+            let Ok(normalized_tarball_filename) =
+                Self::normalized_attachment_filename(&tarball_filename)
+            else {
+                continue;
+            };
+            if normalized_tarball_filename != filename {
+                continue;
+            }
+            version_for_file = Some(version.clone());
+            shasum_for_file = dist
+                .get("shasum")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            break;
+        }
+
+        let mut obj = Map::new();
+        if let Some(shasum) = shasum_for_file {
+            obj.insert("shasum".to_string(), Value::String(shasum));
+        }
+        if let Some(version) = version_for_file.or_else(|| {
+            attachment
+                .get("version")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }) {
+            obj.insert("version".to_string(), Value::String(version));
+        }
+
+        if obj.is_empty() {
+            return Self::remove_attachment_data(attachment);
+        }
+        Value::Object(obj)
     }
 
     fn tarball_filename_from_version_payload(payload: &Value) -> Option<String> {
@@ -1952,22 +2071,36 @@ impl Store {
         }
 
         if let Some(attachments) = body.get("_attachments").and_then(Value::as_object) {
+            let normalized_attachment_names = Self::normalized_attachment_names(attachments)?;
             let previous_attachment_names = manifest
                 .get("_attachments")
                 .and_then(Value::as_object)
                 .map(|existing| existing.keys().cloned().collect::<HashSet<_>>())
                 .unwrap_or_default();
             let mut new_attachments = Map::new();
-            for (name, attachment) in attachments {
-                new_attachments.insert(name.clone(), Self::remove_attachment_data(attachment));
+            let mut new_attachment_names = HashSet::with_capacity(attachments.len());
+            for (raw_name, normalized_name) in normalized_attachment_names {
+                let Some(attachment) = attachments.get(&raw_name) else {
+                    return Err(RegistryError::Internal);
+                };
+                new_attachments.insert(
+                    normalized_name.clone(),
+                    Self::remove_attachment_data(attachment),
+                );
+                new_attachment_names.insert(normalized_name);
             }
-            let new_attachment_names = new_attachments.keys().cloned().collect::<HashSet<_>>();
-            for filename in previous_attachment_names.difference(&new_attachment_names) {
-                result.tarballs_to_delete.insert(filename.clone());
+            for filename in &previous_attachment_names {
+                let normalized_filename = Self::normalized_attachment_filename(filename)
+                    .unwrap_or_else(|_| filename.clone());
+                if !new_attachment_names.contains(&normalized_filename) {
+                    result.tarballs_to_delete.insert(filename.clone());
+                }
             }
-            result
-                .tarballs_to_delete
-                .retain(|filename| !new_attachment_names.contains(filename));
+            result.tarballs_to_delete.retain(|filename| {
+                let normalized_filename = Self::normalized_attachment_filename(filename)
+                    .unwrap_or_else(|_| filename.clone());
+                !new_attachment_names.contains(&normalized_filename)
+            });
             manifest.insert("_attachments".to_string(), Value::Object(new_attachments));
         } else if !result.tarballs_to_delete.is_empty()
             && let Some(existing_attachments) = manifest
@@ -2135,7 +2268,7 @@ impl Store {
             if let Some(time_obj) = manifest.get_mut("time").and_then(Value::as_object_mut) {
                 time_obj.insert(
                     "modified".to_string(),
-                    Value::String(Utc::now().to_rfc3339()),
+                    Value::String(Self::now_rfc3339_timestamp()),
                 );
             }
 
@@ -2181,7 +2314,12 @@ impl Store {
         attachments: &Map<String, Value>,
         username: &str,
     ) -> Result<String, RegistryError> {
-        for (filename, attachment) in attachments {
+        let published_versions: Vec<String> = versions.keys().cloned().collect();
+        let attachment_names = Self::normalized_attachment_names(attachments)?;
+        for (raw_name, filename) in &attachment_names {
+            let Some(attachment) = attachments.get(raw_name) else {
+                return Err(RegistryError::Internal);
+            };
             let Some(data_b64) = attachment.get("data").and_then(Value::as_str) else {
                 return Err(RegistryError::http(
                     StatusCode::BAD_REQUEST,
@@ -2220,7 +2358,9 @@ impl Store {
                 }
 
                 for (version, payload) in versions {
-                    dst_versions.insert(version.clone(), payload.clone());
+                    let mut normalized_payload = payload.clone();
+                    Self::normalize_version_dist_tarball(package_name, &mut normalized_payload);
+                    dst_versions.insert(version.clone(), normalized_payload);
                 }
 
                 if let Some(tags) = body.get("dist-tags").and_then(Value::as_object) {
@@ -2240,8 +2380,18 @@ impl Store {
                     .as_object_mut()
                     .ok_or(RegistryError::Internal)?;
 
-                for (name, attachment) in attachments {
-                    dst_attachments.insert(name.clone(), Self::remove_attachment_data(attachment));
+                for (raw_name, normalized_name) in &attachment_names {
+                    let Some(attachment) = attachments.get(raw_name) else {
+                        return Err(RegistryError::Internal);
+                    };
+                    dst_attachments.insert(
+                        normalized_name.clone(),
+                        Self::attachment_metadata_for_publish(
+                            versions,
+                            normalized_name,
+                            attachment,
+                        ),
+                    );
                 }
 
                 if let Some(users) = body.get("users") {
@@ -2255,10 +2405,13 @@ impl Store {
                 Self::bump_revision(manifest);
 
                 if let Some(time_obj) = manifest.get_mut("time").and_then(Value::as_object_mut) {
-                    time_obj.insert(
-                        "modified".to_string(),
-                        Value::String(Utc::now().to_rfc3339()),
-                    );
+                    let now = Self::now_rfc3339_timestamp();
+                    time_obj.insert("modified".to_string(), Value::String(now.clone()));
+                    for version in &published_versions {
+                        time_obj
+                            .entry(version.clone())
+                            .or_insert_with(|| Value::String(now.clone()));
+                    }
                 }
 
                 record.updated_at = Self::now_ms();
@@ -2272,19 +2425,42 @@ impl Store {
                     )
                 })?;
 
-                if let Some(attachments_obj) = manifest
-                    .get_mut("_attachments")
-                    .and_then(Value::as_object_mut)
+                if let Some(versions_obj) =
+                    manifest.get_mut("versions").and_then(Value::as_object_mut)
                 {
-                    let keys: Vec<String> = attachments_obj.keys().cloned().collect();
-                    for key in keys {
-                        if let Some(value) = attachments_obj.get(&key).cloned() {
-                            attachments_obj.insert(key, Self::remove_attachment_data(&value));
-                        }
+                    for payload in versions_obj.values_mut() {
+                        Self::normalize_version_dist_tarball(package_name, payload);
                     }
                 }
+                let mut normalized_attachments = Map::new();
+                for (raw_name, normalized_name) in &attachment_names {
+                    let Some(attachment) = attachments.get(raw_name) else {
+                        return Err(RegistryError::Internal);
+                    };
+                    normalized_attachments.insert(
+                        normalized_name.clone(),
+                        Self::attachment_metadata_for_publish(
+                            versions,
+                            normalized_name,
+                            attachment,
+                        ),
+                    );
+                }
+                manifest.insert(
+                    "_attachments".to_string(),
+                    Value::Object(normalized_attachments),
+                );
 
                 Self::ensure_manifest_defaults(&mut manifest, package_name, username);
+                if let Some(time_obj) = manifest.get_mut("time").and_then(Value::as_object_mut) {
+                    let now = Self::now_rfc3339_timestamp();
+                    time_obj.insert("modified".to_string(), Value::String(now.clone()));
+                    for version in &published_versions {
+                        time_obj
+                            .entry(version.clone())
+                            .or_insert_with(|| Value::String(now.clone()));
+                    }
+                }
                 manifest.insert("_rev".to_string(), Value::String(Self::initial_revision()));
 
                 state.packages.insert(
