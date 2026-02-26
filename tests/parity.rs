@@ -3547,10 +3547,9 @@ async fn s3_mode_scoped_publish_writes_verdaccio_tarball_key_layout() {
         .await;
     Mock::given(method("PUT"))
         .and(|request: &wiremock::Request| {
-            request
-                .url
-                .path()
-                .contains("/registry/@scope/scoped-s3-pkg/package.json")
+            let path = request.url.path();
+            path.contains("/registry/@scope/scoped-s3-pkg/package.json")
+                || path.contains("/registry/%40scope/scoped-s3-pkg/package.json")
         })
         .respond_with(ResponseTemplate::new(200))
         .mount(&s3)
@@ -3587,9 +3586,10 @@ async fn s3_mode_scoped_publish_writes_verdaccio_tarball_key_layout() {
         .collect();
 
     assert!(
-        tarball_put_paths
-            .iter()
-            .any(|path| path.contains("/registry/@scope/scoped-s3-pkg/scoped-s3-pkg-1.0.0.tgz")),
+        tarball_put_paths.iter().any(|path| {
+            path.contains("/registry/@scope/scoped-s3-pkg/scoped-s3-pkg-1.0.0.tgz")
+                || path.contains("/registry/%40scope/scoped-s3-pkg/scoped-s3-pkg-1.0.0.tgz")
+        }),
         "scoped tarball publish should use Verdaccio path layout in object storage"
     );
     assert!(
