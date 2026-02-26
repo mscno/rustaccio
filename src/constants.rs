@@ -15,6 +15,7 @@ pub const API_ERROR_UNSUPPORTED_REGISTRY_CALL: &str = "unsupported registry call
 pub const API_ERROR_UNAUTHORIZED_ACCESS: &str = "unauthorized access";
 pub const API_ERROR_ONLY_OWNER: &str = "only owners are allowed to change package";
 pub const API_ERROR_PACKAGE_EXIST: &str = "this package is already present";
+pub const API_ERROR_REVISION_CONFLICT: &str = "revision conflict";
 pub const API_ERROR_USERNAME_ALREADY_REGISTERED: &str = "username is already registered";
 pub const API_ERROR_USERNAME_MISMATCH: &str = "username does not match logged in user";
 pub const API_ERROR_SESSION_ID_REQUIRED: &str = "session id is required";

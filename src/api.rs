@@ -5,6 +5,7 @@ use crate::{
         HEADER_JSON_INSTALL, HEADER_OCTET,
     },
     error::RegistryError,
+    events::RegistryEvent,
     governance::{GovernanceAction, GovernanceContext},
     models::{AuthIdentity, TenantContext},
     policy::{PolicyAction, RequestContext},
@@ -42,9 +43,11 @@ pub async fn dispatch(
     };
     let query = uri.query().map(ToOwned::to_owned);
     let headers = req.headers().clone();
+    let request_id = request_id_from_headers(&headers);
     let request_context = RequestContext {
         method: method.to_string(),
         path: path.clone(),
+        request_id: request_id.clone(),
         tenant: tenant_context_from_headers(&headers),
     };
     let span = tracing::Span::current();
@@ -56,7 +59,14 @@ pub async fn dispatch(
         return Ok(response);
     }
 
-    let auth_identity = resolve_auth_identity(&state.store, &headers, &method, &path).await?;
+    let auth_identity = resolve_auth_identity(
+        &state.store,
+        &headers,
+        &method,
+        &path,
+        request_id.as_deref(),
+    )
+    .await?;
     let auth_user = auth_identity_primary_name(auth_identity.as_ref()).map(ToOwned::to_owned);
 
     if method == Method::GET
@@ -103,24 +113,97 @@ pub async fn dispatch(
         ));
     }
 
+    if method == Method::GET && path == "/-/npm/v1/bootstrap" {
+        let body = npm_bootstrap_payload(
+            &headers,
+            state.trust_proxy,
+            &state.url_prefix,
+            query.as_deref(),
+            auth_user.as_deref(),
+        );
+        return Ok(json_response(StatusCode::OK, body, HEADER_JSON));
+    }
+
     if method == Method::POST && path == "/-/admin/reindex" {
         ensure_admin_authenticated(&state, auth_identity.as_ref())?;
         let body = state.store.reindex_from_backend().await?;
+        emit_registry_event(
+            &state,
+            "admin.reindex",
+            &request_context,
+            auth_user.as_deref(),
+            None,
+            json!({
+                "changed": body.get("changed").cloned().unwrap_or(Value::Null),
+                "packagesBefore": body.get("packagesBefore").cloned().unwrap_or(Value::Null),
+                "packagesAfter": body.get("packagesAfter").cloned().unwrap_or(Value::Null),
+            }),
+        )
+        .await;
         return Ok(json_response(StatusCode::OK, body, HEADER_JSON));
     }
 
     if method == Method::GET && path == "/-/admin/storage-health" {
         ensure_admin_authenticated(&state, auth_identity.as_ref())?;
         let body = state.store.storage_health().await?;
+        emit_registry_event(
+            &state,
+            "admin.storage_health.read",
+            &request_context,
+            auth_user.as_deref(),
+            None,
+            json!({}),
+        )
+        .await;
         return Ok(json_response(StatusCode::OK, body, HEADER_JSON));
     }
 
     if method == Method::POST && path == "/-/admin/policy-cache/invalidate" {
         ensure_admin_authenticated(&state, auth_identity.as_ref())?;
         state.policy.invalidate_cache().await?;
+        emit_registry_event(
+            &state,
+            "admin.policy_cache.invalidate",
+            &request_context,
+            auth_user.as_deref(),
+            None,
+            json!({}),
+        )
+        .await;
         return Ok(json_response(
             StatusCode::OK,
             json!({ "ok": "policy cache invalidated" }),
+            HEADER_JSON,
+        ));
+    }
+
+    if method == Method::POST && path == "/-/admin/package-cache/invalidate" {
+        ensure_admin_authenticated(&state, auth_identity.as_ref())?;
+        let payload = parse_json_body(&read_body(req, state.max_body_size).await?)?;
+        let package_name = payload
+            .get("package")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| bad_request("missing `package` in request body"))?;
+        let removed = state.store.invalidate_package_cache(package_name).await;
+        emit_registry_event(
+            &state,
+            "admin.package_cache.invalidate",
+            &request_context,
+            auth_user.as_deref(),
+            Some(package_name),
+            json!({
+                "removed": removed,
+            }),
+        )
+        .await;
+        return Ok(json_response(
+            StatusCode::OK,
+            json!({
+                "ok": "package cache invalidated",
+                "package": package_name,
+                "removed": removed
+            }),
             HEADER_JSON,
         ));
     }
@@ -203,6 +286,18 @@ pub async fn dispatch(
                     Some(&version),
                 )
                 .await?;
+            emit_registry_event(
+                &state,
+                "package.dist_tag.updated",
+                &request_context,
+                auth_user.as_deref(),
+                Some(&package_name),
+                json!({
+                    "tag": tag.as_deref().unwrap_or_default(),
+                    "version": version,
+                }),
+            )
+            .await;
             return Ok(json_response(
                 StatusCode::CREATED,
                 json!({ "ok": message }),
@@ -223,6 +318,17 @@ pub async fn dispatch(
                 .store
                 .merge_dist_tag(&package_name, tag.as_deref().unwrap_or_default(), None)
                 .await?;
+            emit_registry_event(
+                &state,
+                "package.dist_tag.removed",
+                &request_context,
+                auth_user.as_deref(),
+                Some(&package_name),
+                json!({
+                    "tag": tag.as_deref().unwrap_or_default(),
+                }),
+            )
+            .await;
             return Ok(json_response(
                 StatusCode::CREATED,
                 json!({ "ok": message }),
@@ -646,6 +752,17 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
                 .store
                 .publish_manifest(&package_name, body, user)
                 .await?;
+            emit_registry_event(
+                &state,
+                "package.published",
+                &request_context,
+                Some(user),
+                Some(&package_name),
+                json!({
+                    "route": "PUT /:package",
+                }),
+            )
+            .await;
             return Ok(json_response(
                 StatusCode::CREATED,
                 json!({"success": true, "ok": message}),
@@ -669,6 +786,18 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
                 .store
                 .publish_manifest(&package_name, body, user)
                 .await?;
+            emit_registry_event(
+                &state,
+                "package.metadata_updated",
+                &request_context,
+                Some(user),
+                Some(&package_name),
+                json!({
+                    "route": "PUT /:package/-rev/:revision",
+                    "revision": tail[1].clone(),
+                }),
+            )
+            .await;
             return Ok(json_response(
                 StatusCode::CREATED,
                 json!({"success": true, "ok": message}),
@@ -690,6 +819,18 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
                 .store
                 .merge_dist_tag(&package_name, &tail[0], Some(&version))
                 .await?;
+            emit_registry_event(
+                &state,
+                "package.dist_tag.updated",
+                &request_context,
+                auth_user.as_deref(),
+                Some(&package_name),
+                json!({
+                    "tag": tail[0].clone(),
+                    "version": version,
+                }),
+            )
+            .await;
             return Ok(json_response(
                 StatusCode::CREATED,
                 json!({ "ok": message }),
@@ -708,7 +849,21 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
             )
             .await?;
             ensure_package_owner_permission(&state, &package_name, auth_user.as_deref()).await?;
-            let message = state.store.remove_package(&package_name).await?;
+            let message = state
+                .store
+                .remove_package_with_revision(&package_name, Some(&tail[1]))
+                .await?;
+            emit_registry_event(
+                &state,
+                "package.removed",
+                &request_context,
+                auth_user.as_deref(),
+                Some(&package_name),
+                json!({
+                    "revision": tail[1].clone(),
+                }),
+            )
+            .await;
             return Ok(json_response(
                 StatusCode::CREATED,
                 json!({ "ok": message }),
@@ -725,7 +880,22 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
             )
             .await?;
             ensure_package_owner_permission(&state, &package_name, auth_user.as_deref()).await?;
-            let message = state.store.remove_tarball(&package_name, &tail[1]).await?;
+            let message = state
+                .store
+                .remove_tarball_with_revision(&package_name, &tail[1], Some(&tail[3]))
+                .await?;
+            emit_registry_event(
+                &state,
+                "package.tarball.removed",
+                &request_context,
+                auth_user.as_deref(),
+                Some(&package_name),
+                json!({
+                    "filename": tail[1].clone(),
+                    "revision": tail[3].clone(),
+                }),
+            )
+            .await;
             return Ok(json_response(
                 StatusCode::CREATED,
                 json!({ "ok": message }),
@@ -1045,6 +1215,7 @@ async fn resolve_auth_identity(
     headers: &HeaderMap,
     method: &Method,
     path: &str,
+    request_id: Option<&str>,
 ) -> Result<Option<AuthIdentity>, RegistryError> {
     let raw = headers
         .get(header::AUTHORIZATION)
@@ -1061,7 +1232,7 @@ async fn resolve_auth_identity(
     match token {
         Some(token) => {
             let Some(identity) = store
-                .authenticate_request(&token, method.as_str(), path)
+                .authenticate_request(&token, method.as_str(), path, request_id)
                 .await?
             else {
                 warn!(
@@ -1148,7 +1319,7 @@ async fn ensure_publish_permission(
         user = auth_identity_primary_name(identity).unwrap_or(ANONYMOUS_USER),
         "publish denied by policy engine"
     );
-    Err(unauthorized(&format!(
+    Err(RegistryError::policy_denied(format!(
         "authorization required to publish package {package_name}"
     )))
 }
@@ -1176,7 +1347,7 @@ async fn ensure_unpublish_permission(
         user = auth_identity_primary_name(identity).unwrap_or(ANONYMOUS_USER),
         "unpublish denied by policy engine"
     );
-    Err(unauthorized(&format!(
+    Err(RegistryError::policy_denied(format!(
         "authorization required to unpublish package {package_name}"
     )))
 }
@@ -1222,6 +1393,34 @@ fn auth_identity_primary_name(identity: Option<&AuthIdentity>) -> Option<&str> {
         .username
         .as_deref()
         .or_else(|| identity.groups.first().map(String::as_str))
+}
+
+fn request_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+}
+
+async fn emit_registry_event(
+    state: &AppState,
+    event_type: &str,
+    request_context: &RequestContext,
+    actor: Option<&str>,
+    package: Option<&str>,
+    attributes: Value,
+) {
+    state
+        .events
+        .emit_best_effort(RegistryEvent::new(
+            event_type,
+            actor.map(ToOwned::to_owned),
+            package.map(ToOwned::to_owned),
+            request_context.request_id.clone(),
+            request_context.tenant.clone(),
+            attributes,
+        ))
+        .await;
 }
 
 fn select_uplinks_for_package<'a>(
@@ -1619,6 +1818,59 @@ fn request_registry_base_url(headers: &HeaderMap, trust_proxy: bool, url_prefix:
     } else {
         format!("{origin}{url_prefix}")
     }
+}
+
+fn npm_bootstrap_payload(
+    headers: &HeaderMap,
+    trust_proxy: bool,
+    url_prefix: &str,
+    query: Option<&str>,
+    auth_user: Option<&str>,
+) -> Value {
+    let params = query_params(query);
+    let scope = params.get("scope").map(|value| {
+        if value.starts_with('@') {
+            value.clone()
+        } else {
+            format!("@{value}")
+        }
+    });
+
+    let registry_base = request_registry_base_url(headers, trust_proxy, url_prefix);
+    let registry = format!("{registry_base}/");
+    let auth_host = registry
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    let auth_key = format!("//{auth_host}/:_authToken");
+    let scope_registry_line = scope
+        .as_ref()
+        .map(|scope| format!("{scope}:registry={registry}"))
+        .unwrap_or_else(|| "# optional: @your-scope:registry=<registry-url>".to_string());
+    let npmrc = format!(
+        "registry={registry}\n{scope_registry_line}\nalways-auth=true\n{auth_key}=${{RUSTACCIO_NPM_TOKEN}}"
+    );
+    let user_hint = auth_user
+        .map(|user| format!("Authenticated as `{user}`."))
+        .unwrap_or_else(|| "Not authenticated yet.".to_string());
+
+    json!({
+        "registry": registry,
+        "scope": scope,
+        "authTokenKey": auth_key,
+        "userHint": user_hint,
+        "snippets": {
+            "npmrc": npmrc,
+            "npm": format!("npm config set registry {registry}"),
+            "pnpm": format!("pnpm config set registry {registry}"),
+            "yarn": format!("yarn config set npmRegistryServer {registry}"),
+            "bun": format!("bun pm config set registry {registry}"),
+        },
+        "notes": [
+            "Export token before install/publish: export RUSTACCIO_NPM_TOKEN=<token>",
+            "For CI, prefer project-scoped tokens and rotate periodically."
+        ],
+    })
 }
 
 fn normalize_incoming_path(path: &str, url_prefix: &str) -> Option<String> {

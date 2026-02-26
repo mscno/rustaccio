@@ -31,6 +31,7 @@ pub enum PolicyAction {
 pub struct RequestContext {
     pub method: String,
     pub path: String,
+    pub request_id: Option<String>,
     pub tenant: TenantContext,
 }
 
@@ -161,9 +162,21 @@ impl PolicyEngine for DefaultPolicyEngine {
         }
 
         let plugin_decision = match action {
-            PolicyAction::Access => self.store.allow_access(identity, package_name).await?,
-            PolicyAction::Publish => self.store.allow_publish(identity, package_name).await?,
-            PolicyAction::Unpublish => self.store.allow_unpublish(identity, package_name).await?,
+            PolicyAction::Access => {
+                self.store
+                    .allow_access(identity, package_name, request.request_id.as_deref())
+                    .await?
+            }
+            PolicyAction::Publish => {
+                self.store
+                    .allow_publish(identity, package_name, request.request_id.as_deref())
+                    .await?
+            }
+            PolicyAction::Unpublish => {
+                self.store
+                    .allow_unpublish(identity, package_name, request.request_id.as_deref())
+                    .await?
+            }
         };
         if let Some(allowed) = plugin_decision {
             return Ok(allowed);
@@ -254,6 +267,7 @@ impl HttpPolicyBackend {
             "package": package_name,
             "method": request.method,
             "path": request.path,
+            "request_id": request.request_id,
             "username": identity_username,
             "groups": identity_groups,
             "identity": identity,
@@ -263,7 +277,11 @@ impl HttpPolicyBackend {
         });
 
         let endpoint_url = format!("{}{}", self.cfg.base_url, self.cfg.decision_endpoint);
-        let response = self.client.post(endpoint_url).json(&payload).send().await;
+        let mut request_builder = self.client.post(endpoint_url);
+        if let Some(request_id) = request.request_id.as_deref() {
+            request_builder = request_builder.header("x-request-id", request_id);
+        }
+        let response = request_builder.json(&payload).send().await;
         let response = match response {
             Ok(response) => response,
             Err(err) => {
@@ -282,8 +300,7 @@ impl HttpPolicyBackend {
                     package = package_name,
                     "external policy backend unavailable"
                 );
-                return Err(RegistryError::http(
-                    StatusCode::BAD_GATEWAY,
+                return Err(RegistryError::policy_backend_unavailable(
                     "external policy backend unavailable",
                 ));
             }
@@ -307,10 +324,9 @@ impl HttpPolicyBackend {
                 );
                 return Ok(None);
             }
-            return Err(RegistryError::http(
-                StatusCode::BAD_GATEWAY,
-                format!("external policy backend returned status {status}"),
-            ));
+            return Err(RegistryError::policy_backend_unavailable(format!(
+                "external policy backend returned status {status}"
+            )));
         }
 
         let payload = match response.json::<Value>().await {
@@ -325,8 +341,7 @@ impl HttpPolicyBackend {
                     );
                     return Ok(None);
                 }
-                return Err(RegistryError::http(
-                    StatusCode::BAD_GATEWAY,
+                return Err(RegistryError::policy_backend_unavailable(
                     "external policy backend returned invalid JSON",
                 ));
             }

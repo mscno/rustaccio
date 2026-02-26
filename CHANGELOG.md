@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added versioned integration contracts in `docs/contracts/` for auth request mapping, external policy decisions, npm bootstrap payloads, registry event schema, and error taxonomy.
+- Added machine-readable error `code` (and contextual `hint` for key auth/policy failures) to JSON error responses.
+- Added request ID propagation (`x-request-id`) into external auth and policy HTTP backends.
+- Added best-effort registry event emission with pluggable sink (`RUSTACCIO_EVENT_SINK=none|http`) and event emission for admin/package mutation operations.
+- Added `GET /-/npm/v1/bootstrap` endpoint for npm/pnpm/yarn/bun onboarding snippets and `.npmrc` bootstrap guidance.
+- Added admin cache invalidation hook endpoint `POST /-/admin/package-cache/invalidate` for external/event-driven cache eviction.
+
 ### Changed
 
 - Breaking: removed snapshot-based package metadata persistence and shared S3 `__rustaccio_meta/state.json` package snapshots. Package metadata is now always sidecar-authoritative (`package.json`), and local `state.json` persists auth/session/token records only.
@@ -14,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Breaking: backend selector parsing is now strict for auth, tarball, and policy backends (invalid backend values fail fast at startup instead of silently falling back).
 - Added bounded in-memory caches with periodic pruning for package metadata and external policy decisions; added package discovery modes (`single-node|multi-node`) with optional periodic shared-backend package-name refresh.
 - Added memory-cardinality bounds for in-memory governance backends (rate limiter/quota) to prevent unbounded key growth.
+- Hardened mode config semantics: `RUSTACCIO_RUNTIME_PROFILE=managed` now implies managed guardrails, managed guardrails additionally require `RUSTACCIO_AUTH_BACKEND=http` and `RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT`, and package discovery mode parsing now fails fast on invalid values.
+- State-coordination S3 config now falls back to `RUSTACCIO_S3_*` values when `RUSTACCIO_STATE_COORDINATION_S3_*` are unset to reduce duplicated configuration.
+- Added metadata backend abstraction scaffold via `RUSTACCIO_METADATA_BACKEND` (currently `sidecar` only; transactional backend reserved/not yet available).
+- Added optional strict revision-concurrency guard (`RUSTACCIO_STRICT_REVISION_CHECK`, defaults enabled in managed mode) for package mutation paths.
 
 ### Removed
 

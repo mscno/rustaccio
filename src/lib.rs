@@ -8,6 +8,7 @@ pub mod auth_plugin;
 pub mod config;
 pub mod constants;
 pub mod error;
+pub mod events;
 pub mod examples;
 pub mod governance;
 pub mod models;

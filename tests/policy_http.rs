@@ -102,6 +102,7 @@ async fn seeded_app(
         acl,
         policy,
         governance: Arc::new(rustaccio::governance::GovernanceEngine::default()),
+        events: Arc::new(rustaccio::events::EventDispatcher::disabled()),
         admin_access: rustaccio::app::AdminAccessConfig::default(),
         uplinks: HashMap::new(),
         web_enabled: cfg.web_enabled,
@@ -126,6 +127,16 @@ fn auth_get(uri: &str, token: &str) -> Request<Body> {
         .method(Method::GET)
         .uri(uri)
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request")
+}
+
+fn auth_get_with_request_id(uri: &str, token: &str, request_id: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header("x-request-id", request_id)
         .body(Body::empty())
         .expect("request")
 }
@@ -330,4 +341,57 @@ async fn admin_policy_cache_invalidate_forces_recheck() {
         .filter(|request| request.url.path() == "/authorize")
         .count();
     assert_eq!(decision_calls, 2);
+}
+
+#[tokio::test]
+async fn external_policy_forwards_request_id_header() {
+    let policy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/authorize"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"allowed": true})))
+        .mount(&policy)
+        .await;
+
+    let dir = TempDir::new().expect("dir");
+    let cfg = base_config(
+        dir.path().to_path_buf(),
+        vec![PackageRule {
+            pattern: "**".to_string(),
+            access: vec!["nobody".to_string()],
+            publish: vec!["$authenticated".to_string()],
+            unpublish: vec!["$authenticated".to_string()],
+            proxy: None,
+            uplinks_look: true,
+        }],
+    );
+    let policy_cfg = HttpPolicyConfig {
+        base_url: policy.uri(),
+        decision_endpoint: "/authorize".to_string(),
+        timeout_ms: 1_000,
+        cache_ttl_ms: 0,
+        cache_max_entries: 10_000,
+        cache_prune_interval_ms: 30_000,
+        fail_open: false,
+    };
+    let (app, token) = seeded_app(cfg, Some(policy_cfg), "request-id").await;
+
+    let resp = send(
+        &app,
+        auth_get_with_request_id("/request-id", &token, "req-policy-1"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let requests = policy.received_requests().await.expect("received requests");
+    let forwarded = requests.iter().find_map(|request| {
+        if request.url.path() != "/authorize" {
+            return None;
+        }
+        request
+            .headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+    });
+    assert_eq!(forwarded.as_deref(), Some("req-policy-1"));
 }

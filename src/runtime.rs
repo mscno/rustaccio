@@ -2,8 +2,9 @@ use crate::{
     acl::Acl,
     app::{AdminAccessConfig, AppState, build_router},
     auth::AuthHook,
-    config::{Config, TarballStorageBackend},
+    config::{AuthBackend, Config, TarballStorageBackend},
     error::RegistryError,
+    events::EventDispatcher,
     governance::GovernanceEngine,
     observability,
     policy::{DefaultPolicyEngine, HttpPolicyConfig},
@@ -30,13 +31,15 @@ pub async fn build_state(
     config: &Config,
     auth_hook: Option<Arc<dyn AuthHook>>,
 ) -> Result<AppState, RegistryError> {
-    validate_runtime_profile(config)?;
+    let managed_mode = validate_runtime_profile(config)?;
+    let admin_access = AdminAccessConfig::from_env();
+    validate_managed_mode_guardrails_with_flag(managed_mode, config, &admin_access)?;
+
     let store = Arc::new(Store::open_with_options(config, StoreOptions { auth_hook }).await?);
     store.start_background_maintenance();
     let acl = Acl::new(config.acl_rules.clone());
     let governance = Arc::new(GovernanceEngine::from_env().await?);
-    let admin_access = AdminAccessConfig::from_env();
-    validate_managed_mode_guardrails(config, &admin_access)?;
+    let events = Arc::new(EventDispatcher::from_env()?);
     let policy = if let Some(policy_cfg) = HttpPolicyConfig::from_env()? {
         Arc::new(DefaultPolicyEngine::new_with_http(
             store.clone(),
@@ -62,6 +65,7 @@ pub async fn build_state(
         acl,
         policy,
         governance,
+        events,
         admin_access,
         uplinks,
         web_enabled: config.web_enabled,
@@ -137,9 +141,9 @@ enum RuntimeProfile {
     Managed,
 }
 
-fn validate_runtime_profile(config: &Config) -> Result<(), RegistryError> {
-    let managed_mode = managed_mode_enabled_from_env();
-    let inferred_profile = if managed_mode {
+fn validate_runtime_profile(config: &Config) -> Result<bool, RegistryError> {
+    let managed_mode_from_env = managed_mode_enabled_from_env();
+    let inferred_profile = if managed_mode_from_env {
         RuntimeProfile::Managed
     } else if config.tarball_storage.backend == TarballStorageBackend::S3 {
         RuntimeProfile::S3
@@ -147,6 +151,7 @@ fn validate_runtime_profile(config: &Config) -> Result<(), RegistryError> {
         RuntimeProfile::Local
     };
     let profile = runtime_profile_from_env(inferred_profile)?;
+    let managed_mode = managed_mode_from_env || profile == RuntimeProfile::Managed;
     let rate_limit_backend = backend_env("RUSTACCIO_RATE_LIMIT_BACKEND", "none");
     let quota_backend = backend_env("RUSTACCIO_QUOTA_BACKEND", "none");
     let state_coord_backend = backend_env("RUSTACCIO_STATE_COORDINATION_BACKEND", "none");
@@ -158,7 +163,8 @@ fn validate_runtime_profile(config: &Config) -> Result<(), RegistryError> {
         &rate_limit_backend,
         &quota_backend,
         &state_coord_backend,
-    )
+    )?;
+    Ok(managed_mode)
 }
 
 fn runtime_profile_from_env(
@@ -298,17 +304,6 @@ fn validate_runtime_profile_with_inputs(
     Ok(())
 }
 
-fn validate_managed_mode_guardrails(
-    config: &Config,
-    admin_access: &AdminAccessConfig,
-) -> Result<(), RegistryError> {
-    validate_managed_mode_guardrails_with_flag(
-        managed_mode_enabled_from_env(),
-        config,
-        admin_access,
-    )
-}
-
 fn validate_managed_mode_guardrails_with_flag(
     managed_mode: bool,
     config: &Config,
@@ -336,6 +331,25 @@ fn validate_managed_mode_guardrails_with_flag(
         return Err(RegistryError::http(
             StatusCode::INTERNAL_SERVER_ERROR,
             "RUSTACCIO_MANAGED_MODE=true requires auth.plugin.externalMode=true",
+        ));
+    }
+    if config.auth_plugin.backend != AuthBackend::Http {
+        return Err(RegistryError::http(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "RUSTACCIO_MANAGED_MODE=true requires RUSTACCIO_AUTH_BACKEND=http",
+        ));
+    }
+
+    let has_request_auth_endpoint = config
+        .auth_plugin
+        .http
+        .as_ref()
+        .and_then(|http| http.request_auth_endpoint.as_deref())
+        .is_some_and(|endpoint| !endpoint.trim().is_empty());
+    if !has_request_auth_endpoint {
+        return Err(RegistryError::http(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "RUSTACCIO_MANAGED_MODE=true requires RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT",
         ));
     }
 
@@ -498,10 +512,14 @@ mod tests {
         app::AdminAccessConfig,
         config::{
             AuthBackend, AuthPluginConfig, Config, TarballStorageBackend, TarballStorageConfig,
+            default_http_auth_config_for_examples,
         },
     };
 
     fn config_with_external_mode(external_mode: bool) -> Config {
+        let mut http = default_http_auth_config_for_examples();
+        http.base_url = "http://auth.local".to_string();
+        http.request_auth_endpoint = Some("/request-auth".to_string());
         Config {
             bind: "127.0.0.1:4873".parse().expect("bind"),
             data_dir: std::env::temp_dir(),
@@ -522,9 +540,9 @@ mod tests {
             keep_alive_timeout_secs: None,
             log_level: "info".to_string(),
             auth_plugin: AuthPluginConfig {
-                backend: AuthBackend::Local,
+                backend: AuthBackend::Http,
                 external_mode,
-                http: None,
+                http: Some(http),
             },
             tarball_storage: TarballStorageConfig {
                 backend: TarballStorageBackend::Local,
@@ -601,6 +619,37 @@ mod tests {
             groups: vec!["platform-admins".to_string()],
         };
         assert!(validate_managed_mode_guardrails_with_flag(true, &config, &admin).is_ok());
+    }
+
+    #[test]
+    fn managed_mode_guardrails_require_http_auth_backend() {
+        let mut config = config_with_external_mode(true);
+        config.auth_plugin.backend = AuthBackend::Local;
+        config.auth_plugin.http = None;
+        let admin = AdminAccessConfig {
+            allow_any_authenticated: false,
+            users: vec!["ops".to_string()],
+            groups: Vec::new(),
+        };
+        let err = validate_managed_mode_guardrails_with_flag(true, &config, &admin)
+            .expect_err("must fail");
+        assert!(err.to_string().contains("AUTH_BACKEND=http"));
+    }
+
+    #[test]
+    fn managed_mode_guardrails_require_request_auth_endpoint() {
+        let mut config = config_with_external_mode(true);
+        if let Some(http) = config.auth_plugin.http.as_mut() {
+            http.request_auth_endpoint = None;
+        }
+        let admin = AdminAccessConfig {
+            allow_any_authenticated: false,
+            users: vec!["ops".to_string()],
+            groups: Vec::new(),
+        };
+        let err = validate_managed_mode_guardrails_with_flag(true, &config, &admin)
+            .expect_err("must fail");
+        assert!(err.to_string().contains("AUTH_HTTP_REQUEST_AUTH_ENDPOINT"));
     }
 
     #[test]

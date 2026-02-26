@@ -142,8 +142,9 @@ Environment variables:
 - `RUSTACCIO_AUTH_HTTP_ALLOW_UNPUBLISH_ENDPOINT` (optional ACL override hook endpoint)
 - `RUSTACCIO_AUTH_EXTERNAL_MODE` (default `false`; disables local user/token/web-login endpoints)
 - `RUSTACCIO_AUTH_HTTP_TIMEOUT_MS` (default `5000`)
-- `RUSTACCIO_RUNTIME_PROFILE` (`local`, `s3`, or `managed`; optional override, otherwise inferred from config)
-- `RUSTACCIO_PACKAGE_DISCOVERY_MODE` (`single-node` or `multi-node`, default `single-node`)
+- `RUSTACCIO_RUNTIME_PROFILE` (`local`, `s3`, or `managed`; primary mode selector when set, otherwise inferred from `RUSTACCIO_MANAGED_MODE` and tarball backend)
+- `RUSTACCIO_STRICT_REVISION_CHECK` (optional `true|false`; default `true` in managed mode, otherwise `false`)
+- `RUSTACCIO_PACKAGE_DISCOVERY_MODE` (`single-node` or `multi-node`; default is mode-aware: `multi-node` for managed/S3 runtime, `single-node` otherwise)
 - `RUSTACCIO_PACKAGE_CACHE_MAX_ENTRIES` (default `5000`; bounded in-memory package cache cap)
 - `RUSTACCIO_PACKAGE_CACHE_TTL_SECS` (default `0` in `single-node`, `120` in `multi-node`; `0` keeps strict sidecar revalidation)
 - `RUSTACCIO_PACKAGE_CACHE_PRUNE_INTERVAL_SECS` (default `30`; periodic package-cache pruning)
@@ -157,6 +158,7 @@ Environment variables:
 - `RUSTACCIO_S3_PREFIX` (optional key prefix)
 - `RUSTACCIO_S3_FORCE_PATH_STYLE` (default `true`)
 - `RUSTACCIO_S3_CA_BUNDLE` (optional PEM bundle path for S3 TLS trust; falls back to common system bundle paths when present)
+- `RUSTACCIO_METADATA_BACKEND` (`sidecar` or `transactional`; default `sidecar`, `transactional` reserved/not yet available)
 - `RUSTACCIO_PACKAGE_METADATA_AUTHORITY` (`sidecar`, default `sidecar`)
   - Any non-empty value other than `sidecar` is rejected at startup.
 - `RUSTACCIO_STATE_COORDINATION_BACKEND` (`none`, `redis`, or `s3`, default `none`)
@@ -172,11 +174,16 @@ Environment variables:
 - `RUSTACCIO_STATE_COORDINATION_S3_ACCESS_KEY_ID` / `RUSTACCIO_STATE_COORDINATION_S3_SECRET_ACCESS_KEY` (optional static credentials)
 - `RUSTACCIO_STATE_COORDINATION_S3_PREFIX` (default `rustaccio/state-locks/`)
 - `RUSTACCIO_STATE_COORDINATION_S3_FORCE_PATH_STYLE` (default `false`)
+- When `RUSTACCIO_STATE_COORDINATION_S3_*` fields are unset, Rustaccio falls back to matching `RUSTACCIO_S3_*` tarball backend settings.
 - `RUSTACCIO_RATE_LIMIT_MEMORY_MAX_KEYS` (default `10000`; in-memory rate-limit key bound)
 - `RUSTACCIO_QUOTA_MEMORY_MAX_KEYS` (default `50000`; in-memory quota key bound)
 - `RUSTACCIO_QUOTA_MEMORY_RETENTION_DAYS` (default `2`; in-memory quota day retention window)
 - `RUSTACCIO_POLICY_HTTP_CACHE_MAX_ENTRIES` (default `10000`; bounded policy decision cache)
 - `RUSTACCIO_POLICY_HTTP_CACHE_PRUNE_INTERVAL_MS` (default `30000`; periodic policy-cache pruning)
+- `RUSTACCIO_EVENT_SINK` (`none` or `http`, default `none`)
+- `RUSTACCIO_EVENT_HTTP_BASE_URL` (required when `RUSTACCIO_EVENT_SINK=http`)
+- `RUSTACCIO_EVENT_HTTP_ENDPOINT` (default `/events/registry`)
+- `RUSTACCIO_EVENT_HTTP_TIMEOUT_MS` (default `2000`)
 
 Build features:
 
@@ -397,10 +404,11 @@ Key APIs:
 - `/-/user/*` (add user/login/logout)
 - `/-/v1/search`
 - `/-/all` and `/-/all/since` (deprecated response)
-- `/-/admin/reindex`, `/-/admin/storage-health`, and `/-/admin/policy-cache/invalidate` (admin/ops endpoints)
+- `/-/admin/reindex`, `/-/admin/storage-health`, `/-/admin/policy-cache/invalidate`, and `/-/admin/package-cache/invalidate` (admin/ops endpoints)
 - `/-/_view/starredByUser`
 - `/-/package/:package/dist-tags` (+ `:tag`)
 - `/-/npm/v1/user`
+- `/-/npm/v1/bootstrap` (npm/pnpm/yarn/bun onboarding snippets)
 - `/-/npm/v1/tokens` (+ token delete)
 - `/-/npm/v1/security/advisories/bulk`
 - `/-/npm/v1/security/audits/quick`
@@ -458,7 +466,7 @@ Rustaccio targets Verdaccio-compatible npm client behavior for core flows, but i
 - YAML `listen` can be configured as a list for config compatibility, but the server currently binds a single effective socket address.
 - `server.keepAliveTimeout` is currently mapped to an HTTP/1 header-read timeout for keep-alive connections (not a byte-for-byte Node.js socket timeout implementation).
 - Built-in web UI is a lightweight Verdaccio-style SPA shell and static assets, not the full upstream Verdaccio frontend/runtime surface.
-- Rustaccio-specific admin endpoints are exposed at `/-/admin/reindex`, `/-/admin/storage-health`, and `/-/admin/policy-cache/invalidate`.
+- Rustaccio-specific admin endpoints are exposed at `/-/admin/reindex`, `/-/admin/storage-health`, `/-/admin/policy-cache/invalidate`, and `/-/admin/package-cache/invalidate`.
 
 ## Architecture
 
@@ -507,10 +515,19 @@ store:
 
 The HTTP auth backend is called by core user endpoints and keeps the same external npm/Verdaccio API contract.
 
+Versioned contract reference: `docs/contracts/auth-request-v1.md`
+
+## npm Bootstrap Endpoint
+
+`GET /-/npm/v1/bootstrap` returns registry and `.npmrc` snippets for npm/pnpm/yarn/bun.
+Use `?scope=<name>` (for example `?scope=acme`) to include scope-specific registry lines.
+
+Versioned contract reference: `docs/contracts/npm-bootstrap-v1.md`
+
 - `POST {baseUrl}{addUserEndpoint}` with `{ "username", "password" }`
 - `POST {baseUrl}{loginEndpoint}` with `{ "username", "password" }`
 - `POST {baseUrl}{changePasswordEndpoint}` with `{ "username", "old_password", "new_password" }`
-- `POST {baseUrl}{requestAuthEndpoint}` with `{ "token", "method", "path" }` and response including:
+- `POST {baseUrl}{requestAuthEndpoint}` with `{ "token", "method", "path", "request_id" }` and response including:
   - `authenticated` (`true|false`, optional)
   - user identity: `username` or `user` or `name` (optional)
   - groups: `groups`/`roles` array or `group` scalar (optional)
@@ -518,7 +535,11 @@ The HTTP auth backend is called by core user endpoints and keeps the same extern
   - `POST {baseUrl}{allowAccessEndpoint}`
   - `POST {baseUrl}{allowPublishEndpoint}`
   - `POST {baseUrl}{allowUnpublishEndpoint}`
-  - request body includes `{ "package", "username", "groups", "identity" }`, response supports `{ "allowed": true|false }` or raw boolean
+  - request body includes `{ "package", "username", "groups", "identity", "request_id" }`, response supports `{ "allowed": true|false }` or raw boolean
+
+Request ID propagation:
+
+- Rustaccio sends `x-request-id` to request-auth and allow-* plugin callbacks when available.
 
 Behavior:
 
@@ -528,6 +549,8 @@ Behavior:
 ## External Policy Backend (HTTP, via Env)
 
 Policy decisions can be sourced from a dedicated HTTP backend and will run before auth-hook/plugin/ACL fallback.
+
+Versioned contract reference: `docs/contracts/policy-decision-v1.md`
 
 Environment variables:
 
@@ -544,8 +567,13 @@ Decision request payload includes:
 - `package`
 - `method`
 - `path`
+- `request_id`
 - identity context: `username`, `groups`, `identity`
 - tenant context: `tenant`, `org_id`, `project_id` (from request headers when present)
+
+Request ID propagation:
+
+- Rustaccio sends `x-request-id` to external policy requests when available.
 
 Decision response:
 
@@ -560,6 +588,29 @@ Cache control:
 - `POST /-/admin/policy-cache/invalidate` clears in-memory external policy decision cache for the running instance.
 - `RUSTACCIO_POLICY_HTTP_CACHE_MAX_ENTRIES` bounds in-memory policy decisions (default `10000`).
 - `RUSTACCIO_POLICY_HTTP_CACHE_PRUNE_INTERVAL_MS` controls periodic expired-entry pruning (default `30000`).
+
+## Error Codes
+
+Error responses include machine-readable `code` in addition to `error`.
+Versioned taxonomy: `docs/contracts/error-taxonomy-v1.md`.
+
+## Registry Events (Best-Effort)
+
+Rustaccio can emit structured registry/admin mutation events to a configured sink.
+
+Versioned schema: `docs/contracts/registry-events-v1.md`.
+
+Environment variables:
+
+- `RUSTACCIO_EVENT_SINK=none|http` (default `none`)
+- `RUSTACCIO_EVENT_HTTP_BASE_URL` (required for `http` sink)
+- `RUSTACCIO_EVENT_HTTP_ENDPOINT` (default `/events/registry`)
+- `RUSTACCIO_EVENT_HTTP_TIMEOUT_MS` (default `2000`)
+
+Notes:
+
+- Event emission is best-effort; npm request success does not depend on sink availability.
+- `x-request-id` is forwarded to the HTTP sink when present.
 
 ## Governance Controls (Opt-In)
 
@@ -605,6 +656,7 @@ State write coordination (opt-in):
 - `RUSTACCIO_STATE_COORDINATION_S3_ACCESS_KEY_ID`, `RUSTACCIO_STATE_COORDINATION_S3_SECRET_ACCESS_KEY` (optional)
 - `RUSTACCIO_STATE_COORDINATION_S3_PREFIX` (default `rustaccio/state-locks/`)
 - `RUSTACCIO_STATE_COORDINATION_S3_FORCE_PATH_STYLE` (default `false`)
+- If unset, `RUSTACCIO_STATE_COORDINATION_S3_*` values fall back to matching `RUSTACCIO_S3_*` values.
 
 Semantics:
 
@@ -648,6 +700,8 @@ Behavior:
   - `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false`
   - at least one explicit admin principal in `RUSTACCIO_ADMIN_USERS` or `RUSTACCIO_ADMIN_GROUPS`
   - `auth.plugin.externalMode=true` (external identity provider mode)
+  - `RUSTACCIO_AUTH_BACKEND=http`
+  - `RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT=<path>`
 
 Recommended managed-mode posture:
 
@@ -658,6 +712,7 @@ Recommended managed-mode posture:
 ## Run Modes
 
 Rustaccio now runs sidecar-authoritative package metadata in all modes.
+Mode-specific env presets are included at repo root: `.env.local.example`, `.env.s3.example`, `.env.managed.example`.
 
 | Mode | Tarball Backend | Metadata Authority | Governance Backends | Typical Use |
 |---|---|---|---|---|
@@ -693,10 +748,13 @@ Shared object store mode defaults:
 Managed hardening mode:
 
 - `RUSTACCIO_RUNTIME_PROFILE=managed`
-- `RUSTACCIO_MANAGED_MODE=true` enforces:
+- `RUSTACCIO_RUNTIME_PROFILE=managed` implies managed guardrails even when `RUSTACCIO_MANAGED_MODE` is unset (`RUSTACCIO_MANAGED_MODE=true` remains a compatibility alias)
+- Managed guardrails enforce:
   - `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false`
   - explicit admin principals (`RUSTACCIO_ADMIN_USERS` or `RUSTACCIO_ADMIN_GROUPS`)
   - `auth.plugin.externalMode=true` (env: `RUSTACCIO_AUTH_EXTERNAL_MODE=true`)
+  - `RUSTACCIO_AUTH_BACKEND=http`
+  - `RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT=<path>`
 - Managed profile additionally requires:
   - `RUSTACCIO_RATE_LIMIT_BACKEND=redis`
   - `RUSTACCIO_QUOTA_BACKEND=postgres`
@@ -707,9 +765,11 @@ Package discovery and cache behavior:
 - Rustaccio keeps an in-memory package record cache and a package-name index to avoid storage-backend round-trips on every request.
 - `RUSTACCIO_PACKAGE_DISCOVERY_MODE=single-node` favors local cache hits and on-demand backend probes (no periodic list refresh by default).
 - `RUSTACCIO_PACKAGE_DISCOVERY_MODE=multi-node` enables periodic backend list refresh (`RUSTACCIO_PACKAGE_DISCOVERY_REFRESH_SECS`) to detect package adds/removals from other nodes.
+- Invalid `RUSTACCIO_PACKAGE_DISCOVERY_MODE` values fail startup (accepted: `single-node`, `multi-node` and their aliases).
 - Package cache growth is bounded by `RUSTACCIO_PACKAGE_CACHE_MAX_ENTRIES`, TTL-controlled by `RUSTACCIO_PACKAGE_CACHE_TTL_SECS`, and pruned periodically by `RUSTACCIO_PACKAGE_CACHE_PRUNE_INTERVAL_SECS`.
 - Missing-package probes are negative-cached with `RUSTACCIO_PACKAGE_NEGATIVE_CACHE_TTL_SECS` to suppress repeated misses.
 - For strict multi-node write safety, still configure `RUSTACCIO_STATE_COORDINATION_BACKEND=redis|s3`; package discovery refresh is not a write lock.
+- External event-driven cache hook: `POST /-/admin/package-cache/invalidate` with `{ "package": "<name>" }` evicts a package from in-memory cache so subsequent reads reload from authoritative storage.
 
 ## Deploying with Redis/Postgres Backends
 

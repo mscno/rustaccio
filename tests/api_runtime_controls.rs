@@ -19,10 +19,6 @@ use serde_json::{Value, json};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tempfile::TempDir;
 use tower::ServiceExt;
-use wiremock::{
-    Mock, MockServer, ResponseTemplate,
-    matchers::{method, path},
-};
 
 #[derive(Debug)]
 struct GroupOnlyHook;
@@ -292,20 +288,13 @@ async fn group_only_identity_can_satisfy_acl_publish() {
 
 #[tokio::test]
 async fn external_request_auth_not_found_surfaces_as_bad_gateway() {
-    let auth = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/request-auth"))
-        .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error":"not found"})))
-        .mount(&auth)
-        .await;
-
     let dir = TempDir::new().expect("dir");
     let mut cfg = base_config(dir.path().to_path_buf());
     cfg.auth_plugin = AuthPluginConfig {
         backend: AuthBackend::Http,
         external_mode: false,
         http: Some(HttpAuthPluginConfig {
-            base_url: auth.uri(),
+            base_url: "http://127.0.0.1:9".to_string(),
             add_user_endpoint: "/adduser".to_string(),
             login_endpoint: "/authenticate".to_string(),
             change_password_endpoint: "/change-password".to_string(),
@@ -322,6 +311,7 @@ async fn external_request_auth_not_found_surfaces_as_bad_gateway() {
         .method(Method::GET)
         .uri("/@geoman-io/leaflet-geoman-free")
         .header(header::AUTHORIZATION, "Bearer deadbeef")
+        .header("x-request-id", "req-auth-404")
         .body(Body::empty())
         .expect("request");
     let resp = send(&app, req).await;
@@ -329,7 +319,7 @@ async fn external_request_auth_not_found_surfaces_as_bad_gateway() {
     let body = json_body(resp).await;
     assert_eq!(
         body["error"].as_str(),
-        Some("external request auth endpoint not found: /request-auth")
+        Some("external request auth unavailable")
     );
 }
 
@@ -392,6 +382,54 @@ async fn web_routes_are_hidden_when_web_is_disabled() {
 }
 
 #[tokio::test]
+async fn npm_bootstrap_endpoint_returns_client_snippets() {
+    let dir = TempDir::new().expect("dir");
+    let cfg = base_config(dir.path().to_path_buf());
+    let app = app_with_config(&cfg, None).await;
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/-/npm/v1/bootstrap?scope=acme")
+        .header(header::HOST, "registry.example.com")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["registry"].as_str(),
+        Some("http://registry.example.com/")
+    );
+    assert_eq!(body["scope"].as_str(), Some("@acme"));
+    let npmrc = body["snippets"]["npmrc"].as_str().expect("npmrc snippet");
+    assert!(npmrc.contains("@acme:registry=http://registry.example.com/"));
+    assert!(npmrc.contains("//registry.example.com/:_authToken=${RUSTACCIO_NPM_TOKEN}"));
+}
+
+#[tokio::test]
+async fn auth_errors_include_actionable_hint() {
+    let dir = TempDir::new().expect("dir");
+    let cfg = base_config(dir.path().to_path_buf());
+    let app = app_with_config(&cfg, None).await;
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/-/whoami")
+        .header(header::AUTHORIZATION, "Basic deadbeef")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = json_body(resp).await;
+    assert_eq!(body["code"].as_str(), Some("AUTH_UNAUTHORIZED"));
+    assert!(
+        body["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("Bearer token"))
+    );
+}
+
+#[tokio::test]
 async fn admin_endpoints_require_explicit_admin_when_any_authenticated_disabled() {
     let dir = TempDir::new().expect("dir");
     let cfg = base_config(dir.path().to_path_buf());
@@ -417,6 +455,35 @@ async fn admin_endpoints_require_explicit_admin_when_any_authenticated_disabled(
         .expect("request");
     let resp = send(&app, req).await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn admin_package_cache_invalidate_endpoint_is_available() {
+    let dir = TempDir::new().expect("dir");
+    let cfg = base_config(dir.path().to_path_buf());
+    let app = app_with_config(
+        &cfg,
+        Some(Arc::new(NamedHook {
+            username: Some("ops".to_string()),
+            groups: vec!["platform-admins".to_string()],
+        })),
+    )
+    .await;
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/-/admin/package-cache/invalidate")
+        .header(header::AUTHORIZATION, "Bearer embedded-token")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({"package":"pkg-a"})).expect("payload"),
+        ))
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["package"].as_str(), Some("pkg-a"));
+    assert_eq!(body["ok"].as_str(), Some("package cache invalidated"));
 }
 
 #[tokio::test]

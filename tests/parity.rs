@@ -82,6 +82,7 @@ async fn build_test_app_from_config(cfg: Config) -> axum::Router {
         acl,
         policy,
         governance: Arc::new(rustaccio::governance::GovernanceEngine::default()),
+        events: Arc::new(rustaccio::events::EventDispatcher::disabled()),
         admin_access: rustaccio::app::AdminAccessConfig::default(),
         uplinks: upstream_clients,
         web_enabled: cfg.web_enabled,

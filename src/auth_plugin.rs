@@ -150,6 +150,7 @@ impl HttpAuthPlugin {
         token: &str,
         method: &str,
         path: &str,
+        request_id: Option<&str>,
     ) -> Result<Option<AuthIdentity>, RegistryError> {
         let Some(endpoint) = &self.request_auth_endpoint else {
             debug!(
@@ -160,13 +161,16 @@ impl HttpAuthPlugin {
         };
         let url = format!("{}{}", self.base_url, endpoint);
         debug!(endpoint, method, path, "attempting external request-auth");
-        let response = self
-            .client
-            .post(url)
+        let mut request_builder = self.client.post(url);
+        if let Some(request_id) = request_id {
+            request_builder = request_builder.header("x-request-id", request_id);
+        }
+        let response = request_builder
             .json(&json!({
                 "token": token,
                 "method": method,
                 "path": path,
+                "request_id": request_id,
             }))
             .send()
             .await
@@ -288,11 +292,13 @@ impl HttpAuthPlugin {
         &self,
         identity: Option<AuthIdentity>,
         package_name: &str,
+        request_id: Option<&str>,
     ) -> Result<Option<bool>, RegistryError> {
         self.allow_decision(
             self.allow_access_endpoint.as_deref(),
             identity,
             package_name,
+            request_id,
         )
         .await
     }
@@ -302,11 +308,13 @@ impl HttpAuthPlugin {
         &self,
         identity: Option<AuthIdentity>,
         package_name: &str,
+        request_id: Option<&str>,
     ) -> Result<Option<bool>, RegistryError> {
         self.allow_decision(
             self.allow_publish_endpoint.as_deref(),
             identity,
             package_name,
+            request_id,
         )
         .await
     }
@@ -316,11 +324,13 @@ impl HttpAuthPlugin {
         &self,
         identity: Option<AuthIdentity>,
         package_name: &str,
+        request_id: Option<&str>,
     ) -> Result<Option<bool>, RegistryError> {
         self.allow_decision(
             self.allow_unpublish_endpoint.as_deref(),
             identity,
             package_name,
+            request_id,
         )
         .await
     }
@@ -331,6 +341,7 @@ impl HttpAuthPlugin {
         endpoint: Option<&str>,
         identity: Option<AuthIdentity>,
         package_name: &str,
+        request_id: Option<&str>,
     ) -> Result<Option<bool>, RegistryError> {
         let Some(endpoint) = endpoint else {
             debug!(
@@ -351,9 +362,11 @@ impl HttpAuthPlugin {
             identity_group_count,
             "attempting external allow hook"
         );
-        let response = self
-            .client
-            .post(url)
+        let mut request_builder = self.client.post(url);
+        if let Some(request_id) = request_id {
+            request_builder = request_builder.header("x-request-id", request_id);
+        }
+        let response = request_builder
             .json(&json!({
                 "package": package_name,
                 "username": identity_username,
@@ -362,6 +375,7 @@ impl HttpAuthPlugin {
                     .map(|id| id.groups.clone())
                     .unwrap_or_default(),
                 "identity": identity,
+                "request_id": request_id,
             }))
             .send()
             .await
@@ -501,7 +515,7 @@ impl AuthHook for HttpAuthPlugin {
         method: &str,
         path: &str,
     ) -> Result<Option<AuthIdentity>, RegistryError> {
-        HttpAuthPlugin::authenticate_request(self, token, method, path).await
+        HttpAuthPlugin::authenticate_request(self, token, method, path, None).await
     }
 
     async fn allow_access(
@@ -509,7 +523,7 @@ impl AuthHook for HttpAuthPlugin {
         identity: Option<AuthIdentity>,
         package_name: &str,
     ) -> Result<Option<bool>, RegistryError> {
-        HttpAuthPlugin::allow_access(self, identity, package_name).await
+        HttpAuthPlugin::allow_access(self, identity, package_name, None).await
     }
 
     async fn allow_publish(
@@ -517,7 +531,7 @@ impl AuthHook for HttpAuthPlugin {
         identity: Option<AuthIdentity>,
         package_name: &str,
     ) -> Result<Option<bool>, RegistryError> {
-        HttpAuthPlugin::allow_publish(self, identity, package_name).await
+        HttpAuthPlugin::allow_publish(self, identity, package_name, None).await
     }
 
     async fn allow_unpublish(
@@ -525,7 +539,7 @@ impl AuthHook for HttpAuthPlugin {
         identity: Option<AuthIdentity>,
         package_name: &str,
     ) -> Result<Option<bool>, RegistryError> {
-        HttpAuthPlugin::allow_unpublish(self, identity, package_name).await
+        HttpAuthPlugin::allow_unpublish(self, identity, package_name, None).await
     }
 }
 

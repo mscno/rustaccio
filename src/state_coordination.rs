@@ -58,6 +58,26 @@ impl Default for StateCoordinationConfig {
 
 impl StateCoordinationConfig {
     fn from_env() -> Self {
+        let s3_bucket = env_value_non_empty("RUSTACCIO_STATE_COORDINATION_S3_BUCKET")
+            .or_else(|| env_value_non_empty("RUSTACCIO_S3_BUCKET"));
+        let s3_region = env_value_non_empty("RUSTACCIO_STATE_COORDINATION_S3_REGION")
+            .or_else(|| env_value_non_empty("RUSTACCIO_S3_REGION"))
+            .unwrap_or_else(|| "us-east-1".to_string());
+        let s3_endpoint = env_value_non_empty("RUSTACCIO_STATE_COORDINATION_S3_ENDPOINT")
+            .or_else(|| env_value_non_empty("RUSTACCIO_S3_ENDPOINT"));
+        let s3_access_key_id = env_value_non_empty("RUSTACCIO_STATE_COORDINATION_S3_ACCESS_KEY_ID")
+            .or_else(|| env_value_non_empty("RUSTACCIO_S3_ACCESS_KEY_ID"));
+        let s3_secret_access_key =
+            env_value_non_empty("RUSTACCIO_STATE_COORDINATION_S3_SECRET_ACCESS_KEY")
+                .or_else(|| env_value_non_empty("RUSTACCIO_S3_SECRET_ACCESS_KEY"));
+        let s3_prefix_raw = env_value_non_empty("RUSTACCIO_STATE_COORDINATION_S3_PREFIX")
+            .or_else(|| env_value_non_empty("RUSTACCIO_S3_PREFIX"))
+            .unwrap_or_else(|| "rustaccio/state-locks/".to_string());
+        let s3_force_path_style =
+            parse_bool_env_optional("RUSTACCIO_STATE_COORDINATION_S3_FORCE_PATH_STYLE")
+                .or_else(|| parse_bool_env_optional("RUSTACCIO_S3_FORCE_PATH_STYLE"))
+                .unwrap_or(false);
+
         Self {
             backend: env_value("RUSTACCIO_STATE_COORDINATION_BACKEND")
                 .unwrap_or_else(|| "none".to_string()),
@@ -75,26 +95,13 @@ impl StateCoordinationConfig {
             poll_interval_ms: parse_u64_env("RUSTACCIO_STATE_COORDINATION_POLL_INTERVAL_MS", 100)
                 .clamp(10, 5_000),
             fail_open: parse_bool_env("RUSTACCIO_STATE_COORDINATION_FAIL_OPEN", false),
-            s3_bucket: env_value("RUSTACCIO_STATE_COORDINATION_S3_BUCKET")
-                .filter(|value| !value.trim().is_empty()),
-            s3_region: env_value("RUSTACCIO_STATE_COORDINATION_S3_REGION")
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "us-east-1".to_string()),
-            s3_endpoint: env_value("RUSTACCIO_STATE_COORDINATION_S3_ENDPOINT")
-                .filter(|value| !value.trim().is_empty()),
-            s3_access_key_id: env_value("RUSTACCIO_STATE_COORDINATION_S3_ACCESS_KEY_ID")
-                .filter(|value| !value.trim().is_empty()),
-            s3_secret_access_key: env_value("RUSTACCIO_STATE_COORDINATION_S3_SECRET_ACCESS_KEY")
-                .filter(|value| !value.trim().is_empty()),
-            s3_prefix: normalize_s3_prefix(
-                env_value("RUSTACCIO_STATE_COORDINATION_S3_PREFIX")
-                    .as_deref()
-                    .unwrap_or("rustaccio/state-locks/"),
-            ),
-            s3_force_path_style: parse_bool_env(
-                "RUSTACCIO_STATE_COORDINATION_S3_FORCE_PATH_STYLE",
-                false,
-            ),
+            s3_bucket,
+            s3_region,
+            s3_endpoint,
+            s3_access_key_id,
+            s3_secret_access_key,
+            s3_prefix: normalize_s3_prefix(&s3_prefix_raw),
+            s3_force_path_style,
         }
     }
 }
@@ -892,6 +899,17 @@ fn env_value(key: &str) -> Option<String> {
     std::env::var(key).ok()
 }
 
+fn env_value_non_empty(key: &str) -> Option<String> {
+    env_value(key).and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
 fn parse_u64_env(key: &str, default: u64) -> u64 {
     env_value(key)
         .and_then(|v| v.parse::<u64>().ok())
@@ -899,7 +917,14 @@ fn parse_u64_env(key: &str, default: u64) -> u64 {
 }
 
 fn parse_bool_env(key: &str, default: bool) -> bool {
-    env_value(key)
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(default)
+    parse_bool_env_optional(key).unwrap_or(default)
+}
+
+fn parse_bool_env_optional(key: &str) -> Option<bool> {
+    env_value_non_empty(key).map(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    })
 }

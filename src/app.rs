@@ -1,9 +1,10 @@
 use crate::{
-    acl::Acl, api, governance::GovernanceEngine, policy::PolicyEngine, storage::Store,
-    upstream::Upstream,
+    acl::Acl, api, events::EventDispatcher, governance::GovernanceEngine, policy::PolicyEngine,
+    storage::Store, upstream::Upstream,
 };
 use axum::{
     Router,
+    body::Body,
     http::{HeaderName, StatusCode},
     routing::any,
 };
@@ -13,7 +14,7 @@ use tower_http::{
     limit::RequestBodyLimitLayer,
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     timeout::TimeoutLayer,
-    trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer},
+    trace::{DefaultOnFailure, DefaultOnResponse, TraceLayer},
 };
 use tracing::Level;
 
@@ -59,6 +60,7 @@ pub struct AppState {
     pub acl: Acl,
     pub policy: Arc<dyn PolicyEngine>,
     pub governance: Arc<GovernanceEngine>,
+    pub events: Arc<EventDispatcher>,
     pub admin_access: AdminAccessConfig,
     pub uplinks: HashMap<String, Upstream>,
     pub web_enabled: bool,
@@ -74,10 +76,24 @@ pub struct AppState {
 
 pub fn build_router(state: AppState) -> Router {
     let request_id_header = HeaderName::from_static("x-request-id");
+    let trace_request_id_header = request_id_header.clone();
     let max_body_size = state.max_body_size;
     let request_timeout_secs = request_timeout_secs_from_env();
     let trace_layer = TraceLayer::new_for_http()
-        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+        .make_span_with(move |request: &axum::http::Request<Body>| {
+            let request_id = request
+                .headers()
+                .get(&trace_request_id_header)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("-");
+            tracing::span!(
+                Level::INFO,
+                "http_request",
+                method = %request.method(),
+                path = %request.uri().path(),
+                request_id = %request_id
+            )
+        })
         .on_response(DefaultOnResponse::new().level(Level::INFO))
         .on_failure(DefaultOnFailure::new().level(Level::ERROR));
 

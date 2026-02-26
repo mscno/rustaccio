@@ -1,18 +1,17 @@
 use crate::{
     auth::AuthHook,
     auth_plugin::HttpAuthPlugin,
-    config::AuthBackend,
-    config::Config,
+    config::{AuthBackend, Config, TarballStorageBackend},
     constants::{
         API_ERROR_BAD_USERNAME_PASSWORD, API_ERROR_MUST_BE_LOGGED, API_ERROR_NO_PACKAGE,
         API_ERROR_NO_SUCH_FILE, API_ERROR_PACKAGE_EXIST, API_ERROR_PARAMETERS_NOT_VALID,
-        API_ERROR_PASSWORD_SHORT, API_ERROR_PROFILE_ERROR, API_ERROR_SESSION_ID_INVALID,
-        API_ERROR_SESSION_ID_REQUIRED, API_ERROR_SESSION_TOKEN_EXPIRED, API_ERROR_TFA_DISABLED,
-        API_ERROR_UNAUTHORIZED_ACCESS, API_ERROR_UNSUPPORTED_REGISTRY_CALL,
-        API_ERROR_USERNAME_ALREADY_REGISTERED, API_ERROR_USERNAME_MISMATCH,
-        API_ERROR_VERSION_NOT_EXIST, API_MESSAGE_LOGGED_OUT, API_MESSAGE_PKG_CHANGED,
-        API_MESSAGE_PKG_CREATED, API_MESSAGE_PKG_REMOVED, API_MESSAGE_TAG_ADDED,
-        API_MESSAGE_TAG_REMOVED, API_MESSAGE_TARBALL_REMOVED,
+        API_ERROR_PASSWORD_SHORT, API_ERROR_PROFILE_ERROR, API_ERROR_REVISION_CONFLICT,
+        API_ERROR_SESSION_ID_INVALID, API_ERROR_SESSION_ID_REQUIRED,
+        API_ERROR_SESSION_TOKEN_EXPIRED, API_ERROR_TFA_DISABLED, API_ERROR_UNAUTHORIZED_ACCESS,
+        API_ERROR_UNSUPPORTED_REGISTRY_CALL, API_ERROR_USERNAME_ALREADY_REGISTERED,
+        API_ERROR_USERNAME_MISMATCH, API_ERROR_VERSION_NOT_EXIST, API_MESSAGE_LOGGED_OUT,
+        API_MESSAGE_PKG_CHANGED, API_MESSAGE_PKG_CREATED, API_MESSAGE_PKG_REMOVED,
+        API_MESSAGE_TAG_ADDED, API_MESSAGE_TAG_REMOVED, API_MESSAGE_TARBALL_REMOVED,
     },
     error::RegistryError,
     models::{
@@ -56,11 +55,42 @@ enum PackageDiscoveryMode {
     MultiNode,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataBackend {
+    Sidecar,
+    TransactionalPreview,
+}
+
+impl MetadataBackend {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "sidecar" => Some(Self::Sidecar),
+            "transactional" | "db" | "database" => Some(Self::TransactionalPreview),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sidecar => "sidecar",
+            Self::TransactionalPreview => "transactional-preview",
+        }
+    }
+}
+
 impl PackageDiscoveryMode {
     fn as_str(self) -> &'static str {
         match self {
             Self::SingleNode => "single-node",
             Self::MultiNode => "multi-node",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "single" | "single-node" | "single_node" | "local" => Some(Self::SingleNode),
+            "multi" | "multi-node" | "multi_node" | "cluster" => Some(Self::MultiNode),
+            _ => None,
         }
     }
 }
@@ -76,17 +106,18 @@ struct PackageCacheSettings {
 }
 
 impl PackageCacheSettings {
-    fn from_env() -> Self {
-        let discovery_mode = match std::env::var("RUSTACCIO_PACKAGE_DISCOVERY_MODE")
-            .ok()
-            .unwrap_or_else(|| "single-node".to_string())
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "single" | "single-node" | "single_node" | "local" => PackageDiscoveryMode::SingleNode,
-            "multi" | "multi-node" | "multi_node" | "cluster" => PackageDiscoveryMode::MultiNode,
-            _ => PackageDiscoveryMode::SingleNode,
+    fn from_env(default_discovery_mode: PackageDiscoveryMode) -> Result<Self, RegistryError> {
+        let discovery_mode = match std::env::var("RUSTACCIO_PACKAGE_DISCOVERY_MODE").ok() {
+            None => default_discovery_mode,
+            Some(raw) if raw.trim().is_empty() => default_discovery_mode,
+            Some(raw) => PackageDiscoveryMode::parse(&raw).ok_or_else(|| {
+                RegistryError::http(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "unsupported RUSTACCIO_PACKAGE_DISCOVERY_MODE: {raw} (expected single-node|multi-node)"
+                    ),
+                )
+            })?,
         };
 
         let (default_ttl_secs, default_negative_ttl_secs, default_refresh_secs) =
@@ -108,14 +139,14 @@ impl PackageCacheSettings {
             default_refresh_secs,
         );
 
-        Self {
+        Ok(Self {
             discovery_mode,
             max_entries,
             record_ttl_ms: (ttl_secs as i64).saturating_mul(1_000),
             prune_interval_ms: (prune_interval_secs as i64).saturating_mul(1_000),
             negative_ttl_ms: (negative_ttl_secs as i64).saturating_mul(1_000),
             discovery_refresh_interval_ms: (refresh_secs as i64).saturating_mul(1_000),
-        }
+        })
     }
 }
 
@@ -144,6 +175,8 @@ pub struct Store {
     password_min_length: usize,
     login_session_ttl_seconds: i64,
     package_cache: PackageCacheSettings,
+    metadata_backend: MetadataBackend,
+    strict_revision_checks: bool,
     known_packages: RwLock<KnownPackagesIndex>,
     last_package_cache_prune_ms: AtomicI64,
     maintenance_started: AtomicBool,
@@ -178,7 +211,16 @@ impl Store {
         tokio::fs::create_dir_all(&config.data_dir).await?;
         let tarball_backend = TarballBackend::from_config(config).await?;
         let state_coordinator = StateWriteCoordinator::from_env().await?;
-        let package_cache = PackageCacheSettings::from_env();
+        let metadata_backend = Self::metadata_backend_from_env()?;
+        let default_discovery_mode = if managed_mode_enabled_from_env()
+            || config.tarball_storage.backend == TarballStorageBackend::S3
+        {
+            PackageDiscoveryMode::MultiNode
+        } else {
+            PackageDiscoveryMode::SingleNode
+        };
+        let package_cache = PackageCacheSettings::from_env(default_discovery_mode)?;
+        let strict_revision_checks = strict_revision_checks_from_env();
 
         let state_file = config.data_dir.join("state.json");
         let mut state = Self::read_local_snapshot(&state_file).await?;
@@ -207,6 +249,8 @@ impl Store {
             password_min_length: config.password_min_length,
             login_session_ttl_seconds: config.login_session_ttl_seconds,
             package_cache: package_cache.clone(),
+            metadata_backend,
+            strict_revision_checks,
             known_packages: RwLock::new(KnownPackagesIndex::default()),
             last_package_cache_prune_ms: AtomicI64::new(0),
             maintenance_started: AtomicBool::new(false),
@@ -218,6 +262,8 @@ impl Store {
             prune_interval_ms = package_cache.prune_interval_ms,
             negative_ttl_ms = package_cache.negative_ttl_ms,
             discovery_refresh_interval_ms = package_cache.discovery_refresh_interval_ms,
+            metadata_backend = metadata_backend.as_str(),
+            strict_revision_checks,
             "store initialized"
         );
         Ok(store)
@@ -437,6 +483,27 @@ impl Store {
                 "RUSTACCIO_PACKAGE_METADATA_AUTHORITY={raw} is unsupported; only `sidecar` is valid"
             ),
         ))
+    }
+
+    fn metadata_backend_from_env() -> Result<MetadataBackend, RegistryError> {
+        let raw = std::env::var("RUSTACCIO_METADATA_BACKEND")
+            .ok()
+            .unwrap_or_else(|| "sidecar".to_string());
+        let Some(backend) = MetadataBackend::parse(&raw) else {
+            return Err(RegistryError::http(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "unsupported RUSTACCIO_METADATA_BACKEND: {raw} (expected sidecar|transactional)"
+                ),
+            ));
+        };
+        if backend == MetadataBackend::TransactionalPreview {
+            return Err(RegistryError::http(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "RUSTACCIO_METADATA_BACKEND=transactional is not available yet; use sidecar",
+            ));
+        }
+        Ok(backend)
     }
 
     fn now_http() -> String {
@@ -1157,6 +1224,9 @@ impl Store {
     }
 
     async fn sync_all_package_sidecars(&self) -> Result<usize, RegistryError> {
+        if self.metadata_backend != MetadataBackend::Sidecar {
+            return Ok(0);
+        }
         let package_manifests = {
             let state = self.state.read().await;
             state
@@ -1178,6 +1248,9 @@ impl Store {
     }
 
     async fn sync_package_sidecar(&self, package_name: &str) -> Result<(), RegistryError> {
+        if self.metadata_backend != MetadataBackend::Sidecar {
+            return Ok(());
+        }
         let manifest = {
             let state = self.state.read().await;
             let Some(record) = state.packages.get(package_name) else {
@@ -1237,6 +1310,7 @@ impl Store {
         token: &str,
         method: &str,
         path: &str,
+        request_id: Option<&str>,
     ) -> Result<Option<AuthIdentity>, RegistryError> {
         if let Some(hook) = &self.auth_hook {
             debug!(
@@ -1260,7 +1334,10 @@ impl Store {
                 method,
                 path, "attempting request auth via external auth plugin"
             );
-            if let Some(identity) = plugin.authenticate_request(token, method, path).await? {
+            if let Some(identity) = plugin
+                .authenticate_request(token, method, path, request_id)
+                .await?
+            {
                 debug!(
                     method,
                     path,
@@ -1297,6 +1374,7 @@ impl Store {
         &self,
         identity: Option<&AuthIdentity>,
         package_name: &str,
+        request_id: Option<&str>,
     ) -> Result<Option<bool>, RegistryError> {
         if let Some(hook) = &self.auth_hook
             && let Some(allowed) = hook.allow_access(identity.cloned(), package_name).await?
@@ -1304,7 +1382,9 @@ impl Store {
             return Ok(Some(allowed));
         }
         if let Some(plugin) = &self.auth_plugin
-            && let Some(allowed) = plugin.allow_access(identity.cloned(), package_name).await?
+            && let Some(allowed) = plugin
+                .allow_access(identity.cloned(), package_name, request_id)
+                .await?
         {
             return Ok(Some(allowed));
         }
@@ -1315,6 +1395,7 @@ impl Store {
         &self,
         identity: Option<&AuthIdentity>,
         package_name: &str,
+        request_id: Option<&str>,
     ) -> Result<Option<bool>, RegistryError> {
         if let Some(hook) = &self.auth_hook
             && let Some(allowed) = hook.allow_publish(identity.cloned(), package_name).await?
@@ -1323,7 +1404,7 @@ impl Store {
         }
         if let Some(plugin) = &self.auth_plugin
             && let Some(allowed) = plugin
-                .allow_publish(identity.cloned(), package_name)
+                .allow_publish(identity.cloned(), package_name, request_id)
                 .await?
         {
             return Ok(Some(allowed));
@@ -1335,6 +1416,7 @@ impl Store {
         &self,
         identity: Option<&AuthIdentity>,
         package_name: &str,
+        request_id: Option<&str>,
     ) -> Result<Option<bool>, RegistryError> {
         if let Some(hook) = &self.auth_hook
             && let Some(allowed) = hook
@@ -1345,7 +1427,7 @@ impl Store {
         }
         if let Some(plugin) = &self.auth_plugin
             && let Some(allowed) = plugin
-                .allow_unpublish(identity.cloned(), package_name)
+                .allow_unpublish(identity.cloned(), package_name, request_id)
                 .await?
         {
             return Ok(Some(allowed));
@@ -1679,6 +1761,25 @@ impl Store {
         Self::revision(1)
     }
 
+    fn ensure_revision_matches(
+        manifest: &Map<String, Value>,
+        expected_revision: Option<&str>,
+    ) -> Result<(), RegistryError> {
+        let Some(expected) = expected_revision else {
+            return Ok(());
+        };
+        let current = manifest
+            .get("_rev")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if current == expected {
+            return Ok(());
+        }
+        Err(RegistryError::storage_conflict(format!(
+            "{API_ERROR_REVISION_CONFLICT}: expected `{expected}`, current `{current}`"
+        )))
+    }
+
     fn revision(counter: u64) -> String {
         format!("{counter}-{}", Self::random_token_hex(16))
     }
@@ -1922,6 +2023,17 @@ impl Store {
         body: Value,
         username: &str,
     ) -> Result<String, RegistryError> {
+        let expected_revision = body.get("_rev").and_then(Value::as_str);
+        {
+            let state = self.state.read().await;
+            if let Some(record) = state.packages.get(package_name)
+                && let Some(manifest) = record.manifest.as_object()
+                && self.strict_revision_checks
+            {
+                Self::ensure_revision_matches(manifest, expected_revision)?;
+            }
+        }
+
         let is_owner_or_star_update = body.get("versions").is_none()
             && (body.get("users").is_some() || body.get("maintainers").is_some());
 
@@ -2202,19 +2314,43 @@ impl Store {
         self.run_package_exclusive(package_name, "remove_package", || async {
             self.refresh_package_from_authority_cache(package_name, false)
                 .await?;
-            self.remove_package_inner(package_name).await
+            self.remove_package_inner(package_name, None).await
         })
         .await
     }
 
-    async fn remove_package_inner(&self, package_name: &str) -> Result<String, RegistryError> {
+    pub async fn remove_package_with_revision(
+        &self,
+        package_name: &str,
+        expected_revision: Option<&str>,
+    ) -> Result<String, RegistryError> {
+        self.run_package_exclusive(package_name, "remove_package", || async {
+            self.refresh_package_from_authority_cache(package_name, false)
+                .await?;
+            self.remove_package_inner(package_name, expected_revision)
+                .await
+        })
+        .await
+    }
+
+    async fn remove_package_inner(
+        &self,
+        package_name: &str,
+        expected_revision: Option<&str>,
+    ) -> Result<String, RegistryError> {
         {
             let state = self.state.read().await;
-            if !state.packages.contains_key(package_name) {
+            let Some(record) = state.packages.get(package_name) else {
                 return Err(RegistryError::http(
                     StatusCode::NOT_FOUND,
                     API_ERROR_NO_PACKAGE,
                 ));
+            };
+            let Some(manifest) = record.manifest.as_object() else {
+                return Err(RegistryError::Internal);
+            };
+            if self.strict_revision_checks {
+                Self::ensure_revision_matches(manifest, expected_revision)?;
             }
         }
 
@@ -2244,7 +2380,23 @@ impl Store {
         self.run_package_exclusive(package_name, "remove_tarball", || async {
             self.refresh_package_from_authority_cache(package_name, true)
                 .await?;
-            self.remove_tarball_inner(package_name, filename).await
+            self.remove_tarball_inner(package_name, filename, None)
+                .await
+        })
+        .await
+    }
+
+    pub async fn remove_tarball_with_revision(
+        &self,
+        package_name: &str,
+        filename: &str,
+        expected_revision: Option<&str>,
+    ) -> Result<String, RegistryError> {
+        self.run_package_exclusive(package_name, "remove_tarball", || async {
+            self.refresh_package_from_authority_cache(package_name, true)
+                .await?;
+            self.remove_tarball_inner(package_name, filename, expected_revision)
+                .await
         })
         .await
     }
@@ -2253,14 +2405,21 @@ impl Store {
         &self,
         package_name: &str,
         filename: &str,
+        expected_revision: Option<&str>,
     ) -> Result<String, RegistryError> {
         {
             let state = self.state.read().await;
-            if !state.packages.contains_key(package_name) {
+            let Some(record) = state.packages.get(package_name) else {
                 return Err(RegistryError::http(
                     StatusCode::NOT_FOUND,
                     API_ERROR_NO_PACKAGE,
                 ));
+            };
+            let Some(manifest) = record.manifest.as_object() else {
+                return Err(RegistryError::Internal);
+            };
+            if self.strict_revision_checks {
+                Self::ensure_revision_matches(manifest, expected_revision)?;
             }
         }
 
@@ -2398,6 +2557,16 @@ impl Store {
             .cloned()
             .unwrap_or_else(|| Value::Object(Map::new()));
         Ok(tags)
+    }
+
+    pub async fn invalidate_package_cache(&self, package_name: &str) -> bool {
+        let removed = {
+            let mut state = self.state.write().await;
+            state.packages.remove(package_name).is_some()
+        };
+        let mut known = self.known_packages.write().await;
+        known.missing.remove(package_name);
+        removed
     }
 
     pub async fn get_package_record(&self, package_name: &str) -> Option<PackageRecord> {
@@ -3074,23 +3243,23 @@ pub fn has_write_auth(user: Option<&str>) -> Result<&str, RegistryError> {
 }
 
 pub fn no_credentials() -> RegistryError {
-    RegistryError::http(StatusCode::UNAUTHORIZED, "no credentials provided")
+    RegistryError::auth_unauthorized("no credentials provided")
 }
 
 pub fn unauthorized(msg: &str) -> RegistryError {
-    RegistryError::http(StatusCode::UNAUTHORIZED, msg)
+    RegistryError::auth_unauthorized(msg)
 }
 
 pub fn forbidden(msg: &str) -> RegistryError {
-    RegistryError::http(StatusCode::FORBIDDEN, msg)
+    RegistryError::auth_forbidden(msg)
 }
 
 pub fn bad_request(msg: &str) -> RegistryError {
-    RegistryError::http(StatusCode::BAD_REQUEST, msg)
+    RegistryError::storage_bad_request(msg)
 }
 
 pub fn unprocessable(msg: &str) -> RegistryError {
-    RegistryError::http(StatusCode::UNPROCESSABLE_ENTITY, msg)
+    RegistryError::storage_unprocessable(msg)
 }
 
 pub fn is_json_request(headers: &axum::http::HeaderMap) -> bool {
@@ -3177,6 +3346,31 @@ fn parse_usize_env(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn managed_mode_enabled_from_env() -> bool {
+    std::env::var("RUSTACCIO_MANAGED_MODE")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn strict_revision_checks_from_env() -> bool {
+    let default = managed_mode_enabled_from_env();
+    std::env::var("RUSTACCIO_STRICT_REVISION_CHECK")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(default)
+}
+
 pub fn parse_authorization(header: Option<&str>) -> Option<String> {
     let value = header?.trim();
     if let Some(token) = value.strip_prefix("Bearer ") {
@@ -3205,8 +3399,9 @@ pub fn ok_object() -> Value {
 #[cfg(test)]
 mod tests {
     use super::{PackageCacheSettings, PackageDiscoveryMode, Store};
-    use crate::{config::Config, models::PackageRecord};
-    use serde_json::json;
+    use crate::{config::Config, error::RegistryError, models::PackageRecord};
+    use axum::http::StatusCode;
+    use serde_json::{Map, Value, json};
     use std::{io::Write, path::Path};
 
     fn config_for_data_dir(data_dir: &Path) -> Config {
@@ -3371,5 +3566,43 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(!state.packages.contains_key("expired"));
         assert!(state.packages.contains_key("fresh"));
+    }
+
+    #[test]
+    fn package_discovery_mode_parse_supports_aliases() {
+        assert_eq!(
+            PackageDiscoveryMode::parse("single-node"),
+            Some(PackageDiscoveryMode::SingleNode)
+        );
+        assert_eq!(
+            PackageDiscoveryMode::parse("single"),
+            Some(PackageDiscoveryMode::SingleNode)
+        );
+        assert_eq!(
+            PackageDiscoveryMode::parse("multi-node"),
+            Some(PackageDiscoveryMode::MultiNode)
+        );
+        assert_eq!(
+            PackageDiscoveryMode::parse("cluster"),
+            Some(PackageDiscoveryMode::MultiNode)
+        );
+    }
+
+    #[test]
+    fn package_discovery_mode_parse_rejects_unknown_values() {
+        assert_eq!(PackageDiscoveryMode::parse(""), None);
+        assert_eq!(PackageDiscoveryMode::parse("wat"), None);
+    }
+
+    #[test]
+    fn revision_match_enforces_expected_revision() {
+        let mut manifest = Map::new();
+        manifest.insert("_rev".to_string(), Value::String("2-abc".to_string()));
+        assert!(Store::ensure_revision_matches(&manifest, Some("2-abc")).is_ok());
+        let err = Store::ensure_revision_matches(&manifest, Some("1-stale"))
+            .expect_err("stale revision should fail");
+        assert!(
+            matches!(err, RegistryError::Http { status, .. } if status == StatusCode::CONFLICT)
+        );
     }
 }
