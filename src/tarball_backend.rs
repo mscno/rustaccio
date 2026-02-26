@@ -580,10 +580,11 @@ impl S3TarballBackend {
         filename: &str,
         content: &[u8],
     ) -> Result<(), RegistryError> {
+        let key = self.verdaccio_plain_key(package, filename);
         self.client
             .put_object()
             .bucket(&self.bucket)
-            .key(self.key(package, filename))
+            .key(key)
             .body(aws_sdk_s3::primitives::ByteStream::from(content.to_vec()))
             .send()
             .await

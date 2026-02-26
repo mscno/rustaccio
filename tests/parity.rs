@@ -1708,6 +1708,7 @@ async fn scoped_publish_normalizes_scoped_attachment_keys() {
         body["versions"]["1.0.0"]["dist"]["tarball"].as_str(),
         Some("http://localhost:4873/%40scope%2Fnormalize/-/normalize-1.0.0.tgz")
     );
+    assert_eq!(body["dist-tags"]["latest"].as_str(), Some("1.0.0"));
     assert!(body["_attachments"].get("normalize-1.0.0.tgz").is_some());
     assert_eq!(
         body["_attachments"]["normalize-1.0.0.tgz"]["version"].as_str(),
@@ -1722,6 +1723,22 @@ async fn scoped_publish_normalizes_scoped_attachment_keys() {
             .get("@scope/normalize-1.0.0.tgz")
             .is_none()
     );
+    assert!(
+        body["_attachments"]["normalize-1.0.0.tgz"]
+            .get("content_type")
+            .is_none()
+    );
+    assert!(
+        body["_attachments"]["normalize-1.0.0.tgz"]
+            .get("length")
+            .is_none()
+    );
+
+    let modified = body["time"]["modified"]
+        .as_str()
+        .expect("modified timestamp present");
+    assert!(modified.ends_with('Z'));
+    assert!(!modified.contains("+00:00"));
     assert!(body["time"]["1.0.0"].as_str().is_some());
 
     let req = Request::builder()
@@ -3504,6 +3521,80 @@ async fn s3_mode_writes_verdaccio_package_sidecar_on_publish() {
     assert!(
         verdaccio_sidecar_put,
         "publish should write package sidecar metadata in Verdaccio-compatible layout"
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "s3")]
+async fn s3_mode_scoped_publish_writes_verdaccio_tarball_key_layout() {
+    let s3 = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().starts_with("/registry-test")
+                && request
+                    .url
+                    .query_pairs()
+                    .any(|(k, v)| k == "list-type" && v == "2")
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_s3_list_xml()))
+        .mount(&s3)
+        .await;
+    Mock::given(method("PUT"))
+        .and(|request: &wiremock::Request| request.url.path().ends_with(".tgz"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&s3)
+        .await;
+    Mock::given(method("PUT"))
+        .and(|request: &wiremock::Request| {
+            request
+                .url
+                .path()
+                .contains("/registry/@scope/scoped-s3-pkg/package.json")
+        })
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&s3)
+        .await;
+
+    let dir = TempDir::new().expect("dir");
+    let cfg = s3_test_config(dir.path().to_path_buf(), s3.uri());
+    let state = runtime::build_state(&cfg, None).await.expect("state");
+    let app = build_router(state);
+    let token = create_user(&app, "scoped-s3-user", "secret").await;
+
+    let manifest = pkg_manifest(
+        "@scope/scoped-s3-pkg",
+        "1.0.0",
+        "scoped-s3-pkg-1.0.0.tgz",
+        b"payload",
+    );
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri("/%40scope%2Fscoped-s3-pkg")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&manifest).expect("payload")))
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let requests = s3.received_requests().await.expect("received requests");
+    let tarball_put_paths: Vec<String> = requests
+        .iter()
+        .filter(|request| request.method.as_str() == "PUT")
+        .map(|request| request.url.path().to_string())
+        .filter(|path| path.ends_with(".tgz"))
+        .collect();
+
+    assert!(
+        tarball_put_paths
+            .iter()
+            .any(|path| path.contains("/registry/@scope/scoped-s3-pkg/scoped-s3-pkg-1.0.0.tgz")),
+        "scoped tarball publish should use Verdaccio path layout in object storage"
+    );
+    assert!(
+        tarball_put_paths.iter().all(|path| !path.contains("__")),
+        "scoped tarball publish should not write legacy __ key layout"
     );
 }
 
