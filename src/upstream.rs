@@ -234,7 +234,11 @@ impl Upstream {
         }))
     }
 
-    #[instrument(skip(self, payload), fields(path, upstream = %self.base_url))]
+    #[instrument(
+        level = "debug",
+        skip(self, payload),
+        fields(path = %path, upstream = %self.base_url)
+    )]
     async fn post_json_path(
         &self,
         path: &str,

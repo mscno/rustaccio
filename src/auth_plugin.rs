@@ -84,7 +84,7 @@ impl HttpAuthPlugin {
         Ok(plugin)
     }
 
-    #[instrument(skip(self, password), fields(username))]
+    #[instrument(level = "debug", skip(self, password), fields(username = %username))]
     pub async fn add_user(
         &self,
         username: &str,
@@ -107,7 +107,7 @@ impl HttpAuthPlugin {
         .await
     }
 
-    #[instrument(skip(self, password), fields(username))]
+    #[instrument(level = "debug", skip(self, password), fields(username = %username))]
     pub async fn authenticate(&self, username: &str, password: &str) -> Result<(), RegistryError> {
         self.post_json(
             &self.login_endpoint,
@@ -119,7 +119,11 @@ impl HttpAuthPlugin {
         .await
     }
 
-    #[instrument(skip(self, old_password, new_password), fields(username))]
+    #[instrument(
+        level = "debug",
+        skip(self, old_password, new_password),
+        fields(username = %username)
+    )]
     pub async fn change_password(
         &self,
         username: &str,
@@ -144,7 +148,11 @@ impl HttpAuthPlugin {
         .await
     }
 
-    #[instrument(skip(self, token), fields(method, path))]
+    #[instrument(
+        level = "debug",
+        skip(self, token),
+        fields(method = %method, path = %path)
+    )]
     pub async fn authenticate_request(
         &self,
         token: &str,
@@ -287,7 +295,11 @@ impl HttpAuthPlugin {
         Ok(Some(AuthIdentity { username, groups }))
     }
 
-    #[instrument(skip(self, identity), fields(package_name))]
+    #[instrument(
+        level = "debug",
+        skip(self, identity),
+        fields(package_name = %package_name, has_identity = identity.is_some())
+    )]
     pub async fn allow_access(
         &self,
         identity: Option<AuthIdentity>,
@@ -303,7 +315,11 @@ impl HttpAuthPlugin {
         .await
     }
 
-    #[instrument(skip(self, identity), fields(package_name))]
+    #[instrument(
+        level = "debug",
+        skip(self, identity),
+        fields(package_name = %package_name, has_identity = identity.is_some())
+    )]
     pub async fn allow_publish(
         &self,
         identity: Option<AuthIdentity>,
@@ -319,7 +335,11 @@ impl HttpAuthPlugin {
         .await
     }
 
-    #[instrument(skip(self, identity), fields(package_name))]
+    #[instrument(
+        level = "debug",
+        skip(self, identity),
+        fields(package_name = %package_name, has_identity = identity.is_some())
+    )]
     pub async fn allow_unpublish(
         &self,
         identity: Option<AuthIdentity>,
@@ -335,7 +355,15 @@ impl HttpAuthPlugin {
         .await
     }
 
-    #[instrument(skip(self, identity), fields(endpoint = endpoint.unwrap_or("<none>"), package_name))]
+    #[instrument(
+        level = "debug",
+        skip(self, identity),
+        fields(
+            endpoint = endpoint.unwrap_or("<none>"),
+            package_name = %package_name,
+            has_identity = identity.is_some()
+        )
+    )]
     async fn allow_decision(
         &self,
         endpoint: Option<&str>,
@@ -440,7 +468,7 @@ impl HttpAuthPlugin {
         Ok(None)
     }
 
-    #[instrument(skip(self, payload), fields(endpoint))]
+    #[instrument(level = "debug", skip(self, payload), fields(endpoint = %endpoint))]
     async fn post_json(&self, endpoint: &str, payload: &Value) -> Result<(), RegistryError> {
         let url = format!("{}{}", self.base_url, endpoint);
         debug!(endpoint, "attempting external auth plugin request");

@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Scoped package publishes now normalize `_attachments` keys and `dist.tarball` entries to canonical tarball filenames, preventing nested tarball paths like `@scope/pkg.tgz` from causing `npm install` 404s.
+- Request tracing now records route/query context on API spans and demotes high-frequency external auth helper spans to `debug`, reducing noisy `INFO` close-event logs.
 
 ## [0.9.0] - 2026-02-14
 

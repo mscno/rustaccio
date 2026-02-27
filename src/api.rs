@@ -660,8 +660,29 @@ struct PackageRouteContext {
     req: Request<Body>,
 }
 
-#[instrument(skip(ctx))]
+#[instrument(
+    skip(ctx),
+    fields(method, path, package, route, tail, has_query, authenticated)
+)]
 async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body>, RegistryError> {
+    let route = package_route_pattern(&ctx.method, &ctx.tail);
+    let tail_path = if ctx.tail.is_empty() {
+        "<root>".to_string()
+    } else {
+        ctx.tail.join("/")
+    };
+    let span = tracing::Span::current();
+    span.record("method", tracing::field::display(&ctx.method));
+    span.record("path", tracing::field::display(&ctx.request_context.path));
+    span.record("package", tracing::field::display(&ctx.package_name));
+    span.record("route", tracing::field::display(route));
+    span.record("tail", tracing::field::display(&tail_path));
+    span.record("has_query", tracing::field::display(ctx.query.is_some()));
+    span.record(
+        "authenticated",
+        tracing::field::display(ctx.auth_identity.is_some()),
+    );
+
     let PackageRouteContext {
         state,
         method,
@@ -677,7 +698,8 @@ async fn handle_package_routes(ctx: PackageRouteContext) -> Result<Response<Body
     debug!(
         package = package_name,
         method = %method,
-        tail_len = tail.len(),
+        route,
+        tail = tail_path,
         authenticated = auth_identity.is_some(),
         "handling package route"
     );
@@ -1096,7 +1118,18 @@ async fn ensure_package_cached(
     Ok(())
 }
 
-#[instrument(skip(state), fields(has_query = query.is_some(), authenticated = auth_identity.is_some()))]
+#[instrument(
+    skip(state, query, auth_identity, request_context),
+    fields(
+        method = %request_context.method,
+        path = %request_context.path,
+        has_query = query.is_some(),
+        query_text,
+        query_size,
+        query_from,
+        authenticated = auth_identity.is_some()
+    )
+)]
 async fn handle_search(
     state: &AppState,
     query: Option<&str>,
@@ -1118,6 +1151,11 @@ async fn handle_search(
         .get("from")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
+    let query_text = params.get("text").map(String::as_str).unwrap_or_default();
+    let span = tracing::Span::current();
+    span.record("query_text", tracing::field::display(query_text));
+    span.record("query_size", tracing::field::display(size));
+    span.record("query_from", tracing::field::display(from));
 
     let mut objects = Vec::new();
 
@@ -1209,7 +1247,11 @@ async fn handle_search(
     ))
 }
 
-#[instrument(skip(store, headers), fields(method = %method, path))]
+#[instrument(
+    level = "debug",
+    skip(store, headers),
+    fields(method = %method, path = %path)
+)]
 async fn resolve_auth_identity(
     store: &Store,
     headers: &HeaderMap,
@@ -1779,6 +1821,31 @@ fn parse_package_path(path: &str) -> Option<(String, Vec<String>)> {
     Some((package, tail))
 }
 
+fn package_route_pattern(method: &Method, tail: &[String]) -> &'static str {
+    match method {
+        &Method::GET | &Method::HEAD => match tail {
+            [] => "GET|HEAD /:package",
+            [_] => "GET|HEAD /:package/:version",
+            [dash, _filename] if dash == "-" => "GET|HEAD /:package/-/:filename",
+            _ => "GET|HEAD /:package/<unmatched>",
+        },
+        &Method::PUT => match tail {
+            [] => "PUT /:package",
+            [dash, _revision] if dash == "-rev" => "PUT /:package/-rev/:revision",
+            [_tag] => "PUT /:package/:tag",
+            _ => "PUT /:package/<unmatched>",
+        },
+        &Method::DELETE => match tail {
+            [dash, _revision] if dash == "-rev" => "DELETE /:package/-rev/:revision",
+            [dash, _filename, rev, _revision] if dash == "-" && rev == "-rev" => {
+                "DELETE /:package/-/:filename/-rev/:revision"
+            }
+            _ => "DELETE /:package/<unmatched>",
+        },
+        _ => "/:package/<unsupported-method>",
+    }
+}
+
 fn decode_path_component(value: &str) -> String {
     urlencoding::decode(value)
         .map(|decoded| decoded.into_owned())
@@ -2013,4 +2080,62 @@ async fn read_body(req: Request<Body>, max_body_size: usize) -> Result<Vec<u8>, 
         .await
         .map(|bytes| bytes.to_vec())
         .map_err(|_| RegistryError::http(StatusCode::PAYLOAD_TOO_LARGE, "request entity too large"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::package_route_pattern;
+    use axum::http::Method;
+
+    fn tail(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    #[test]
+    fn package_route_pattern_get_variants() {
+        assert_eq!(
+            package_route_pattern(&Method::GET, &tail(&[])),
+            "GET|HEAD /:package"
+        );
+        assert_eq!(
+            package_route_pattern(&Method::HEAD, &tail(&["1.2.3"])),
+            "GET|HEAD /:package/:version"
+        );
+        assert_eq!(
+            package_route_pattern(&Method::GET, &tail(&["-", "pkg-1.2.3.tgz"])),
+            "GET|HEAD /:package/-/:filename"
+        );
+        assert_eq!(
+            package_route_pattern(&Method::GET, &tail(&["too", "many", "parts"])),
+            "GET|HEAD /:package/<unmatched>"
+        );
+    }
+
+    #[test]
+    fn package_route_pattern_write_variants() {
+        assert_eq!(
+            package_route_pattern(&Method::PUT, &tail(&[])),
+            "PUT /:package"
+        );
+        assert_eq!(
+            package_route_pattern(&Method::PUT, &tail(&["latest"])),
+            "PUT /:package/:tag"
+        );
+        assert_eq!(
+            package_route_pattern(&Method::PUT, &tail(&["-rev", "17-abc"])),
+            "PUT /:package/-rev/:revision"
+        );
+        assert_eq!(
+            package_route_pattern(&Method::DELETE, &tail(&["-rev", "17-abc"])),
+            "DELETE /:package/-rev/:revision"
+        );
+        assert_eq!(
+            package_route_pattern(&Method::DELETE, &tail(&["-", "a.tgz", "-rev", "18-def"])),
+            "DELETE /:package/-/:filename/-rev/:revision"
+        );
+        assert_eq!(
+            package_route_pattern(&Method::DELETE, &tail(&["latest"])),
+            "DELETE /:package/<unmatched>"
+        );
+    }
 }
