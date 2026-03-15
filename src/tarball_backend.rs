@@ -5,13 +5,15 @@ use crate::{
     error::RegistryError,
 };
 #[cfg(feature = "s3")]
-use aws_sdk_s3::error::ProvideErrorMetadata;
+use aws_sdk_s3::error::{DisplayErrorContext, ProvideErrorMetadata};
 use axum::http::StatusCode;
 #[cfg(feature = "s3")]
 use config::{Config as SettingsLoader, Environment};
 use serde_json::Value;
 #[cfg(feature = "s3")]
 use std::collections::HashSet;
+#[cfg(feature = "s3")]
+use std::error::Error as StdError;
 use std::path::PathBuf;
 #[cfg(feature = "s3")]
 use tracing::warn;
@@ -364,6 +366,7 @@ pub struct S3TarballBackend {
     client: aws_sdk_s3::Client,
     bucket: String,
     prefix: String,
+    endpoint: String,
 }
 
 #[cfg(feature = "s3")]
@@ -437,6 +440,10 @@ impl S3TarballBackend {
             client: aws_sdk_s3::Client::from_conf(builder.build()),
             bucket: cfg.bucket.clone(),
             prefix: normalize_prefix(&cfg.prefix),
+            endpoint: cfg
+                .endpoint
+                .clone()
+                .unwrap_or_else(|| "<aws-default>".to_string()),
         })
     }
 
@@ -546,7 +553,16 @@ impl S3TarballBackend {
         {
             Ok(response) => response,
             Err(err) if is_not_found(&err) => return Ok(None),
-            Err(err) => return Err(map_s3_sdk_error("get_object", &err)),
+            Err(err) => {
+                return Err(map_s3_sdk_error(
+                    "get_object",
+                    &self.endpoint,
+                    &self.bucket,
+                    Some(key),
+                    None,
+                    &err,
+                ));
+            }
         };
 
         let bytes = response.body.collect().await.map_err(|err| {
@@ -569,7 +585,14 @@ impl S3TarballBackend {
         {
             Ok(_) => Ok(true),
             Err(err) if is_not_found(&err) => Ok(false),
-            Err(err) => Err(map_s3_sdk_error("head_object", &err)),
+            Err(err) => Err(map_s3_sdk_error(
+                "head_object",
+                &self.endpoint,
+                &self.bucket,
+                Some(key),
+                None,
+                &err,
+            )),
         }
     }
 
@@ -584,11 +607,20 @@ impl S3TarballBackend {
         self.client
             .put_object()
             .bucket(&self.bucket)
-            .key(key)
+            .key(&key)
             .body(aws_sdk_s3::primitives::ByteStream::from(content.to_vec()))
             .send()
             .await
-            .map_err(|err| map_s3_sdk_error("put_object", &err))?;
+            .map_err(|err| {
+                map_s3_sdk_error(
+                    "put_object",
+                    &self.endpoint,
+                    &self.bucket,
+                    Some(&key),
+                    None,
+                    &err,
+                )
+            })?;
         debug!("uploaded tarball to s3");
         Ok(())
     }
@@ -617,10 +649,19 @@ impl S3TarballBackend {
             self.client
                 .delete_object()
                 .bucket(&self.bucket)
-                .key(key)
+                .key(&key)
                 .send()
                 .await
-                .map_err(|err| map_s3_sdk_error("delete_object", &err))?;
+                .map_err(|err| {
+                    map_s3_sdk_error(
+                        "delete_object",
+                        &self.endpoint,
+                        &self.bucket,
+                        Some(&key),
+                        None,
+                        &err,
+                    )
+                })?;
             debug!("deleted tarball from s3");
             return Ok(true);
         }
@@ -641,10 +682,16 @@ impl S3TarballBackend {
                     request = request.continuation_token(token);
                 }
 
-                let response = request
-                    .send()
-                    .await
-                    .map_err(|err| map_s3_sdk_error("list_objects_v2", &err))?;
+                let response = request.send().await.map_err(|err| {
+                    map_s3_sdk_error(
+                        "list_objects_v2",
+                        &self.endpoint,
+                        &self.bucket,
+                        None,
+                        Some(&prefix),
+                        &err,
+                    )
+                })?;
                 let objects = response.contents();
                 for object in objects {
                     if let Some(key) = object.key() {
@@ -654,7 +701,16 @@ impl S3TarballBackend {
                             .key(key)
                             .send()
                             .await
-                            .map_err(|err| map_s3_sdk_error("delete_object", &err))?;
+                            .map_err(|err| {
+                                map_s3_sdk_error(
+                                    "delete_object",
+                                    &self.endpoint,
+                                    &self.bucket,
+                                    Some(key),
+                                    Some(&prefix),
+                                    &err,
+                                )
+                            })?;
                     }
                 }
 
@@ -683,10 +739,16 @@ impl S3TarballBackend {
                 request = request.continuation_token(token);
             }
 
-            let response = request
-                .send()
-                .await
-                .map_err(|err| map_s3_sdk_error("list_objects_v2", &err))?;
+            let response = request.send().await.map_err(|err| {
+                map_s3_sdk_error(
+                    "list_objects_v2",
+                    &self.endpoint,
+                    &self.bucket,
+                    None,
+                    Some(&self.prefix),
+                    &err,
+                )
+            })?;
             for object in response.contents() {
                 if let Some(key) = object.key()
                     && let Some(reference) = self.parse_ref_from_key(key)
@@ -719,10 +781,16 @@ impl S3TarballBackend {
                 request = request.continuation_token(token);
             }
 
-            let response = request
-                .send()
-                .await
-                .map_err(|err| map_s3_sdk_error("list_objects_v2", &err))?;
+            let response = request.send().await.map_err(|err| {
+                map_s3_sdk_error(
+                    "list_objects_v2",
+                    &self.endpoint,
+                    &self.bucket,
+                    None,
+                    Some(&self.prefix),
+                    &err,
+                )
+            })?;
             for object in response.contents() {
                 let Some(key) = object.key() else {
                     continue;
@@ -764,10 +832,16 @@ impl S3TarballBackend {
                     request = request.continuation_token(token);
                 }
 
-                let response = request
-                    .send()
-                    .await
-                    .map_err(|err| map_s3_sdk_error("list_objects_v2", &err))?;
+                let response = request.send().await.map_err(|err| {
+                    map_s3_sdk_error(
+                        "list_objects_v2",
+                        &self.endpoint,
+                        &self.bucket,
+                        None,
+                        Some(&prefix),
+                        &err,
+                    )
+                })?;
                 for object in response.contents() {
                     let Some(key) = object.key() else {
                         continue;
@@ -818,11 +892,20 @@ impl S3TarballBackend {
         self.client
             .put_object()
             .bucket(&self.bucket)
-            .key(key)
+            .key(&key)
             .body(aws_sdk_s3::primitives::ByteStream::from(body))
             .send()
             .await
-            .map_err(|err| map_s3_sdk_error("put_object", &err))?;
+            .map_err(|err| {
+                map_s3_sdk_error(
+                    "put_object",
+                    &self.endpoint,
+                    &self.bucket,
+                    Some(&key),
+                    None,
+                    &err,
+                )
+            })?;
         Ok(())
     }
 
@@ -984,9 +1067,16 @@ fn strip_non_certificate_lines(input: Vec<u8>) -> Vec<u8> {
 }
 
 #[cfg(feature = "s3")]
-fn map_s3_sdk_error<E>(operation: &str, err: &aws_sdk_s3::error::SdkError<E>) -> RegistryError
+fn map_s3_sdk_error<E>(
+    operation: &str,
+    endpoint: &str,
+    bucket: &str,
+    key: Option<&str>,
+    prefix: Option<&str>,
+    err: &aws_sdk_s3::error::SdkError<E>,
+) -> RegistryError
 where
-    E: ProvideErrorMetadata + std::fmt::Debug,
+    E: ProvideErrorMetadata + StdError + std::fmt::Debug + 'static,
 {
     let http_status = err
         .raw_response()
@@ -994,12 +1084,32 @@ where
         .unwrap_or(StatusCode::BAD_GATEWAY);
     let aws_code = err.code().unwrap_or("unknown");
     let aws_message = err.message().unwrap_or("");
+    let aws_request_id = s3_error_header(err, "x-amz-request-id").unwrap_or("<none>");
+    let aws_extended_request_id = s3_error_header(err, "x-amz-id-2").unwrap_or("<none>");
+    let response_server = s3_error_header(err, "server").unwrap_or("<none>");
+    let response_via = s3_error_header(err, "via").unwrap_or("<none>");
+    let response_content_type = s3_error_header(err, "content-type").unwrap_or("<none>");
+    let key = key.filter(|value| !value.is_empty()).unwrap_or("<none>");
+    let prefix = prefix
+        .map(|value| if value.is_empty() { "<root>" } else { value })
+        .unwrap_or("<none>");
 
     warn!(
         operation,
+        bucket,
+        endpoint,
+        key,
+        prefix,
         http_status = http_status.as_u16(),
+        sdk_error_kind = s3_sdk_error_kind(err),
         aws_code = ?err.code(),
         aws_message = ?err.message(),
+        aws_request_id,
+        aws_extended_request_id,
+        response_server,
+        response_via,
+        response_content_type,
+        sdk_error = %DisplayErrorContext(err),
         "s3 operation failed"
     );
 
@@ -1018,6 +1128,27 @@ where
 }
 
 #[cfg(feature = "s3")]
+fn s3_error_header<'a, E>(
+    err: &'a aws_sdk_s3::error::SdkError<E>,
+    header: &str,
+) -> Option<&'a str> {
+    err.raw_response()
+        .and_then(|response| response.headers().get(header))
+}
+
+#[cfg(feature = "s3")]
+fn s3_sdk_error_kind<E, R>(err: &aws_sdk_s3::error::SdkError<E, R>) -> &'static str {
+    match err {
+        aws_sdk_s3::error::SdkError::ConstructionFailure(_) => "construction_failure",
+        aws_sdk_s3::error::SdkError::TimeoutError(_) => "timeout",
+        aws_sdk_s3::error::SdkError::DispatchFailure(_) => "dispatch_failure",
+        aws_sdk_s3::error::SdkError::ResponseError(_) => "response_error",
+        aws_sdk_s3::error::SdkError::ServiceError(_) => "service_error",
+        _ => "unknown",
+    }
+}
+
+#[cfg(feature = "s3")]
 fn is_not_found<E>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
     err.raw_response()
         .map(|response| response.status().as_u16() == 404)
@@ -1028,7 +1159,9 @@ fn is_not_found<E>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
 mod tests {
     use super::{
         TarballRef, parse_package_from_metadata_object_key, parse_tarball_ref_from_object_key,
+        s3_sdk_error_kind,
     };
+    use std::io;
 
     #[test]
     fn parses_rustaccio_legacy_key_layout() {
@@ -1081,5 +1214,33 @@ mod tests {
         let key = "registry/%40scope%2fpkg/package.json";
         let parsed = parse_package_from_metadata_object_key("registry/", key);
         assert_eq!(parsed.as_deref(), Some("@scope/pkg"));
+    }
+
+    #[test]
+    fn classifies_sdk_error_variants_for_logging() {
+        type TestSdkError = aws_sdk_s3::error::SdkError<aws_sdk_s3::error::ErrorMetadata, ()>;
+
+        let construction = TestSdkError::construction_failure(io::Error::other("build"));
+        assert_eq!(s3_sdk_error_kind(&construction), "construction_failure");
+
+        let timeout = TestSdkError::timeout_error(io::Error::other("timeout"));
+        assert_eq!(s3_sdk_error_kind(&timeout), "timeout");
+
+        let dispatch = TestSdkError::dispatch_failure(aws_sdk_s3::error::ConnectorError::other(
+            io::Error::other("dispatch").into(),
+            None,
+        ));
+        assert_eq!(s3_sdk_error_kind(&dispatch), "dispatch_failure");
+
+        let response = TestSdkError::response_error(io::Error::other("response"), ());
+        assert_eq!(s3_sdk_error_kind(&response), "response_error");
+
+        let service = TestSdkError::service_error(
+            aws_sdk_s3::error::ErrorMetadata::builder()
+                .message("service")
+                .build(),
+            (),
+        );
+        assert_eq!(s3_sdk_error_kind(&service), "service_error");
     }
 }

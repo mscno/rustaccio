@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Scoped package publishes now normalize `_attachments` keys and `dist.tarball` entries to canonical tarball filenames, preventing nested tarball paths like `@scope/pkg.tgz` from causing `npm install` 404s.
 - Request tracing now records route/query context on API spans and demotes high-frequency external auth helper spans to `debug`, reducing noisy `INFO` close-event logs.
+- S3 tarball backend warnings now include endpoint, bucket, key/prefix scope, AWS request IDs, gateway headers, and SDK error kind to speed up production diagnosis of broken S3 backends and proxies.
 
 ## [0.9.0] - 2026-02-14
 
