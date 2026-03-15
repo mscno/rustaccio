@@ -27,6 +27,10 @@ impl Upstream {
         }
     }
 
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     #[instrument(skip(self), fields(package = package_name, upstream = %self.base_url))]
     pub async fn fetch_package(&self, package_name: &str) -> Result<Option<Value>, RegistryError> {
         let encoded = urlencoding::encode(package_name);
@@ -38,11 +42,15 @@ impl Upstream {
             .await
             .map_err(map_uplink_request_err)?;
         if resp.status() == StatusCode::NOT_FOUND {
-            debug!("package not found upstream");
+            debug!(status = resp.status().as_u16(), outcome = "miss", "package not found upstream");
             return Ok(None);
         }
         if resp.status() == StatusCode::NOT_MODIFIED {
-            debug!("package not modified upstream");
+            debug!(
+                status = resp.status().as_u16(),
+                outcome = "not_modified",
+                "package not modified upstream"
+            );
             return Ok(None);
         }
         if matches!(
@@ -51,6 +59,12 @@ impl Upstream {
                 | StatusCode::GATEWAY_TIMEOUT
                 | StatusCode::SERVICE_UNAVAILABLE
         ) {
+            warn!(
+                status = resp.status().as_u16(),
+                outcome = "transient_error",
+                reason = "upstream_status",
+                "upstream package request returned transient status"
+            );
             return Err(RegistryError::http(
                 StatusCode::SERVICE_UNAVAILABLE,
                 API_ERROR_SERVER_TIME_OUT,
@@ -59,6 +73,8 @@ impl Upstream {
         if !resp.status().is_success() {
             warn!(
                 status = resp.status().as_u16(),
+                outcome = "non_transient_error",
+                reason = "unexpected_status",
                 "unexpected uplink package status"
             );
             return Err(RegistryError::http(
@@ -70,7 +86,14 @@ impl Upstream {
         let value = resp
             .json::<Value>()
             .await
-            .map_err(|_| RegistryError::http(StatusCode::BAD_GATEWAY, "bad uplink payload"))?;
+            .map_err(|_| {
+                warn!(
+                    outcome = "non_transient_error",
+                    reason = "bad_payload",
+                    "upstream package response was not valid JSON"
+                );
+                RegistryError::http(StatusCode::BAD_GATEWAY, "bad uplink payload")
+            })?;
         debug!("fetched package from upstream");
         Ok(Some(value))
     }
@@ -342,7 +365,24 @@ fn load_env_value(key: &str) -> Option<String> {
 }
 
 fn map_uplink_request_err(err: reqwest::Error) -> RegistryError {
-    warn!(error = %err, "uplink request failed");
+    let reason = if err.is_timeout() {
+        "timeout"
+    } else if err.is_connect() {
+        "connect_error"
+    } else if err.is_decode() {
+        "decode_error"
+    } else if err.is_body() {
+        "body_error"
+    } else if err.is_redirect() {
+        "redirect_error"
+    } else if err.is_request() {
+        "request_error"
+    } else if err.is_builder() {
+        "builder_error"
+    } else {
+        "unknown_request_error"
+    };
+    warn!(reason, error = %err, "uplink request failed");
     if err.is_timeout() {
         return RegistryError::http(StatusCode::SERVICE_UNAVAILABLE, API_ERROR_SERVER_TIME_OUT);
     }

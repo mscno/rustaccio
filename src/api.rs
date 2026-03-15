@@ -26,6 +26,12 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, instrument, warn};
 
+#[derive(Clone, Copy)]
+struct SelectedUplink<'a> {
+    name: &'a str,
+    upstream: &'a crate::upstream::Upstream,
+}
+
 pub async fn dispatch(
     State(state): State<AppState>,
     req: Request<Body>,
@@ -1029,14 +1035,14 @@ async fn handle_get_tarball(
     }
 
     let mut upstream_error = false;
-    for upstream in select_uplinks_for_package(state, package_name) {
+    for selected in select_uplinks_for_package(state, package_name) {
         let url = state
             .store
             .upstream_tarball_url(package_name, filename)
             .await
-            .unwrap_or_else(|| upstream.default_tarball_url(package_name, filename));
+            .unwrap_or_else(|| selected.upstream.default_tarball_url(package_name, filename));
 
-        match upstream.fetch_tarball(&url).await {
+        match selected.upstream.fetch_tarball(&url).await {
             Ok(Some(bytes)) => {
                 state
                     .store
@@ -1076,21 +1082,64 @@ async fn ensure_package_cached(
         return Ok(());
     }
 
+    let matched_rule = state.acl.rule_for(package_name);
     let uplinks = select_uplinks_for_package(state, package_name);
+    let selected_uplink_names: Vec<&str> = uplinks.iter().map(|selected| selected.name).collect();
+    debug!(
+        acl_pattern = matched_rule.map(|rule| rule.pattern.as_str()).unwrap_or("none"),
+        acl_proxy = matched_rule
+            .and_then(|rule| rule.proxy.as_deref())
+            .unwrap_or("none"),
+        uplinks_look = matched_rule.map(|rule| rule.uplinks_look).unwrap_or(true),
+        selected_uplinks = ?selected_uplink_names,
+        "selected uplinks for package manifest lookup"
+    );
     if uplinks.is_empty() {
         debug!("no upstream configured for package");
         return Ok(());
     }
 
     let mut had_upstream_error = false;
-    for upstream in uplinks {
-        let Some(manifest) = (match upstream.fetch_package(package_name).await {
-            Ok(manifest) => manifest,
+    for selected in uplinks {
+        let Some(manifest) = (match selected.upstream.fetch_package(package_name).await {
+            Ok(manifest) => {
+                if manifest.is_none() {
+                    debug!(
+                        uplink_name = selected.name,
+                        uplink = selected.upstream.base_url(),
+                        outcome = "miss",
+                        "uplink did not have package manifest"
+                    );
+                }
+                manifest
+            }
             Err(err) if is_uplink_transient_error(&err) => {
+                let (status, code, message) = registry_error_details(&err);
+                warn!(
+                    uplink_name = selected.name,
+                    uplink = selected.upstream.base_url(),
+                    outcome = "transient_error",
+                    error_status = status,
+                    error_code = code,
+                    error = message,
+                    "uplink package fetch failed, trying next candidate"
+                );
                 had_upstream_error = true;
                 continue;
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                let (status, code, message) = registry_error_details(&err);
+                warn!(
+                    uplink_name = selected.name,
+                    uplink = selected.upstream.base_url(),
+                    outcome = "non_transient_error",
+                    error_status = status,
+                    error_code = code,
+                    error = message,
+                    "uplink package fetch failed"
+                );
+                return Err(err);
+            }
         }) else {
             continue;
         };
@@ -1104,11 +1153,20 @@ async fn ensure_package_cached(
             .store
             .upsert_upstream_package(package_name, normalized, upstream_map)
             .await?;
-        debug!("cached package manifest from upstream");
+        debug!(
+            uplink_name = selected.name,
+            uplink = selected.upstream.base_url(),
+            outcome = "hit",
+            "cached package manifest from upstream"
+        );
         return Ok(());
     }
 
     if had_upstream_error {
+        warn!(
+            selected_uplinks = ?selected_uplink_names,
+            "all selected uplinks failed transiently for package manifest lookup"
+        );
         return Err(RegistryError::http(
             StatusCode::SERVICE_UNAVAILABLE,
             API_ERROR_SERVER_TIME_OUT,
@@ -1465,10 +1523,7 @@ async fn emit_registry_event(
         .await;
 }
 
-fn select_uplinks_for_package<'a>(
-    state: &'a AppState,
-    package_name: &str,
-) -> Vec<&'a crate::upstream::Upstream> {
+fn select_uplinks_for_package<'a>(state: &'a AppState, package_name: &str) -> Vec<SelectedUplink<'a>> {
     if !state.acl.uplinks_look_for(package_name) {
         return Vec::new();
     }
@@ -1491,7 +1546,12 @@ fn select_uplinks_for_package<'a>(
 
     selected_names
         .into_iter()
-        .filter_map(|name| state.uplinks.get(&name))
+        .filter_map(|name| {
+            state.uplinks.get_key_value(&name).map(|(resolved_name, upstream)| SelectedUplink {
+                name: resolved_name.as_str(),
+                upstream,
+            })
+        })
         .collect()
 }
 
@@ -1515,6 +1575,21 @@ fn is_uplink_transient_error(err: &RegistryError) -> bool {
     match err {
         RegistryError::Http { status, .. } => is_transient_uplink_status(*status),
         RegistryError::Internal => false,
+    }
+}
+
+fn registry_error_details(err: &RegistryError) -> (u16, &str, &str) {
+    match err {
+        RegistryError::Http {
+            status,
+            code,
+            message,
+        } => (status.as_u16(), code.as_str(), message.as_str()),
+        RegistryError::Internal => (
+            StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+            crate::error::code::INTERNAL_ERROR,
+            "internal server error",
+        ),
     }
 }
 
@@ -2084,8 +2159,10 @@ async fn read_body(req: Request<Body>, max_body_size: usize) -> Result<Vec<u8>, 
 
 #[cfg(test)]
 mod tests {
-    use super::package_route_pattern;
+    use super::{package_route_pattern, registry_error_details};
+    use crate::error::{RegistryError, code};
     use axum::http::Method;
+    use axum::http::StatusCode;
 
     fn tail(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_string()).collect()
@@ -2136,6 +2213,19 @@ mod tests {
         assert_eq!(
             package_route_pattern(&Method::DELETE, &tail(&["latest"])),
             "DELETE /:package/<unmatched>"
+        );
+    }
+
+    #[test]
+    fn registry_error_details_return_structured_fields() {
+        let err = RegistryError::http_code(
+            StatusCode::BAD_GATEWAY,
+            code::UPSTREAM_BAD_GATEWAY,
+            "uplink is offline",
+        );
+        assert_eq!(
+            registry_error_details(&err),
+            (502, code::UPSTREAM_BAD_GATEWAY, "uplink is offline")
         );
     }
 }
