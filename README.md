@@ -126,6 +126,7 @@ Environment variables:
 - `RUSTACCIO_TOKIO_WORKER_THREADS` (default `min(max(available_parallelism, 2), 8)`)
 - `RUSTACCIO_TOKIO_MAX_BLOCKING_THREADS` (default `64`)
 - `RUSTACCIO_TOKIO_THREAD_STACK_SIZE` (bytes, default `1048576`)
+- `RUSTACCIO_STARTUP_CONNECTIVITY_CHECK` (default `false`; when enabled, runs non-fatal startup TCP reachability checks for `https://registry.npmjs.org` and the configured tarball S3 endpoint, logging IPv4 and IPv6 results separately)
 - `RUSTACCIO_UPSTREAM_CONNECT_TIMEOUT_SECS` (default `3`)
 - `RUSTACCIO_UPSTREAM_TIMEOUT_SECS` (default `20`)
 - `RUSTACCIO_UPSTREAM_POOL_IDLE_TIMEOUT_SECS` (default `30`)
@@ -459,6 +460,7 @@ The integration suite in `tests/parity.rs` currently validates:
 Rustaccio targets Verdaccio-compatible npm client behavior for core flows, but it is not a byte-for-byte Verdaccio clone. Current known differences/limits:
 
 - ACL matching is a parity subset: rule matching supports common wildcard patterns, but not full Verdaccio/micromatch pattern semantics.
+- Package routes only consult an explicitly configured package-rule `proxy` uplink; they do not implicitly fall back to `default` or every configured uplink.
 - Authorization parsing currently accepts `Bearer <token>` only.
 - `:revision` route segments are accepted for Verdaccio-compatible route shapes, but revision values are not currently used for optimistic-concurrency checks.
 - `/-/npm/v1/user` currently does not support 2FA updates (`tfa` payload returns `503`).

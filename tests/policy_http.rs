@@ -185,7 +185,6 @@ async fn external_policy_allow_overrides_acl_deny() {
             publish: vec!["$authenticated".to_string()],
             unpublish: vec!["$authenticated".to_string()],
             proxy: None,
-            uplinks_look: true,
         }],
     );
     let policy_cfg = HttpPolicyConfig {
@@ -259,7 +258,6 @@ async fn external_policy_cache_reuses_decision() {
             publish: vec!["$authenticated".to_string()],
             unpublish: vec!["$authenticated".to_string()],
             proxy: None,
-            uplinks_look: true,
         }],
     );
     let policy_cfg = HttpPolicyConfig {
@@ -304,7 +302,6 @@ async fn admin_policy_cache_invalidate_forces_recheck() {
             publish: vec!["$authenticated".to_string()],
             unpublish: vec!["$authenticated".to_string()],
             proxy: None,
-            uplinks_look: true,
         }],
     );
     let policy_cfg = HttpPolicyConfig {
@@ -361,7 +358,6 @@ async fn external_policy_forwards_request_id_header() {
             publish: vec!["$authenticated".to_string()],
             unpublish: vec!["$authenticated".to_string()],
             proxy: None,
-            uplinks_look: true,
         }],
     );
     let policy_cfg = HttpPolicyConfig {

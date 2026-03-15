@@ -42,7 +42,11 @@ impl Upstream {
             .await
             .map_err(map_uplink_request_err)?;
         if resp.status() == StatusCode::NOT_FOUND {
-            debug!(status = resp.status().as_u16(), outcome = "miss", "package not found upstream");
+            debug!(
+                status = resp.status().as_u16(),
+                outcome = "miss",
+                "package not found upstream"
+            );
             return Ok(None);
         }
         if resp.status() == StatusCode::NOT_MODIFIED {
@@ -83,17 +87,14 @@ impl Upstream {
             ));
         }
 
-        let value = resp
-            .json::<Value>()
-            .await
-            .map_err(|_| {
-                warn!(
-                    outcome = "non_transient_error",
-                    reason = "bad_payload",
-                    "upstream package response was not valid JSON"
-                );
-                RegistryError::http(StatusCode::BAD_GATEWAY, "bad uplink payload")
-            })?;
+        let value = resp.json::<Value>().await.map_err(|_| {
+            warn!(
+                outcome = "non_transient_error",
+                reason = "bad_payload",
+                "upstream package response was not valid JSON"
+            );
+            RegistryError::http(StatusCode::BAD_GATEWAY, "bad uplink payload")
+        })?;
         debug!("fetched package from upstream");
         Ok(Some(value))
     }

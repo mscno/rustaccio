@@ -15,6 +15,7 @@ pub mod models;
 pub mod observability;
 pub mod policy;
 pub mod runtime;
+pub mod startup_checks;
 pub mod state_coordination;
 pub mod storage;
 pub mod tarball_backend;

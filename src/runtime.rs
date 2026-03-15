@@ -8,6 +8,7 @@ use crate::{
     governance::GovernanceEngine,
     observability,
     policy::{DefaultPolicyEngine, HttpPolicyConfig},
+    startup_checks,
     storage::{Store, StoreOptions},
     upstream::Upstream,
 };
@@ -117,6 +118,7 @@ pub async fn run_standalone(config: Config) -> Result<(), RegistryError> {
         log_format = tracing_settings.log_format.as_str(),
         "initialized tracing subscriber"
     );
+    startup_checks::run_if_enabled(&config).await;
     run(config, None).await
 }
 

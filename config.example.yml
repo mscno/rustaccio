@@ -13,13 +13,11 @@ packages:
     publish: $authenticated
     unpublish: $authenticated
     proxy: npmjs
-    uplinksLook: true
   "**":
     access: $all
     publish: $authenticated
     unpublish: $authenticated
     proxy: npmjs
-    uplinksLook: true
 
 web:
   enable: true

@@ -1040,7 +1040,11 @@ async fn handle_get_tarball(
             .store
             .upstream_tarball_url(package_name, filename)
             .await
-            .unwrap_or_else(|| selected.upstream.default_tarball_url(package_name, filename));
+            .unwrap_or_else(|| {
+                selected
+                    .upstream
+                    .default_tarball_url(package_name, filename)
+            });
 
         match selected.upstream.fetch_tarball(&url).await {
             Ok(Some(bytes)) => {
@@ -1090,12 +1094,18 @@ async fn ensure_package_cached(
         acl_proxy = matched_rule
             .and_then(|rule| rule.proxy.as_deref())
             .unwrap_or("none"),
-        uplinks_look = matched_rule.map(|rule| rule.uplinks_look).unwrap_or(true),
         selected_uplinks = ?selected_uplink_names,
         "selected uplinks for package manifest lookup"
     );
     if uplinks.is_empty() {
-        debug!("no upstream configured for package");
+        if let Some(proxy_name) = matched_rule.and_then(|rule| rule.proxy.as_deref()) {
+            warn!(
+                acl_proxy = proxy_name,
+                "package rule references an uplink that is not configured"
+            );
+        } else {
+            debug!("package rule has no proxy; skipping uplink lookup");
+        }
         return Ok(());
     }
 
@@ -1523,36 +1533,24 @@ async fn emit_registry_event(
         .await;
 }
 
-fn select_uplinks_for_package<'a>(state: &'a AppState, package_name: &str) -> Vec<SelectedUplink<'a>> {
-    if !state.acl.uplinks_look_for(package_name) {
+fn select_uplinks_for_package<'a>(
+    state: &'a AppState,
+    package_name: &str,
+) -> Vec<SelectedUplink<'a>> {
+    let Some(proxy_name) = state.acl.proxy_for(package_name) else {
         return Vec::new();
-    }
+    };
 
-    let mut selected_names = Vec::new();
-    if let Some(proxy_name) = state.acl.proxy_for(package_name) {
-        selected_names.push(proxy_name.to_string());
-    }
-    if !selected_names.iter().any(|name| name == "default") {
-        selected_names.push("default".to_string());
-    }
-
-    let mut remaining: Vec<String> = state.uplinks.keys().cloned().collect();
-    remaining.sort();
-    for name in remaining {
-        if !selected_names.iter().any(|selected| selected == &name) {
-            selected_names.push(name);
-        }
-    }
-
-    selected_names
-        .into_iter()
-        .filter_map(|name| {
-            state.uplinks.get_key_value(&name).map(|(resolved_name, upstream)| SelectedUplink {
+    state
+        .uplinks
+        .get_key_value(proxy_name)
+        .map(|(resolved_name, upstream)| {
+            vec![SelectedUplink {
                 name: resolved_name.as_str(),
                 upstream,
-            })
+            }]
         })
-        .collect()
+        .unwrap_or_default()
 }
 
 fn select_default_uplinks(state: &AppState) -> Vec<&crate::upstream::Upstream> {

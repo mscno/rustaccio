@@ -33,7 +33,11 @@ use wiremock::{
 };
 
 async fn test_app(data_dir: PathBuf, upstream: Option<String>) -> axum::Router {
-    test_app_with_rules(data_dir, upstream, vec![PackageRule::open("**")]).await
+    let mut rule = PackageRule::open("**");
+    if upstream.is_some() {
+        rule.proxy = Some("default".to_string());
+    }
+    test_app_with_rules(data_dir, upstream, vec![rule]).await
 }
 
 fn base_test_config(data_dir: PathBuf) -> Config {
@@ -2560,7 +2564,6 @@ async fn acl_authenticated_access_filters_package_and_search() {
             publish: vec!["$authenticated".to_string()],
             unpublish: vec!["$authenticated".to_string()],
             proxy: None,
-            uplinks_look: true,
         },
         PackageRule {
             pattern: "**".to_string(),
@@ -2568,7 +2571,6 @@ async fn acl_authenticated_access_filters_package_and_search() {
             publish: vec!["$authenticated".to_string()],
             unpublish: vec!["$authenticated".to_string()],
             proxy: None,
-            uplinks_look: true,
         },
     ];
     let app = test_app_with_rules(dir.path().to_path_buf(), None, rules).await;
@@ -2618,7 +2620,6 @@ async fn acl_user_specific_publish_permission() {
             publish: vec!["jota".to_string()],
             unpublish: vec!["jota".to_string()],
             proxy: None,
-            uplinks_look: true,
         },
         PackageRule::open("**"),
     ];
@@ -2656,7 +2657,6 @@ async fn acl_anonymous_publish_allowed() {
         publish: vec!["$anonymous".to_string()],
         unpublish: vec!["$anonymous".to_string()],
         proxy: None,
-        uplinks_look: true,
     }];
     let app = test_app_with_rules(dir.path().to_path_buf(), None, rules).await;
 
@@ -2689,7 +2689,6 @@ async fn acl_unpublish_can_remove_tarball_without_publish_permission() {
             publish: vec!["alice-unpub".to_string()],
             unpublish: vec!["bob-unpub".to_string()],
             proxy: None,
-            uplinks_look: true,
         },
         PackageRule::open("**"),
     ];
@@ -2764,7 +2763,6 @@ async fn acl_proxy_rule_selects_named_uplink() {
             publish: vec!["$authenticated".to_string()],
             unpublish: vec!["$authenticated".to_string()],
             proxy: Some("b".to_string()),
-            uplinks_look: true,
         },
         PackageRule {
             pattern: "**".to_string(),
@@ -2772,7 +2770,6 @@ async fn acl_proxy_rule_selects_named_uplink() {
             publish: vec!["$authenticated".to_string()],
             unpublish: vec!["$authenticated".to_string()],
             proxy: Some("a".to_string()),
-            uplinks_look: true,
         },
     ];
 
@@ -2789,7 +2786,7 @@ async fn acl_proxy_rule_selects_named_uplink() {
 }
 
 #[tokio::test]
-async fn uplinks_look_false_with_cache_keeps_local_manifest() {
+async fn package_rule_without_proxy_with_cache_keeps_local_manifest() {
     let upstream = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/locked"))
@@ -2816,8 +2813,7 @@ async fn uplinks_look_false_with_cache_keeps_local_manifest() {
         access: vec!["$all".to_string()],
         publish: vec!["$authenticated".to_string()],
         unpublish: vec!["$authenticated".to_string()],
-        proxy: Some("default".to_string()),
-        uplinks_look: false,
+        proxy: None,
     }];
     let app = test_app_with_explicit_uplinks(dir.path().to_path_buf(), uplinks, rules, true).await;
     let token = create_user(&app, "locked-owner", "secret").await;
@@ -2852,12 +2848,12 @@ async fn uplinks_look_false_with_cache_keeps_local_manifest() {
         requests
             .iter()
             .all(|request| request.url.path() != "/locked"),
-        "uplinksLook=false should prevent remote manifest sync"
+        "packages without a proxy should not sync from any uplink"
     );
 }
 
 #[tokio::test]
-async fn uplinks_look_false_without_cache_skips_upstream_fetch() {
+async fn package_rule_without_proxy_skips_upstream_fetch() {
     let upstream = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/locked-miss"))
@@ -2884,8 +2880,7 @@ async fn uplinks_look_false_without_cache_skips_upstream_fetch() {
         access: vec!["$all".to_string()],
         publish: vec!["$authenticated".to_string()],
         unpublish: vec!["$authenticated".to_string()],
-        proxy: Some("default".to_string()),
-        uplinks_look: false,
+        proxy: None,
     }];
     let app = test_app_with_explicit_uplinks(dir.path().to_path_buf(), uplinks, rules, true).await;
 
@@ -2907,12 +2902,12 @@ async fn uplinks_look_false_without_cache_skips_upstream_fetch() {
         requests
             .iter()
             .all(|request| request.url.path() != "/locked-miss"),
-        "uplinksLook=false should skip upstream requests when package is uncached"
+        "packages without a proxy should not hit any uplink"
     );
 }
 
 #[tokio::test]
-async fn manifest_fetch_falls_back_to_next_uplink_on_transient_error() {
+async fn manifest_fetch_with_proxy_does_not_fall_back_to_other_uplinks() {
     let uplink_a = MockServer::start().await;
     let uplink_b = MockServer::start().await;
 
@@ -2949,7 +2944,6 @@ async fn manifest_fetch_falls_back_to_next_uplink_on_transient_error() {
         publish: vec!["$authenticated".to_string()],
         unpublish: vec!["$authenticated".to_string()],
         proxy: Some("a".to_string()),
-        uplinks_look: true,
     }];
     let app = test_app_with_explicit_uplinks(dir.path().to_path_buf(), uplinks, rules, true).await;
 
@@ -2959,11 +2953,11 @@ async fn manifest_fetch_falls_back_to_next_uplink_on_transient_error() {
         .body(Body::empty())
         .expect("request");
     let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = json_body(resp).await;
     assert_eq!(
-        body["versions"]["1.0.0"]["description"].as_str(),
-        Some("from-fallback")
+        body["error"].as_str(),
+        Some("one of the uplinks is down, refuse to serve request")
     );
 
     let requests_a = uplink_a
@@ -2982,7 +2976,7 @@ async fn manifest_fetch_falls_back_to_next_uplink_on_transient_error() {
     assert!(
         requests_b
             .iter()
-            .any(|request| request.url.path() == "/flaky")
+            .all(|request| request.url.path() != "/flaky")
     );
 }
 
@@ -3009,7 +3003,6 @@ async fn manifest_fetch_returns_503_when_all_uplinks_are_down() {
         publish: vec!["$authenticated".to_string()],
         unpublish: vec!["$authenticated".to_string()],
         proxy: Some("a".to_string()),
-        uplinks_look: true,
     }];
     let app = test_app_with_explicit_uplinks(dir.path().to_path_buf(), uplinks, rules, true).await;
 
@@ -3024,6 +3017,25 @@ async fn manifest_fetch_returns_503_when_all_uplinks_are_down() {
     assert_eq!(
         body["error"].as_str(),
         Some("one of the uplinks is down, refuse to serve request")
+    );
+
+    let requests_a = uplink_a
+        .received_requests()
+        .await
+        .expect("received requests a");
+    let requests_b = uplink_b
+        .received_requests()
+        .await
+        .expect("received requests b");
+    assert!(
+        requests_a
+            .iter()
+            .any(|request| request.url.path() == "/downpkg")
+    );
+    assert!(
+        requests_b
+            .iter()
+            .all(|request| request.url.path() != "/downpkg")
     );
 }
 

@@ -58,13 +58,11 @@ packages:
     publish: $authenticated
     unpublish: $authenticated
     proxy: npmjs
-    uplinksLook: true
   "**":
     access: $all
     publish: $authenticated
     unpublish: $authenticated
     proxy: npmjs
-    uplinksLook: true
 
 web:
   enable: {web_enabled}
@@ -262,6 +260,7 @@ fn env_defaults() -> BTreeMap<&'static str, &'static str> {
         ("RUSTACCIO_REQUEST_TIMEOUT_SECS", "30"),
         ("RUSTACCIO_RUNTIME_PROFILE", ""),
         ("RUSTACCIO_STRICT_REVISION_CHECK", ""),
+        ("RUSTACCIO_STARTUP_CONNECTIVITY_CHECK", "false"),
         ("RUSTACCIO_STATE_COORDINATION_ACQUIRE_TIMEOUT_MS", "15000"),
         ("RUSTACCIO_STATE_COORDINATION_BACKEND", "none"),
         ("RUSTACCIO_STATE_COORDINATION_FAIL_OPEN", "false"),

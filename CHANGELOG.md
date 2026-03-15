@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added best-effort registry event emission with pluggable sink (`RUSTACCIO_EVENT_SINK=none|http`) and event emission for admin/package mutation operations.
 - Added `GET /-/npm/v1/bootstrap` endpoint for npm/pnpm/yarn/bun onboarding snippets and `.npmrc` bootstrap guidance.
 - Added admin cache invalidation hook endpoint `POST /-/admin/package-cache/invalidate` for external/event-driven cache eviction.
+- Added opt-in startup connectivity probing via `RUSTACCIO_STARTUP_CONNECTIVITY_CHECK`, logging IPv4/IPv6 TCP reachability to `registry.npmjs.org` and the configured tarball S3 endpoint.
 
 ### Changed
 
@@ -27,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - State-coordination S3 config now falls back to `RUSTACCIO_S3_*` values when `RUSTACCIO_STATE_COORDINATION_S3_*` are unset to reduce duplicated configuration.
 - Added metadata backend abstraction scaffold via `RUSTACCIO_METADATA_BACKEND` (currently `sidecar` only; transactional backend reserved/not yet available).
 - Added optional strict revision-concurrency guard (`RUSTACCIO_STRICT_REVISION_CHECK`, defaults enabled in managed mode) for package mutation paths.
+- Package routes now require an explicit package-rule `proxy` to consult an uplink; they no longer implicitly fall back to `default` or all configured uplinks.
 
 ### Removed
 

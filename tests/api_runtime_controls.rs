@@ -269,7 +269,6 @@ async fn group_only_identity_can_satisfy_acl_publish() {
         publish: vec!["dev-team".to_string()],
         unpublish: vec!["dev-team".to_string()],
         proxy: None,
-        uplinks_look: true,
     }];
     let app = app_with_config(&cfg, Some(Arc::new(GroupOnlyHook))).await;
 
