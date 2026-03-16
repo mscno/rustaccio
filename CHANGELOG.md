@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added metadata backend abstraction scaffold via `RUSTACCIO_METADATA_BACKEND` (currently `sidecar` only; transactional backend reserved/not yet available).
 - Added optional strict revision-concurrency guard (`RUSTACCIO_STRICT_REVISION_CHECK`, defaults enabled in managed mode) for package mutation paths.
 - Package routes now require an explicit package-rule `proxy` to consult an uplink; they no longer implicitly fall back to `default` or all configured uplinks.
+- Local bearer auth tokens now expire by TTL (`RUSTACCIO_AUTH_TOKEN_TTL_SECS`, default 30 days), and expired auth/login-session state is pruned on startup, lookup, and background maintenance to prevent unbounded auth/session growth.
 
 ### Removed
 
@@ -39,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Scoped package publishes now normalize `_attachments` keys and `dist.tarball` entries to canonical tarball filenames, preventing nested tarball paths like `@scope/pkg.tgz` from causing `npm install` 404s.
 - Request tracing now records route/query context on API spans and demotes high-frequency external auth helper spans to `debug`, reducing noisy `INFO` close-event logs.
 - S3 tarball backend warnings now include endpoint, bucket, key/prefix scope, AWS request IDs, gateway headers, and SDK error kind to speed up production diagnosis of broken S3 backends and proxies.
+- Authoritative S3 metadata lookup failures now surface as upstream `502/503` responses instead of being collapsed into `404 no such package available`; transport-level S3 timeouts are classified as `503`.
 
 ## [0.9.0] - 2026-02-14
 

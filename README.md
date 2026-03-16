@@ -113,6 +113,7 @@ Environment variables:
 - `RUSTACCIO_PUBLISH_CHECK_OWNERS` (default `false`; enforces owner-only package mutations)
 - `RUSTACCIO_PASSWORD_MIN` (default `3`)
 - `RUSTACCIO_LOGIN_SESSION_TTL_SECONDS` (default `120`)
+- `RUSTACCIO_AUTH_TOKEN_TTL_SECS` (default `2592000` / 30 days; `0` keeps local bearer auth tokens non-expiring)
 - `RUSTACCIO_MAX_BODY_SIZE` (default `50mb`, accepts `kb|mb|gb` suffixes)
 - `RUSTACCIO_AUDIT_ENABLED` (default `true`)
 - `RUSTACCIO_URL_PREFIX` (default `/`)
@@ -851,9 +852,9 @@ Notes:
 The local persisted state file (`<data_dir>/state.json`) stores only auth/session state:
 
 - `users`
-- `auth_tokens`
-- `npm_tokens`
-- `login_sessions`
+- `auth_tokens` (local bearer login tokens; expired entries are pruned on startup, lookup, and background maintenance)
+- `npm_tokens` (persistent npm tokens; remain until explicitly deleted)
+- `login_sessions` (short-lived web-login handoff state; expired entries are pruned on startup, poll, and background maintenance)
 
 `packages` is intentionally persisted as an empty map. Package metadata authority is sidecar-only.
 
@@ -939,6 +940,14 @@ This rebuilds package metadata from backend tarballs/sidecars and can repair man
 - For governance:
   - back up Postgres quota tables
   - persist Redis if you require durable counters across restarts (optional by policy)
+
+### Outbound client lifecycle
+
+- HTTP integrations (`upstream`, auth plugin, external policy backend, event sink) use process-scoped `reqwest` clients with bounded idle pools; they do not accumulate per-request entries in Rustaccio maps.
+- The Postgres quota backend keeps one background connection task for the lifetime of the process when enabled.
+- Redis/S3 state coordination create renewal tasks only while a write lease is held and release them when the lease ends.
+- OTLP tracing may keep exporter workers while the process is running when `RUSTACCIO_OTEL_ENABLED=true`.
+- These outbound clients are expected to stop with the server/runtime shutdown path; they are not an independent container keepalive mechanism.
 
 ## Scalability Characteristics
 

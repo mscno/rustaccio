@@ -24,6 +24,8 @@ pub struct UserRecord {
 pub struct AuthTokenRecord {
     pub user: String,
     pub created_at: i64,
+    #[serde(default)]
+    pub expires_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
