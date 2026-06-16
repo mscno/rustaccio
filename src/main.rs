@@ -1,4 +1,7 @@
 #![forbid(unsafe_code)]
+// Large async runtime futures push rustc's layout query depth past the default
+// recursion limit on recent toolchains; raise it for the binary crate.
+#![recursion_limit = "256"]
 
 use config::{Config as SettingsLoader, Environment};
 use rustaccio::{

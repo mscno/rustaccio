@@ -1,3 +1,7 @@
+// Large async test bodies push rustc's layout query depth past the default
+// recursion limit on recent toolchains; raise it for this test crate.
+#![recursion_limit = "256"]
+
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use rustaccio::{
     config::{AuthBackend, AuthPluginConfig, Config, TarballStorageBackend, TarballStorageConfig},

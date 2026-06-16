@@ -1,3 +1,7 @@
+// Large async test bodies push rustc's layout query depth past the default
+// recursion limit on recent toolchains; raise it for this test crate.
+#![recursion_limit = "256"]
+
 use axum::{
     body::Body,
     http::{Method, Request, StatusCode, header},
