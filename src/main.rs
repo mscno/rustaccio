@@ -123,19 +123,18 @@ fn main() {
         }
     };
 
-    let run_result = runtime.block_on(async {
-        if let Some(config_path) = options.config_path {
-            match Config::from_env_with_config_file(config_path) {
-                Ok(config) => run_standalone(config).await,
-                Err(err) => {
-                    eprintln!("invalid --config value: {err}");
-                    std::process::exit(2);
-                }
+    let run_result = if let Some(config_path) = options.config_path {
+        let config = match Config::from_env_with_config_file(config_path) {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("invalid --config value: {err}");
+                std::process::exit(2);
             }
-        } else {
-            run_from_env().await
-        }
-    });
+        };
+        runtime.block_on(run_standalone(config))
+    } else {
+        runtime.block_on(run_from_env())
+    };
 
     if let Err(err) = run_result {
         eprintln!("server error: {err}");

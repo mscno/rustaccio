@@ -3538,6 +3538,54 @@ async fn s3_mode_writes_verdaccio_package_sidecar_on_publish() {
 
 #[tokio::test]
 #[cfg(feature = "s3")]
+async fn s3_authoritative_lookup_failure_returns_503_instead_of_not_found() {
+    let s3 = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(|request: &wiremock::Request| {
+            request.url.path().starts_with("/registry-test")
+                && request
+                    .url
+                    .query_pairs()
+                    .any(|(k, v)| k == "list-type" && v == "2")
+        })
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&s3)
+        .await;
+    Mock::given(method("GET"))
+        .and(|request: &wiremock::Request| {
+            request
+                .url
+                .path()
+                .contains("/registry/failing-pro/package.json")
+        })
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&s3)
+        .await;
+
+    let dir = TempDir::new().expect("dir");
+    let cfg = s3_test_config(dir.path().to_path_buf(), s3.uri());
+    let state = runtime::build_state(&cfg, None).await.expect("state");
+    let app = build_router(state);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/failing-pro")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json_body(resp).await;
+    assert_eq!(body["code"].as_str(), Some("UPSTREAM_UNAVAILABLE"));
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("s3 get_object failed (status 503)"))
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "s3")]
 async fn s3_mode_scoped_publish_writes_verdaccio_tarball_key_layout() {
     let s3 = MockServer::start().await;
 

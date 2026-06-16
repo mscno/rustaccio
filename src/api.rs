@@ -951,8 +951,7 @@ async fn handle_get_package(
     let base = request_registry_base_url(headers, state.trust_proxy, &state.url_prefix);
 
     ensure_package_cached(state, headers, package_name).await?;
-    let local = state.store.get_package_record(package_name).await;
-    let Some(record) = local else {
+    let Some(record) = state.store.get_package_record_result(package_name).await? else {
         return Err(RegistryError::http(
             StatusCode::NOT_FOUND,
             Store::no_package_message(),
@@ -988,7 +987,7 @@ async fn handle_get_package_version(
 ) -> Result<Response<Body>, RegistryError> {
     ensure_package_cached(state, headers, package_name).await?;
     let base = request_registry_base_url(headers, state.trust_proxy, &state.url_prefix);
-    let Some(record) = state.store.get_package_record(package_name).await else {
+    let Some(record) = state.store.get_package_record_result(package_name).await? else {
         return Err(RegistryError::http(
             StatusCode::NOT_FOUND,
             Store::no_package_message(),
@@ -1081,14 +1080,32 @@ async fn ensure_package_cached(
     headers: &HeaderMap,
     package_name: &str,
 ) -> Result<(), RegistryError> {
-    if state.store.get_package_record(package_name).await.is_some() {
-        debug!("package already cached");
-        return Ok(());
-    }
-
     let matched_rule = state.acl.rule_for(package_name);
     let uplinks = select_uplinks_for_package(state, package_name);
     let selected_uplink_names: Vec<&str> = uplinks.iter().map(|selected| selected.name).collect();
+
+    let authoritative_lookup_error = match state.store.get_package_record_result(package_name).await
+    {
+        Ok(Some(_)) => {
+            debug!("package already cached");
+            return Ok(());
+        }
+        Ok(None) => None,
+        Err(err) => {
+            if uplinks.is_empty() {
+                return Err(err);
+            }
+            let (status, code, message) = registry_error_details(&err);
+            warn!(
+                error_status = status,
+                error_code = code,
+                error = message,
+                "authoritative package lookup failed before uplink lookup; trying configured proxy"
+            );
+            Some(err)
+        }
+    };
+
     debug!(
         acl_pattern = matched_rule.map(|rule| rule.pattern.as_str()).unwrap_or("none"),
         acl_proxy = matched_rule
@@ -1181,6 +1198,9 @@ async fn ensure_package_cached(
             StatusCode::SERVICE_UNAVAILABLE,
             API_ERROR_SERVER_TIME_OUT,
         ));
+    }
+    if let Some(err) = authoritative_lookup_error {
+        return Err(err);
     }
     debug!("package missing on upstream");
     Ok(())
@@ -1471,7 +1491,7 @@ async fn ensure_package_owner_permission(
         return Ok(());
     }
 
-    let Some(record) = state.store.get_package_record(package_name).await else {
+    let Some(record) = state.store.get_package_record_result(package_name).await? else {
         return Ok(());
     };
 

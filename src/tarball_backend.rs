@@ -1078,10 +1078,7 @@ fn map_s3_sdk_error<E>(
 where
     E: ProvideErrorMetadata + StdError + std::fmt::Debug + 'static,
 {
-    let http_status = err
-        .raw_response()
-        .and_then(|response| StatusCode::from_u16(response.status().as_u16()).ok())
-        .unwrap_or(StatusCode::BAD_GATEWAY);
+    let http_status = s3_http_status(err);
     let aws_code = err.code().unwrap_or("unknown");
     let aws_message = err.message().unwrap_or("");
     let aws_request_id = s3_error_header(err, "x-amz-request-id").unwrap_or("<none>");
@@ -1128,6 +1125,28 @@ where
 }
 
 #[cfg(feature = "s3")]
+fn s3_http_status<E>(err: &aws_sdk_s3::error::SdkError<E>) -> StatusCode
+where
+    E: ProvideErrorMetadata,
+{
+    if let Some(status) = err
+        .raw_response()
+        .and_then(|response| StatusCode::from_u16(response.status().as_u16()).ok())
+    {
+        return status;
+    }
+
+    match err {
+        aws_sdk_s3::error::SdkError::TimeoutError(_)
+        | aws_sdk_s3::error::SdkError::DispatchFailure(_) => StatusCode::SERVICE_UNAVAILABLE,
+        aws_sdk_s3::error::SdkError::ConstructionFailure(_)
+        | aws_sdk_s3::error::SdkError::ResponseError(_)
+        | aws_sdk_s3::error::SdkError::ServiceError(_) => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::BAD_GATEWAY,
+    }
+}
+
+#[cfg(feature = "s3")]
 fn s3_error_header<'a, E>(
     err: &'a aws_sdk_s3::error::SdkError<E>,
     header: &str,
@@ -1159,8 +1178,9 @@ fn is_not_found<E>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
 mod tests {
     use super::{
         TarballRef, parse_package_from_metadata_object_key, parse_tarball_ref_from_object_key,
-        s3_sdk_error_kind,
+        s3_http_status, s3_sdk_error_kind,
     };
+    use axum::http::StatusCode;
     use std::io;
 
     #[test]
@@ -1242,5 +1262,22 @@ mod tests {
             (),
         );
         assert_eq!(s3_sdk_error_kind(&service), "service_error");
+    }
+
+    #[test]
+    fn maps_transport_s3_errors_to_service_unavailable() {
+        type TestSdkError = aws_sdk_s3::error::SdkError<
+            aws_sdk_s3::operation::get_object::GetObjectError,
+            aws_sdk_s3::config::http::HttpResponse,
+        >;
+
+        let timeout = TestSdkError::timeout_error(io::Error::other("timeout"));
+        assert_eq!(s3_http_status(&timeout), StatusCode::SERVICE_UNAVAILABLE);
+
+        let dispatch = TestSdkError::dispatch_failure(aws_sdk_s3::error::ConnectorError::other(
+            io::Error::other("dispatch").into(),
+            None,
+        ));
+        assert_eq!(s3_http_status(&dispatch), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
