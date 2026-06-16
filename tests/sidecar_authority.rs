@@ -4,7 +4,7 @@
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use rustaccio::{
-    config::{AuthBackend, AuthPluginConfig, Config, TarballStorageBackend, TarballStorageConfig},
+    config::{Config, TarballStorageBackend, TarballStorageConfig},
     storage::{Store, package_name_to_encoded},
 };
 use serde_json::{Value, json};
@@ -23,21 +23,14 @@ fn base_config(data_dir: std::path::PathBuf) -> Config {
         acl_rules: vec![rustaccio::acl::PackageRule::open("**")],
         web_enabled: true,
         web_title: "Rustaccio".to_string(),
-        web_login: false,
         publish_check_owners: false,
-        password_min_length: 3,
-        login_session_ttl_seconds: 120,
         max_body_size: 50 * 1024 * 1024,
         audit_enabled: true,
         url_prefix: "/".to_string(),
         trust_proxy: false,
         keep_alive_timeout_secs: None,
         log_level: "info".to_string(),
-        auth_plugin: AuthPluginConfig {
-            backend: AuthBackend::Local,
-            external_mode: false,
-            http: None,
-        },
+        auth_plugin: None,
         tarball_storage: TarballStorageConfig {
             backend: TarballStorageBackend::Local,
             s3: None,
@@ -126,45 +119,25 @@ fn publish_body(
 }
 
 #[tokio::test]
-async fn sidecar_authority_keeps_state_auth_only() {
+async fn sidecar_authority_does_not_persist_packages() {
     with_sidecar_authority_env(async {
         let dir = TempDir::new().expect("dir");
         let data_dir = dir.path().to_path_buf();
         let cfg = base_config(data_dir.clone());
         let store = Store::open(&cfg).await.expect("store");
 
-        let _token = store
-            .create_user("sidecar-owner", "secret")
-            .await
-            .expect("create user");
-        let state_file = data_dir.join("state.json");
-        let bytes = tokio::fs::read(&state_file).await.expect("read state");
-        let state_json: Value = serde_json::from_slice(&bytes).expect("state json");
-        assert!(
-            state_json
-                .get("users")
-                .and_then(Value::as_object)
-                .is_some_and(|users| users.contains_key("sidecar-owner"))
-        );
-        assert!(
-            state_json
-                .get("packages")
-                .and_then(Value::as_object)
-                .is_some_and(|packages| packages.is_empty())
-        );
-
         let body = publish_body("sidecar-demo", "1.0.0", "sidecar-demo-1.0.0.tgz", b"demo");
         store
             .publish_manifest("sidecar-demo", body, "sidecar-owner")
             .await
             .expect("publish");
-        let bytes = tokio::fs::read(&state_file).await.expect("read state");
-        let state_json: Value = serde_json::from_slice(&bytes).expect("state json");
+
+        // Package metadata authority is the sidecar; no state.json is written.
         assert!(
-            state_json
-                .get("packages")
-                .and_then(Value::as_object)
-                .is_some_and(|packages| packages.is_empty())
+            !tokio::fs::try_exists(data_dir.join("state.json"))
+                .await
+                .unwrap_or(false),
+            "state.json should not be written"
         );
     })
     .await;
@@ -178,10 +151,6 @@ async fn sidecar_authority_is_default_when_env_is_unset() {
         let cfg = base_config(data_dir.clone());
         let store = Store::open(&cfg).await.expect("store");
 
-        store
-            .create_user("default-authority", "secret")
-            .await
-            .expect("create user");
         let body = publish_body(
             "default-authority-pkg",
             "1.0.0",
@@ -193,15 +162,13 @@ async fn sidecar_authority_is_default_when_env_is_unset() {
             .await
             .expect("publish");
 
-        let bytes = tokio::fs::read(data_dir.join("state.json"))
-            .await
-            .expect("read state");
-        let state_json: Value = serde_json::from_slice(&bytes).expect("state json");
+        let sidecar_path = data_dir
+            .join("tarballs")
+            .join("default-authority-pkg")
+            .join("package.json");
         assert!(
-            state_json
-                .get("packages")
-                .and_then(Value::as_object)
-                .is_some_and(|packages| packages.is_empty())
+            tokio::fs::try_exists(&sidecar_path).await.unwrap_or(false),
+            "sidecar package.json should be written"
         );
     })
     .await;
@@ -214,10 +181,6 @@ async fn sidecar_authority_reads_latest_sidecar_manifest() {
         let data_dir = dir.path().to_path_buf();
         let cfg = base_config(data_dir.clone());
         let store = Store::open(&cfg).await.expect("store");
-        store
-            .create_user("sidecar-reader", "secret")
-            .await
-            .expect("create user");
 
         let body = publish_body("sidecar-live", "1.0.0", "sidecar-live-1.0.0.tgz", b"live");
         store
@@ -262,10 +225,6 @@ async fn sidecar_authority_can_rebuild_record_when_sidecar_missing() {
         let data_dir = dir.path().to_path_buf();
         let cfg = base_config(data_dir.clone());
         let store = Store::open(&cfg).await.expect("store");
-        store
-            .create_user("sidecar-rebuild", "secret")
-            .await
-            .expect("create user");
 
         let filename = "sidecar-rebuild-1.0.0.tgz";
         let body = publish_body("sidecar-rebuild", "1.0.0", filename, b"pkg");

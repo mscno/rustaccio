@@ -10,8 +10,8 @@ use crate::{
     models::{AuthIdentity, TenantContext},
     policy::{PolicyAction, RequestContext},
     storage::{
-        Store, bad_request, default_profile, forbidden, make_search_object, parse_authorization,
-        parse_json_body, parse_json_string_body, unauthorized,
+        Store, bad_request, forbidden, make_search_object, parse_authorization, parse_json_body,
+        parse_json_string_body, unauthorized,
     },
 };
 use axum::{
@@ -19,7 +19,7 @@ use axum::{
     extract::{Request, State},
     http::{
         HeaderMap, Method, Response, StatusCode,
-        header::{self, HeaderName, HeaderValue},
+        header::{self},
     },
 };
 use serde_json::{Value, json};
@@ -339,270 +339,6 @@ pub async fn dispatch(
                 StatusCode::CREATED,
                 json!({ "ok": message }),
                 HEADER_JSON,
-            ));
-        }
-    }
-
-    if path == "/-/npm/v1/user" {
-        ensure_local_auth_routes_enabled(&state)?;
-        if method == Method::GET {
-            let Some(name) = auth_user else {
-                return Ok(json_response(
-                    StatusCode::UNAUTHORIZED,
-                    json!({ "message": Store::login_required_message() }),
-                    HEADER_JSON,
-                ));
-            };
-            return Ok(json_response(
-                StatusCode::OK,
-                default_profile(&name),
-                HEADER_JSON,
-            ));
-        }
-
-        if method == Method::POST {
-            let Some(name) = auth_user else {
-                return Ok(json_response(
-                    StatusCode::UNAUTHORIZED,
-                    json!({ "message": Store::login_required_message() }),
-                    HEADER_JSON,
-                ));
-            };
-
-            let body = parse_json_body(&read_body(req, state.max_body_size).await?)?;
-            let password_obj = body.get("password").and_then(Value::as_object);
-            let old = password_obj
-                .and_then(|obj| obj.get("old"))
-                .and_then(Value::as_str);
-            let new = password_obj
-                .and_then(|obj| obj.get("new"))
-                .and_then(Value::as_str);
-            let tfa_present = body.get("tfa").is_some();
-
-            Store::ensure_profile_body_valid(old, new, tfa_present, 3)?;
-            state
-                .store
-                .change_password(&name, old.unwrap_or_default(), new.unwrap_or_default())
-                .await?;
-            return Ok(json_response(
-                StatusCode::OK,
-                default_profile(&name),
-                HEADER_JSON,
-            ));
-        }
-    }
-
-    if path == "/-/npm/v1/tokens" {
-        ensure_local_auth_routes_enabled(&state)?;
-        let user = auth_user
-            .clone()
-            .ok_or_else(crate::storage::no_credentials)?;
-        if method == Method::GET {
-            let tokens = state.store.list_npm_tokens(&user).await;
-            let body = state.store.token_list_response(tokens);
-            return Ok(json_response(StatusCode::OK, body, HEADER_JSON));
-        }
-
-        if method == Method::POST {
-            let body = parse_json_body(&read_body(req, state.max_body_size).await?)?;
-            let password = body
-                .get("password")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let readonly = body.get("readonly").and_then(Value::as_bool);
-            let cidr_whitelist =
-                body.get("cidr_whitelist")
-                    .and_then(Value::as_array)
-                    .map(|array| {
-                        array
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(ToOwned::to_owned)
-                            .collect::<Vec<_>>()
-                    });
-
-            let (readonly, cidr_whitelist) =
-                Store::normalize_support_errors(readonly, cidr_whitelist)?;
-
-            let (saved, raw) = state
-                .store
-                .create_npm_token(&user, password, readonly, cidr_whitelist)
-                .await?;
-            let body = Store::normalize_token_response(&saved, Some(raw));
-            return Ok(json_response_with_header(
-                StatusCode::OK,
-                body,
-                HEADER_JSON,
-                header::CACHE_CONTROL,
-                "no-cache, no-store",
-            ));
-        }
-    }
-
-    if let Some(token_key) = path.strip_prefix("/-/npm/v1/tokens/token/")
-        && method == Method::DELETE
-    {
-        ensure_local_auth_routes_enabled(&state)?;
-        let user = auth_user
-            .clone()
-            .ok_or_else(crate::storage::no_credentials)?;
-        state.store.delete_npm_token(&user, token_key).await?;
-        return Ok(json_response(StatusCode::OK, json!({}), HEADER_JSON));
-    }
-
-    if path == "/-/v1/login" && method == Method::POST {
-        ensure_local_auth_routes_enabled(&state)?;
-        if !state.web_login_enabled {
-            return Err(RegistryError::http(StatusCode::NOT_FOUND, "not found"));
-        }
-        let session_id = state.store.create_login_session().await?;
-        let base = request_registry_base_url(&headers, state.trust_proxy, &state.url_prefix);
-        let next = prefixed_route_path(&state.url_prefix, &format!("/-/v1/login_cli/{session_id}"));
-        let response = json!({
-            "loginUrl": format!("{base}/-/web/login?next={next}"),
-            "doneUrl": format!("{base}/-/v1/done/{session_id}"),
-        });
-        return Ok(json_response(StatusCode::OK, response, HEADER_JSON));
-    }
-
-    if let Some(session_id) = path.strip_prefix("/-/v1/done/")
-        && method == Method::GET
-    {
-        ensure_local_auth_routes_enabled(&state)?;
-        if !state.web_login_enabled {
-            return Err(RegistryError::http(StatusCode::NOT_FOUND, "not found"));
-        }
-        Store::ensure_session_id(Some(session_id))?;
-        match state.store.poll_login_session(session_id).await? {
-            Some(token) => {
-                return Ok(json_response(
-                    StatusCode::OK,
-                    json!({ "token": token }),
-                    HEADER_JSON,
-                ));
-            }
-            None => {
-                return Ok(json_response_with_header(
-                    StatusCode::ACCEPTED,
-                    json!({}),
-                    HEADER_JSON,
-                    header::RETRY_AFTER,
-                    "5",
-                ));
-            }
-        }
-    }
-
-    if let Some(session_id) = path.strip_prefix("/-/v1/login_cli/")
-        && method == Method::POST
-    {
-        ensure_local_auth_routes_enabled(&state)?;
-        if !state.web_login_enabled {
-            return Err(RegistryError::http(StatusCode::NOT_FOUND, "not found"));
-        }
-        Store::ensure_session_id(Some(session_id))?;
-        let body = parse_json_body(&read_body(req, state.max_body_size).await?)?;
-        let username = body
-            .get("username")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let password = body
-            .get("password")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        let token = state.store.login_user(username, password).await?;
-        state
-            .store
-            .set_login_session_token(session_id, token.clone())
-            .await?;
-
-        return Ok(json_response_with_header(
-            StatusCode::CREATED,
-            json!({
-                "ok": Store::format_logged_user(username),
-                "token": token,
-            }),
-            HEADER_JSON,
-            header::CACHE_CONTROL,
-            "no-cache, no-store",
-        ));
-    }
-
-    if let Some(rest) = path.strip_prefix("/-/user/") {
-        ensure_local_auth_routes_enabled(&state)?;
-        if method == Method::DELETE && rest.starts_with("token/") {
-            return Ok(json_response(
-                StatusCode::OK,
-                json!({"ok": Store::logged_out_message()}),
-                HEADER_JSON,
-            ));
-        }
-
-        let org_user = rest.split('/').next().unwrap_or_default();
-
-        if method == Method::GET {
-            if auth_user.is_none() {
-                return Ok(json_response(
-                    StatusCode::OK,
-                    json!({"ok": false}),
-                    HEADER_JSON,
-                ));
-            }
-
-            let requested = org_user.split_once(':').map(|(_, n)| n).unwrap_or_default();
-            let logged = auth_user.unwrap_or_default();
-            return Ok(json_response(
-                StatusCode::OK,
-                json!({
-                    "name": requested,
-                    "email": "",
-                    "ok": Store::format_logged_user(&logged),
-                }),
-                HEADER_JSON,
-            ));
-        }
-
-        if method == Method::PUT {
-            let body = parse_json_body(&read_body(req, state.max_body_size).await?)?;
-            let name = body.get("name").and_then(Value::as_str).unwrap_or_default();
-            let password = body.get("password").and_then(Value::as_str);
-
-            if !Store::validate_user_name(org_user, name) {
-                return Err(bad_request(Store::username_mismatch_message()));
-            }
-
-            if auth_user.as_deref() == Some(name) {
-                let token = state
-                    .store
-                    .login_user(name, password.unwrap_or_default())
-                    .await?;
-                return Ok(json_response_with_header(
-                    StatusCode::CREATED,
-                    json!({
-                        "ok": Store::format_logged_user(name),
-                        "token": token,
-                    }),
-                    HEADER_JSON,
-                    header::CACHE_CONTROL,
-                    "no-cache, no-store",
-                ));
-            }
-
-            state.store.validate_password_length(password)?;
-            let token = state
-                .store
-                .create_user(name, password.unwrap_or_default())
-                .await?;
-            return Ok(json_response_with_header(
-                StatusCode::CREATED,
-                json!({
-                    "ok": format!("user '{name}' created"),
-                    "token": token,
-                }),
-                HEADER_JSON,
-                header::CACHE_CONTROL,
-                "no-cache, no-store",
             ));
         }
     }
@@ -2050,14 +1786,6 @@ fn normalize_incoming_path(path: &str, url_prefix: &str) -> Option<String> {
     None
 }
 
-fn prefixed_route_path(url_prefix: &str, path: &str) -> String {
-    if url_prefix == "/" {
-        path.to_string()
-    } else {
-        format!("{}{}", url_prefix.trim_end_matches('/'), path)
-    }
-}
-
 fn proxy_response(proxy: crate::upstream::UpstreamPassthroughResponse) -> Response<Body> {
     let mut builder = Response::builder().status(proxy.status);
     if let Some(content_type) = proxy.content_type {
@@ -2077,25 +1805,6 @@ fn json_response(status: StatusCode, body: Value, content_type: &str) -> Respons
         .unwrap_or_else(|_| Response::new(Body::from("{}")))
 }
 
-fn json_response_with_header(
-    status: StatusCode,
-    body: Value,
-    content_type: &str,
-    header_name: HeaderName,
-    header_value: &str,
-) -> Response<Body> {
-    let payload = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
-    let header_value = HeaderValue::from_str(header_value)
-        .unwrap_or_else(|_| HeaderValue::from_static("no-cache, no-store"));
-
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header_name, header_value)
-        .body(Body::from(payload))
-        .unwrap_or_else(|_| Response::new(Body::from("{}")))
-}
-
 fn bytes_response(status: StatusCode, bytes: Vec<u8>) -> Response<Body> {
     Response::builder()
         .status(status)
@@ -2108,13 +1817,6 @@ fn bytes_response(status: StatusCode, bytes: Vec<u8>) -> Response<Body> {
 fn head_response(mut response: Response<Body>) -> Response<Body> {
     *response.body_mut() = Body::empty();
     response
-}
-
-fn ensure_local_auth_routes_enabled(state: &AppState) -> Result<(), RegistryError> {
-    if state.auth_external_mode {
-        return Err(RegistryError::http(StatusCode::NOT_FOUND, "not found"));
-    }
-    Ok(())
 }
 
 fn ensure_audit_enabled(state: &AppState) -> Result<(), RegistryError> {

@@ -10,10 +10,7 @@ use axum::{
     http::{Method, Request, StatusCode, header},
 };
 use rustaccio::{
-    config::{
-        AuthBackend, AuthPluginConfig, Config, S3TarballStorageConfig, TarballStorageBackend,
-        TarballStorageConfig,
-    },
+    config::{Config, S3TarballStorageConfig, TarballStorageBackend, TarballStorageConfig},
     runtime,
 };
 use serde_json::json;
@@ -21,6 +18,8 @@ use std::{collections::HashMap, future::Future, sync::OnceLock, time::Duration};
 use tempfile::TempDir;
 use tower::ServiceExt;
 use uuid::Uuid;
+
+mod common;
 
 static ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
@@ -34,21 +33,14 @@ fn base_config(data_dir: std::path::PathBuf) -> Config {
         acl_rules: vec![rustaccio::acl::PackageRule::open("**")],
         web_enabled: true,
         web_title: "Rustaccio".to_string(),
-        web_login: false,
         publish_check_owners: false,
-        password_min_length: 3,
-        login_session_ttl_seconds: 120,
         max_body_size: 50 * 1024 * 1024,
         audit_enabled: true,
         url_prefix: "/".to_string(),
         trust_proxy: false,
         keep_alive_timeout_secs: None,
         log_level: "info".to_string(),
-        auth_plugin: AuthPluginConfig {
-            backend: AuthBackend::Local,
-            external_mode: false,
-            http: None,
-        },
+        auth_plugin: None,
         tarball_storage: TarballStorageConfig {
             backend: TarballStorageBackend::S3,
             s3: Some(S3TarballStorageConfig {
@@ -180,13 +172,39 @@ async fn app_with_env(cfg: &Config) -> axum::Router {
     rustaccio::app::build_router(state)
 }
 
-async fn create_user(app: &axum::Router, username: &str) -> StatusCode {
+fn publish_manifest(name: &str) -> serde_json::Value {
+    json!({
+        "_id": name,
+        "name": name,
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": name,
+                "version": "1.0.0",
+                "dist": { "tarball": format!("http://localhost:4873/{name}/-/{name}-1.0.0.tgz") }
+            }
+        },
+        "_attachments": {
+            format!("{name}-1.0.0.tgz"): {
+                "content_type": "application/octet-stream",
+                "data": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"abc"),
+                "length": 3
+            }
+        }
+    })
+}
+
+/// Perform an authenticated package publish, which exercises a coordinated
+/// state-write. The bearer token is treated as the username by the mock auth
+/// service.
+async fn publish_package(app: &axum::Router, token: &str, package: &str) -> StatusCode {
     let req = Request::builder()
         .method(Method::PUT)
-        .uri(format!("/-/user/org.couchdb.user:{username}"))
+        .uri(format!("/{package}"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(
-            serde_json::to_vec(&json!({"name": username, "password": "secret"})).expect("payload"),
+            serde_json::to_vec(&publish_manifest(package)).expect("payload"),
         ))
         .expect("request");
     app.clone().oneshot(req).await.expect("response").status()
@@ -213,11 +231,17 @@ async fn state_coordination_s3_fail_open_allows_writes_when_backend_is_down() {
             ),
         ],
         async {
+            let auth = common::start_token_echo_auth().await;
             let dir = TempDir::new().expect("dir");
-            let cfg = base_config(dir.path().to_path_buf());
+            let mut cfg = base_config(dir.path().to_path_buf());
+            cfg.auth_plugin = Some(common::external_auth_plugin(&auth.uri()));
             let app = app_with_env(&cfg).await;
             let user = format!("state-open-{}", Uuid::new_v4().as_simple());
-            assert_eq!(create_user(&app, &user).await, StatusCode::CREATED);
+            let pkg = format!("state-open-pkg-{}", Uuid::new_v4().as_simple());
+            assert_eq!(
+                publish_package(&app, &user, &pkg).await,
+                StatusCode::CREATED
+            );
         },
     )
     .await;
@@ -244,11 +268,17 @@ async fn state_coordination_s3_fail_closed_rejects_writes_when_backend_is_down()
             ),
         ],
         async {
+            let auth = common::start_token_echo_auth().await;
             let dir = TempDir::new().expect("dir");
-            let cfg = base_config(dir.path().to_path_buf());
+            let mut cfg = base_config(dir.path().to_path_buf());
+            cfg.auth_plugin = Some(common::external_auth_plugin(&auth.uri()));
             let app = app_with_env(&cfg).await;
             let user = format!("state-closed-{}", Uuid::new_v4().as_simple());
-            assert_eq!(create_user(&app, &user).await, StatusCode::BAD_GATEWAY);
+            let pkg = format!("state-closed-pkg-{}", Uuid::new_v4().as_simple());
+            assert_eq!(
+                publish_package(&app, &user, &pkg).await,
+                StatusCode::BAD_GATEWAY
+            );
         },
     )
     .await;
@@ -326,12 +356,15 @@ async fn state_coordination_s3_lock_timeout_when_key_is_held() {
             ("RUSTACCIO_STATE_COORDINATION_POLL_INTERVAL_MS", Some("50")),
         ],
         async {
+            let auth = common::start_token_echo_auth().await;
             let dir = TempDir::new().expect("dir");
-            let cfg = base_config(dir.path().to_path_buf());
+            let mut cfg = base_config(dir.path().to_path_buf());
+            cfg.auth_plugin = Some(common::external_auth_plugin(&auth.uri()));
             let app = app_with_env(&cfg).await;
             let user = format!("state-lock-{}", Uuid::new_v4().as_simple());
+            let pkg = format!("state-lock-pkg-{}", Uuid::new_v4().as_simple());
             assert_eq!(
-                create_user(&app, &user).await,
+                publish_package(&app, &user, &pkg).await,
                 StatusCode::SERVICE_UNAVAILABLE
             );
         },

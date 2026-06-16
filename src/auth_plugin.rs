@@ -1,9 +1,5 @@
 use crate::{
-    auth::AuthHook,
-    config::HttpAuthPluginConfig,
-    constants::{API_ERROR_BAD_USERNAME_PASSWORD, API_ERROR_PASSWORD_SHORT},
-    error::RegistryError,
-    models::AuthIdentity,
+    auth::AuthHook, config::HttpAuthPluginConfig, error::RegistryError, models::AuthIdentity,
 };
 use async_trait::async_trait;
 use axum::http::StatusCode;
@@ -15,9 +11,6 @@ use tracing::{debug, error, instrument, warn};
 #[derive(Debug, Clone)]
 pub struct HttpAuthPlugin {
     base_url: String,
-    add_user_endpoint: String,
-    login_endpoint: String,
-    change_password_endpoint: String,
     request_auth_endpoint: Option<String>,
     allow_access_endpoint: Option<String>,
     allow_publish_endpoint: Option<String>,
@@ -50,9 +43,6 @@ impl HttpAuthPlugin {
 
         let plugin = Self {
             base_url,
-            add_user_endpoint: normalize_endpoint(&cfg.add_user_endpoint),
-            login_endpoint: normalize_endpoint(&cfg.login_endpoint),
-            change_password_endpoint: normalize_endpoint(&cfg.change_password_endpoint),
             request_auth_endpoint: cfg
                 .request_auth_endpoint
                 .clone()
@@ -82,70 +72,6 @@ impl HttpAuthPlugin {
         );
 
         Ok(plugin)
-    }
-
-    #[instrument(level = "debug", skip(self, password), fields(username = %username))]
-    pub async fn add_user(
-        &self,
-        username: &str,
-        password: &str,
-        min_password_len: usize,
-    ) -> Result<(), RegistryError> {
-        if password.len() < min_password_len {
-            return Err(RegistryError::http(
-                StatusCode::BAD_REQUEST,
-                API_ERROR_PASSWORD_SHORT,
-            ));
-        }
-        self.post_json(
-            &self.add_user_endpoint,
-            &json!({
-                "username": username,
-                "password": password,
-            }),
-        )
-        .await
-    }
-
-    #[instrument(level = "debug", skip(self, password), fields(username = %username))]
-    pub async fn authenticate(&self, username: &str, password: &str) -> Result<(), RegistryError> {
-        self.post_json(
-            &self.login_endpoint,
-            &json!({
-                "username": username,
-                "password": password,
-            }),
-        )
-        .await
-    }
-
-    #[instrument(
-        level = "debug",
-        skip(self, old_password, new_password),
-        fields(username = %username)
-    )]
-    pub async fn change_password(
-        &self,
-        username: &str,
-        old_password: &str,
-        new_password: &str,
-        min_password_len: usize,
-    ) -> Result<(), RegistryError> {
-        if new_password.len() < min_password_len {
-            return Err(RegistryError::http(
-                StatusCode::UNAUTHORIZED,
-                API_ERROR_PASSWORD_SHORT,
-            ));
-        }
-        self.post_json(
-            &self.change_password_endpoint,
-            &json!({
-                "username": username,
-                "old_password": old_password,
-                "new_password": new_password,
-            }),
-        )
-        .await
     }
 
     #[instrument(
@@ -467,76 +393,10 @@ impl HttpAuthPlugin {
         );
         Ok(None)
     }
-
-    #[instrument(level = "debug", skip(self, payload), fields(endpoint = %endpoint))]
-    async fn post_json(&self, endpoint: &str, payload: &Value) -> Result<(), RegistryError> {
-        let url = format!("{}{}", self.base_url, endpoint);
-        debug!(endpoint, "attempting external auth plugin request");
-        let response = self
-            .client
-            .post(url)
-            .json(payload)
-            .send()
-            .await
-            .map_err(|err| {
-                error!(endpoint, error = ?err, "external auth plugin endpoint call failed");
-                RegistryError::http(StatusCode::BAD_GATEWAY, "external auth plugin unavailable")
-            })?;
-
-        if response.status().is_success() {
-            debug!(
-                status = response.status().as_u16(),
-                "auth plugin request succeeded"
-            );
-            return Ok(());
-        }
-
-        let status = response.status();
-        warn!(
-            endpoint,
-            status = status.as_u16(),
-            "auth plugin request failed"
-        );
-        let message = extract_error_message(response)
-            .await
-            .unwrap_or_else(|| API_ERROR_BAD_USERNAME_PASSWORD.to_string());
-
-        Err(RegistryError::http(status, message))
-    }
 }
 
 #[async_trait]
 impl AuthHook for HttpAuthPlugin {
-    async fn add_user(
-        &self,
-        username: &str,
-        password: &str,
-        min_password_len: usize,
-    ) -> Result<(), RegistryError> {
-        HttpAuthPlugin::add_user(self, username, password, min_password_len).await
-    }
-
-    async fn authenticate(&self, username: &str, password: &str) -> Result<(), RegistryError> {
-        HttpAuthPlugin::authenticate(self, username, password).await
-    }
-
-    async fn change_password(
-        &self,
-        username: &str,
-        old_password: &str,
-        new_password: &str,
-        min_password_len: usize,
-    ) -> Result<(), RegistryError> {
-        HttpAuthPlugin::change_password(
-            self,
-            username,
-            old_password,
-            new_password,
-            min_password_len,
-        )
-        .await
-    }
-
     async fn authenticate_request(
         &self,
         token: &str,

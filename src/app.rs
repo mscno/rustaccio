@@ -65,13 +65,11 @@ pub struct AppState {
     pub uplinks: HashMap<String, Upstream>,
     pub web_enabled: bool,
     pub web_title: String,
-    pub web_login_enabled: bool,
     pub publish_check_owners: bool,
     pub max_body_size: usize,
     pub audit_enabled: bool,
     pub url_prefix: String,
     pub trust_proxy: bool,
-    pub auth_external_mode: bool,
 }
 
 pub fn build_router(state: AppState) -> Router {

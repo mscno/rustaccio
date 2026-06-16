@@ -5,7 +5,7 @@ use axum::{
 use rustaccio::{
     acl::{Acl, PackageRule},
     app::{AppState, build_router},
-    config::{AuthBackend, AuthPluginConfig, Config, TarballStorageBackend, TarballStorageConfig},
+    config::{Config, TarballStorageBackend, TarballStorageConfig},
     policy::{DefaultPolicyEngine, HttpPolicyConfig},
     storage::Store,
 };
@@ -18,6 +18,8 @@ use wiremock::{
     matchers::{method, path},
 };
 
+mod common;
+
 fn base_config(data_dir: PathBuf, rules: Vec<PackageRule>) -> Config {
     Config {
         bind: "127.0.0.1:0".parse().expect("bind"),
@@ -28,21 +30,14 @@ fn base_config(data_dir: PathBuf, rules: Vec<PackageRule>) -> Config {
         acl_rules: rules,
         web_enabled: true,
         web_title: "Rustaccio".to_string(),
-        web_login: false,
         publish_check_owners: false,
-        password_min_length: 3,
-        login_session_ttl_seconds: 120,
         max_body_size: 50 * 1024 * 1024,
         audit_enabled: true,
         url_prefix: "/".to_string(),
         trust_proxy: false,
         keep_alive_timeout_secs: None,
         log_level: "info".to_string(),
-        auth_plugin: AuthPluginConfig {
-            backend: AuthBackend::Local,
-            external_mode: false,
-            http: None,
-        },
+        auth_plugin: None,
         tarball_storage: TarballStorageConfig {
             backend: TarballStorageBackend::Local,
             s3: None,
@@ -73,18 +68,23 @@ fn manifest(pkg: &str) -> Value {
     })
 }
 
+/// Authenticated identity used by all policy tests. The token-echo mock auth
+/// server authenticates this bearer token and echoes it back as the username.
+const AUTH_TOKEN: &str = "alice";
+
+/// Build a seeded app wired to an external token-echo auth server. The returned
+/// `MockServer` must be kept alive for the duration of the test.
 async fn seeded_app(
-    cfg: Config,
+    mut cfg: Config,
     policy_cfg: Option<HttpPolicyConfig>,
     package_name: &str,
-) -> (axum::Router, String) {
+) -> (axum::Router, MockServer) {
+    let auth = common::start_token_echo_auth().await;
+    cfg.auth_plugin = Some(common::external_auth_plugin(&auth.uri()));
+
     let store = Arc::new(Store::open(&cfg).await.expect("store"));
-    let token = store
-        .create_user("alice", "secret")
-        .await
-        .expect("create user");
     store
-        .publish_manifest(package_name, manifest(package_name), "alice")
+        .publish_manifest(package_name, manifest(package_name), AUTH_TOKEN)
         .await
         .expect("seed package");
 
@@ -107,15 +107,13 @@ async fn seeded_app(
         uplinks: HashMap::new(),
         web_enabled: cfg.web_enabled,
         web_title: cfg.web_title,
-        web_login_enabled: cfg.web_login,
         publish_check_owners: cfg.publish_check_owners,
         max_body_size: cfg.max_body_size,
         audit_enabled: cfg.audit_enabled,
         url_prefix: cfg.url_prefix,
         trust_proxy: cfg.trust_proxy,
-        auth_external_mode: cfg.auth_plugin.external_mode,
     });
-    (app, token)
+    (app, auth)
 }
 
 async fn send(app: &axum::Router, req: Request<Body>) -> axum::http::Response<Body> {
@@ -161,9 +159,9 @@ async fn external_policy_deny_overrides_open_acl() {
         cache_prune_interval_ms: 30_000,
         fail_open: false,
     };
-    let (app, token) = seeded_app(cfg, Some(policy_cfg), "deny-by-policy").await;
+    let (app, _auth) = seeded_app(cfg, Some(policy_cfg), "deny-by-policy").await;
 
-    let resp = send(&app, auth_get("/deny-by-policy", &token)).await;
+    let resp = send(&app, auth_get("/deny-by-policy", AUTH_TOKEN)).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -196,9 +194,9 @@ async fn external_policy_allow_overrides_acl_deny() {
         cache_prune_interval_ms: 30_000,
         fail_open: false,
     };
-    let (app, token) = seeded_app(cfg, Some(policy_cfg), "allow-by-policy").await;
+    let (app, _auth) = seeded_app(cfg, Some(policy_cfg), "allow-by-policy").await;
 
-    let resp = send(&app, auth_get("/allow-by-policy", &token)).await;
+    let resp = send(&app, auth_get("/allow-by-policy", AUTH_TOKEN)).await;
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
@@ -215,9 +213,9 @@ async fn external_policy_fail_open_falls_back_to_acl() {
         cache_prune_interval_ms: 30_000,
         fail_open: true,
     };
-    let (app, token) = seeded_app(cfg, Some(policy_cfg), "fail-open").await;
+    let (app, _auth) = seeded_app(cfg, Some(policy_cfg), "fail-open").await;
 
-    let resp = send(&app, auth_get("/fail-open", &token)).await;
+    let resp = send(&app, auth_get("/fail-open", AUTH_TOKEN)).await;
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
@@ -234,9 +232,9 @@ async fn external_policy_fail_closed_returns_bad_gateway() {
         cache_prune_interval_ms: 30_000,
         fail_open: false,
     };
-    let (app, token) = seeded_app(cfg, Some(policy_cfg), "fail-closed").await;
+    let (app, _auth) = seeded_app(cfg, Some(policy_cfg), "fail-closed").await;
 
-    let resp = send(&app, auth_get("/fail-closed", &token)).await;
+    let resp = send(&app, auth_get("/fail-closed", AUTH_TOKEN)).await;
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 }
 
@@ -269,11 +267,11 @@ async fn external_policy_cache_reuses_decision() {
         cache_prune_interval_ms: 30_000,
         fail_open: false,
     };
-    let (app, token) = seeded_app(cfg, Some(policy_cfg), "cache-hit").await;
+    let (app, _auth) = seeded_app(cfg, Some(policy_cfg), "cache-hit").await;
 
-    let resp = send(&app, auth_get("/cache-hit", &token)).await;
+    let resp = send(&app, auth_get("/cache-hit", AUTH_TOKEN)).await;
     assert_eq!(resp.status(), StatusCode::OK);
-    let resp = send(&app, auth_get("/cache-hit", &token)).await;
+    let resp = send(&app, auth_get("/cache-hit", AUTH_TOKEN)).await;
     assert_eq!(resp.status(), StatusCode::OK);
 
     let requests = policy.received_requests().await.expect("received requests");
@@ -313,23 +311,23 @@ async fn admin_policy_cache_invalidate_forces_recheck() {
         cache_prune_interval_ms: 30_000,
         fail_open: false,
     };
-    let (app, token) = seeded_app(cfg, Some(policy_cfg), "cache-invalidate").await;
+    let (app, _auth) = seeded_app(cfg, Some(policy_cfg), "cache-invalidate").await;
 
-    let resp = send(&app, auth_get("/cache-invalidate", &token)).await;
+    let resp = send(&app, auth_get("/cache-invalidate", AUTH_TOKEN)).await;
     assert_eq!(resp.status(), StatusCode::OK);
-    let resp = send(&app, auth_get("/cache-invalidate", &token)).await;
+    let resp = send(&app, auth_get("/cache-invalidate", AUTH_TOKEN)).await;
     assert_eq!(resp.status(), StatusCode::OK);
 
     let invalidate_req = Request::builder()
         .method(Method::POST)
         .uri("/-/admin/policy-cache/invalidate")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::AUTHORIZATION, format!("Bearer {AUTH_TOKEN}"))
         .body(Body::from("{}".to_string()))
         .expect("request");
     let invalidate_resp = send(&app, invalidate_req).await;
     assert_eq!(invalidate_resp.status(), StatusCode::OK);
 
-    let resp = send(&app, auth_get("/cache-invalidate", &token)).await;
+    let resp = send(&app, auth_get("/cache-invalidate", AUTH_TOKEN)).await;
     assert_eq!(resp.status(), StatusCode::OK);
 
     let requests = policy.received_requests().await.expect("received requests");
@@ -369,11 +367,11 @@ async fn external_policy_forwards_request_id_header() {
         cache_prune_interval_ms: 30_000,
         fail_open: false,
     };
-    let (app, token) = seeded_app(cfg, Some(policy_cfg), "request-id").await;
+    let (app, _auth) = seeded_app(cfg, Some(policy_cfg), "request-id").await;
 
     let resp = send(
         &app,
-        auth_get_with_request_id("/request-id", &token, "req-policy-1"),
+        auth_get_with_request_id("/request-id", AUTH_TOKEN, "req-policy-1"),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);

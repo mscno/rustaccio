@@ -2,6 +2,8 @@
 // recursion limit on recent toolchains; raise it for this test crate.
 #![recursion_limit = "256"]
 
+mod common;
+
 use axum::{
     body::Body,
     http::{Method, Request, StatusCode, header},
@@ -12,21 +14,15 @@ use http_body_util::BodyExt;
 #[cfg(feature = "s3")]
 use rustaccio::config::S3TarballStorageConfig;
 use rustaccio::{
-    acl::{Acl, PackageRule},
-    app::{AppState, build_router},
-    config::{
-        AuthBackend, AuthPluginConfig, Config, HttpAuthPluginConfig, TarballStorageBackend,
-        TarballStorageConfig,
-    },
-    policy::DefaultPolicyEngine,
+    acl::PackageRule,
+    app::build_router,
+    config::{Config, TarballStorageBackend, TarballStorageConfig},
     runtime,
-    storage::Store,
-    upstream::Upstream,
 };
 use serde_json::{Value, json};
 #[cfg(feature = "s3")]
 use std::io::Write;
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf};
 #[cfg(feature = "s3")]
 use tar::Builder as TarBuilder;
 use tempfile::TempDir;
@@ -54,21 +50,14 @@ fn base_test_config(data_dir: PathBuf) -> Config {
         acl_rules: vec![PackageRule::open("**")],
         web_enabled: true,
         web_title: "Rustaccio".to_string(),
-        web_login: true,
         publish_check_owners: false,
-        password_min_length: 3,
-        login_session_ttl_seconds: 120,
         max_body_size: 50 * 1024 * 1024,
         audit_enabled: true,
         url_prefix: "/".to_string(),
         trust_proxy: false,
         keep_alive_timeout_secs: None,
         log_level: "info".to_string(),
-        auth_plugin: AuthPluginConfig {
-            backend: AuthBackend::Local,
-            external_mode: false,
-            http: None,
-        },
+        auth_plugin: None,
         tarball_storage: TarballStorageConfig {
             backend: TarballStorageBackend::Local,
             s3: None,
@@ -77,32 +66,24 @@ fn base_test_config(data_dir: PathBuf) -> Config {
 }
 
 async fn build_test_app_from_config(cfg: Config) -> axum::Router {
-    let store = Arc::new(Store::open(&cfg).await.expect("store"));
-    let upstream_clients = cfg
-        .uplinks
-        .iter()
-        .map(|(name, url)| (name.clone(), Upstream::new(url.clone())))
-        .collect::<HashMap<_, _>>();
-    let acl = Acl::new(cfg.acl_rules.clone());
-    let policy = Arc::new(DefaultPolicyEngine::new(store.clone(), acl.clone()));
-    build_router(AppState {
-        store,
-        acl,
-        policy,
-        governance: Arc::new(rustaccio::governance::GovernanceEngine::default()),
-        events: Arc::new(rustaccio::events::EventDispatcher::disabled()),
-        admin_access: rustaccio::app::AdminAccessConfig::default(),
-        uplinks: upstream_clients,
-        web_enabled: cfg.web_enabled,
-        web_title: cfg.web_title.clone(),
-        web_login_enabled: cfg.web_login,
-        publish_check_owners: cfg.publish_check_owners,
-        max_body_size: cfg.max_body_size,
-        audit_enabled: cfg.audit_enabled,
-        url_prefix: cfg.url_prefix.clone(),
-        trust_proxy: cfg.trust_proxy,
-        auth_external_mode: cfg.auth_plugin.external_mode,
-    })
+    let state = runtime::build_state(&cfg, None).await.expect("state");
+    build_router(state)
+}
+
+/// Build a config with the given rules and optional default uplink. Anonymous
+/// access only (no auth plugin wired).
+fn config_with_rules(
+    data_dir: PathBuf,
+    upstream: Option<String>,
+    rules: Vec<PackageRule>,
+) -> Config {
+    let mut cfg = base_test_config(data_dir);
+    cfg.upstream_registry = upstream.clone();
+    if let Some(url) = upstream {
+        cfg.uplinks.insert("default".to_string(), url);
+    }
+    cfg.acl_rules = rules;
+    cfg
 }
 
 async fn test_app_with_rules(
@@ -110,41 +91,58 @@ async fn test_app_with_rules(
     upstream: Option<String>,
     rules: Vec<PackageRule>,
 ) -> axum::Router {
-    test_app_with_rules_and_options(data_dir, upstream, rules, true, false).await
+    build_test_app_from_config(config_with_rules(data_dir, upstream, rules)).await
 }
 
-async fn test_app_with_rules_and_web_login(
+/// External-auth variant of [`test_app`]: wires the registry at the mock auth
+/// service so bearer tokens authenticate as the username they carry.
+async fn test_app_with_external_auth(
     data_dir: PathBuf,
     upstream: Option<String>,
-    rules: Vec<PackageRule>,
-    web_login: bool,
+    auth_uri: &str,
 ) -> axum::Router {
-    test_app_with_rules_and_options(data_dir, upstream, rules, web_login, false).await
-}
-
-async fn test_app_with_rules_and_options(
-    data_dir: PathBuf,
-    upstream: Option<String>,
-    rules: Vec<PackageRule>,
-    web_login: bool,
-    publish_check_owners: bool,
-) -> axum::Router {
-    let mut cfg = base_test_config(data_dir);
-    cfg.upstream_registry = upstream.clone();
-    if let Some(url) = upstream {
-        cfg.uplinks.insert("default".to_string(), url);
+    let mut rule = PackageRule::open("**");
+    if upstream.is_some() {
+        rule.proxy = Some("default".to_string());
     }
-    cfg.acl_rules = rules;
-    cfg.web_login = web_login;
-    cfg.publish_check_owners = publish_check_owners;
+    let mut cfg = config_with_rules(data_dir, upstream, vec![rule]);
+    cfg.auth_plugin = Some(common::external_auth_plugin(auth_uri));
     build_test_app_from_config(cfg).await
 }
 
-async fn test_app_with_runtime_settings(
+/// External-auth variant of [`test_app_with_rules`].
+async fn test_app_with_rules_and_external_auth(
+    data_dir: PathBuf,
+    upstream: Option<String>,
+    rules: Vec<PackageRule>,
+    auth_uri: &str,
+) -> axum::Router {
+    let mut cfg = config_with_rules(data_dir, upstream, rules);
+    cfg.auth_plugin = Some(common::external_auth_plugin(auth_uri));
+    build_test_app_from_config(cfg).await
+}
+
+/// External-auth app builder with rules and a `publish_check_owners` toggle.
+async fn test_app_with_rules_and_options_and_external_auth(
+    data_dir: PathBuf,
+    upstream: Option<String>,
+    rules: Vec<PackageRule>,
+    publish_check_owners: bool,
+    auth_uri: &str,
+) -> axum::Router {
+    let mut cfg = config_with_rules(data_dir, upstream, rules);
+    cfg.publish_check_owners = publish_check_owners;
+    cfg.auth_plugin = Some(common::external_auth_plugin(auth_uri));
+    build_test_app_from_config(cfg).await
+}
+
+/// External-auth variant of a runtime-settings app builder.
+async fn test_app_with_runtime_settings_and_external_auth(
     data_dir: PathBuf,
     upstream: Option<String>,
     url_prefix: &str,
     trust_proxy: bool,
+    auth_uri: &str,
 ) -> axum::Router {
     let mut cfg = base_test_config(data_dir);
     cfg.upstream_registry = upstream.clone();
@@ -153,52 +151,39 @@ async fn test_app_with_runtime_settings(
     }
     cfg.url_prefix = url_prefix.to_string();
     cfg.trust_proxy = trust_proxy;
-    let state = runtime::build_state(&cfg, None).await.expect("state");
-    build_router(state)
+    cfg.auth_plugin = Some(common::external_auth_plugin(auth_uri));
+    build_test_app_from_config(cfg).await
+}
+
+fn config_with_explicit_uplinks(
+    data_dir: PathBuf,
+    uplinks: HashMap<String, String>,
+    rules: Vec<PackageRule>,
+) -> Config {
+    let mut cfg = base_test_config(data_dir);
+    cfg.upstream_registry = uplinks.values().next().cloned();
+    cfg.uplinks = uplinks;
+    cfg.acl_rules = rules;
+    cfg
 }
 
 async fn test_app_with_explicit_uplinks(
     data_dir: PathBuf,
     uplinks: HashMap<String, String>,
     rules: Vec<PackageRule>,
-    web_login: bool,
 ) -> axum::Router {
-    test_app_with_explicit_uplinks_and_options(data_dir, uplinks, rules, web_login, false).await
+    build_test_app_from_config(config_with_explicit_uplinks(data_dir, uplinks, rules)).await
 }
 
-async fn test_app_with_explicit_uplinks_and_options(
+/// External-auth variant of [`test_app_with_explicit_uplinks`].
+async fn test_app_with_explicit_uplinks_and_external_auth(
     data_dir: PathBuf,
     uplinks: HashMap<String, String>,
     rules: Vec<PackageRule>,
-    web_login: bool,
-    publish_check_owners: bool,
+    auth_uri: &str,
 ) -> axum::Router {
-    let mut cfg = base_test_config(data_dir);
-    cfg.upstream_registry = uplinks.values().next().cloned();
-    cfg.uplinks = uplinks;
-    cfg.acl_rules = rules;
-    cfg.web_login = web_login;
-    cfg.publish_check_owners = publish_check_owners;
-    build_test_app_from_config(cfg).await
-}
-
-async fn test_app_with_http_auth_plugin(data_dir: PathBuf, auth_base_url: String) -> axum::Router {
-    let mut cfg = base_test_config(data_dir);
-    cfg.auth_plugin = AuthPluginConfig {
-        backend: AuthBackend::Http,
-        external_mode: false,
-        http: Some(HttpAuthPluginConfig {
-            base_url: auth_base_url,
-            add_user_endpoint: "/adduser".to_string(),
-            login_endpoint: "/authenticate".to_string(),
-            change_password_endpoint: "/change-password".to_string(),
-            request_auth_endpoint: None,
-            allow_access_endpoint: None,
-            allow_publish_endpoint: None,
-            allow_unpublish_endpoint: None,
-            timeout_ms: 2_000,
-        }),
-    };
+    let mut cfg = config_with_explicit_uplinks(data_dir, uplinks, rules);
+    cfg.auth_plugin = Some(common::external_auth_plugin(auth_uri));
     build_test_app_from_config(cfg).await
 }
 
@@ -274,30 +259,11 @@ fn looks_like_verdaccio_revision(value: &str) -> bool {
         && suffix.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-async fn create_user(app: &axum::Router, name: &str, password: &str) -> String {
-    let req = Request::builder()
-        .method(Method::PUT)
-        .uri(format!("/-/user/org.couchdb.user:{name}"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({ "name": name, "password": password })).expect("payload"),
-        ))
-        .expect("request");
-    let resp = send(app, req).await;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let body = json_body(resp).await;
-    body.get("token")
-        .and_then(Value::as_str)
-        .expect("token")
-        .to_string()
-}
-
 #[tokio::test]
 async fn user_and_whoami_flow() {
+    let auth = common::start_token_echo_auth().await;
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), None).await;
-
-    let token = create_user(&app, "test", "secret").await;
+    let app = test_app_with_external_auth(dir.path().to_path_buf(), None, &auth.uri()).await;
 
     let req = Request::builder()
         .method(Method::GET)
@@ -316,7 +282,7 @@ async fn user_and_whoami_flow() {
     let req = Request::builder()
         .method(Method::GET)
         .uri("/-/whoami")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::AUTHORIZATION, "Bearer test")
         .body(Body::empty())
         .expect("request");
     let resp = send(&app, req).await;
@@ -326,109 +292,10 @@ async fn user_and_whoami_flow() {
 }
 
 #[tokio::test]
-async fn http_auth_plugin_user_login_and_password_flows() {
-    let auth = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/adduser"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "ok": true })))
-        .mount(&auth)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/authenticate"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
-        .mount(&auth)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/change-password"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
-        .mount(&auth)
-        .await;
-
-    let dir = TempDir::new().expect("dir");
-    let app = test_app_with_http_auth_plugin(dir.path().to_path_buf(), auth.uri()).await;
-
-    let token = create_user(&app, "pluguser", "secret").await;
-
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri("/-/whoami")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::empty())
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = json_body(resp).await;
-    assert_eq!(body["username"].as_str(), Some("pluguser"));
-
-    let req = Request::builder()
-        .method(Method::PUT)
-        .uri("/-/user/org.couchdb.user:pluguser")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({"name":"pluguser","password":"secret"})).expect("payload"),
-        ))
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/-/npm/v1/user")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({ "password": { "new": "newsecret", "old": "secret" }}))
-                .expect("payload"),
-        ))
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn http_auth_plugin_errors_are_propagated() {
-    let auth = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/adduser"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "ok": true })))
-        .mount(&auth)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/authenticate"))
-        .respond_with(ResponseTemplate::new(401).set_body_json(json!({ "error": "plugin denied" })))
-        .mount(&auth)
-        .await;
-
-    let dir = TempDir::new().expect("dir");
-    let app = test_app_with_http_auth_plugin(dir.path().to_path_buf(), auth.uri()).await;
-    let token = create_user(&app, "plugdeny", "secret").await;
-
-    let req = Request::builder()
-        .method(Method::PUT)
-        .uri("/-/user/org.couchdb.user:plugdeny")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({"name":"plugdeny","password":"secret"})).expect("payload"),
-        ))
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    let body = json_body(resp).await;
-    assert_eq!(body["error"].as_str(), Some("plugin denied"));
-}
-
-#[tokio::test]
 async fn ping_and_whoami_invalid_token_paths() {
+    let auth = common::start_token_echo_auth().await;
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), None).await;
-    let _token = create_user(&app, "tester", "secret").await;
+    let app = test_app_with_external_auth(dir.path().to_path_buf(), None, &auth.uri()).await;
 
     let req = Request::builder()
         .method(Method::GET)
@@ -440,22 +307,31 @@ async fn ping_and_whoami_invalid_token_paths() {
     let body = json_body(resp).await;
     assert_eq!(body, json!({}));
 
+    // With external auth, any non-empty bearer token authenticates as the
+    // username it carries, so the echo plugin maps "Bearer some-token" to user
+    // "some-token".
     let req = Request::builder()
         .method(Method::GET)
         .uri("/-/whoami")
-        .header(header::AUTHORIZATION, "Bearer invalid-token")
+        .header(header::AUTHORIZATION, "Bearer some-token")
         .body(Body::empty())
         .expect("request");
     let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body.get("username").and_then(Value::as_str),
+        Some("some-token")
+    );
 }
 
 #[tokio::test]
 async fn publish_get_and_tarball_flow() {
+    let auth = common::start_token_echo_auth().await;
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), None).await;
+    let app = test_app_with_external_auth(dir.path().to_path_buf(), None, &auth.uri()).await;
 
-    let token = create_user(&app, "alice", "secret").await;
+    let token = "alice".to_string();
     let manifest = pkg_manifest("foo", "1.0.0", "foo-1.0.0.tgz", b"hello tarball");
 
     let req = Request::builder()
@@ -566,8 +442,9 @@ async fn publish_get_and_tarball_flow() {
 #[tokio::test]
 async fn head_routes_for_package_version_and_tarball() {
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), None).await;
-    let token = create_user(&app, "head-user", "secret").await;
+    let auth = common::start_token_echo_auth().await;
+    let app = test_app_with_external_auth(dir.path().to_path_buf(), None, &auth.uri()).await;
+    let token = "head-user".to_string();
 
     let manifest = pkg_manifest("headpkg", "1.0.0", "headpkg-1.0.0.tgz", b"head");
     let req = Request::builder()
@@ -599,9 +476,10 @@ async fn head_routes_for_package_version_and_tarball() {
 #[tokio::test]
 async fn dist_tag_flow() {
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), None).await;
+    let auth = common::start_token_echo_auth().await;
+    let app = test_app_with_external_auth(dir.path().to_path_buf(), None, &auth.uri()).await;
 
-    let token = create_user(&app, "bob", "secret").await;
+    let token = "bob".to_string();
 
     let v1 = pkg_manifest("foo", "1.0.0", "foo-1.0.0.tgz", b"v1");
     let req = Request::builder()
@@ -663,111 +541,12 @@ async fn dist_tag_flow() {
 }
 
 #[tokio::test]
-async fn token_profile_and_search_flow() {
+async fn publish_and_search_flow() {
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), None).await;
+    let auth = common::start_token_echo_auth().await;
+    let app = test_app_with_external_auth(dir.path().to_path_buf(), None, &auth.uri()).await;
 
-    let token = create_user(&app, "carol", "secret").await;
-
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/-/npm/v1/tokens")
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::from(
-            serde_json::to_vec(
-                &json!({"password": "secret", "readonly": false, "cidr_whitelist": []}),
-            )
-            .expect("payload"),
-        ))
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = json_body(resp).await;
-    let token_key = body
-        .get("key")
-        .and_then(Value::as_str)
-        .expect("key")
-        .to_string();
-
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri("/-/npm/v1/tokens")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::empty())
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let list = json_body(resp).await;
-    assert_eq!(list["objects"].as_array().map(Vec::len), Some(1));
-
-    let req = Request::builder()
-        .method(Method::DELETE)
-        .uri(format!("/-/npm/v1/tokens/token/{token_key}"))
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::empty())
-        .expect("request");
-    assert_eq!(send(&app, req).await.status(), StatusCode::OK);
-
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri("/-/npm/v1/user")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::empty())
-        .expect("request");
-    assert_eq!(send(&app, req).await.status(), StatusCode::OK);
-
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/-/npm/v1/user")
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::from(
-            serde_json::to_vec(&json!({ "password": { "new": "_" }})).expect("payload"),
-        ))
-        .expect("request");
-    assert_eq!(send(&app, req).await.status(), StatusCode::UNAUTHORIZED);
-
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/-/npm/v1/user")
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::from(
-            serde_json::to_vec(&json!({ "password": { "new": "newpassword", "old": "secret" }}))
-                .expect("payload"),
-        ))
-        .expect("request");
-    assert_eq!(send(&app, req).await.status(), StatusCode::OK);
-
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/-/npm/v1/tokens")
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::from(
-            serde_json::to_vec(&json!({ "password": "newpassword", "cidr_whitelist": [] }))
-                .expect("payload"),
-        ))
-        .expect("request");
-    assert_eq!(
-        send(&app, req).await.status(),
-        StatusCode::UNPROCESSABLE_ENTITY
-    );
-
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/-/npm/v1/tokens")
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::from(
-            serde_json::to_vec(
-                &json!({ "password": "wrong", "readonly": false, "cidr_whitelist": [] }),
-            )
-            .expect("payload"),
-        ))
-        .expect("request");
-    assert_eq!(send(&app, req).await.status(), StatusCode::UNAUTHORIZED);
+    let token = "carol".to_string();
 
     let manifest = pkg_manifest("bar", "1.0.0", "bar-1.0.0.tgz", b"bar");
     let req = Request::builder()
@@ -925,8 +704,11 @@ async fn fetches_upstream_tarball_when_local_manifest_lacks_dist_info() {
         .await;
 
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), Some(upstream.uri())).await;
-    let token = create_user(&app, "distless", "secret").await;
+    let auth = common::start_token_echo_auth().await;
+    let app =
+        test_app_with_external_auth(dir.path().to_path_buf(), Some(upstream.uri()), &auth.uri())
+            .await;
+    let token = "distless".to_string();
 
     let manifest = pkg_manifest(pkg, "1.0.0", "upstream-1.0.0.tgz", b"local-1.0.0");
     let req = Request::builder()
@@ -1022,60 +804,6 @@ async fn tarball_uses_local_cache_after_first_upstream_fetch() {
 }
 
 #[tokio::test]
-async fn upstream_cached_packages_are_not_persisted_in_local_state() {
-    let upstream = MockServer::start().await;
-    let upstream_manifest = json!({
-        "_id": "upstream-only",
-        "name": "upstream-only",
-        "dist-tags": { "latest": "1.0.0" },
-        "versions": {
-            "1.0.0": {
-                "name": "upstream-only",
-                "version": "1.0.0",
-                "description": "from npm uplink",
-                "dist": {
-                    "tarball": format!("{}/upstream-only/-/upstream-only-1.0.0.tgz", upstream.uri())
-                }
-            }
-        }
-    });
-    Mock::given(method("GET"))
-        .and(path("/upstream-only"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(upstream_manifest))
-        .mount(&upstream)
-        .await;
-
-    let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), Some(upstream.uri())).await;
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri("/upstream-only")
-        .body(Body::empty())
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let state_file = dir.path().join("state.json");
-    if tokio::fs::try_exists(&state_file)
-        .await
-        .expect("state file existence")
-    {
-        let bytes = tokio::fs::read(&state_file).await.expect("read state");
-        if !bytes.is_empty() {
-            let state_json: Value = serde_json::from_slice(&bytes).expect("parse state");
-            let persisted = state_json
-                .get("packages")
-                .and_then(Value::as_object)
-                .and_then(|packages| packages.get("upstream-only"));
-            assert!(
-                persisted.is_none(),
-                "upstream cache entries should stay runtime-only and never persist in state.json"
-            );
-        }
-    }
-}
-
-#[tokio::test]
 async fn upstream_info_like_response_contains_dependencies() {
     let upstream = MockServer::start().await;
 
@@ -1145,8 +873,11 @@ async fn upstream_publish_patch_and_dist_tags_flow() {
         .await;
 
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), Some(upstream.uri())).await;
-    let token = create_user(&app, "patcher", "secret").await;
+    let auth = common::start_token_echo_auth().await;
+    let app =
+        test_app_with_external_auth(dir.path().to_path_buf(), Some(upstream.uri()), &auth.uri())
+            .await;
+    let token = "patcher".to_string();
 
     let req = Request::builder()
         .method(Method::GET)
@@ -1327,11 +1058,12 @@ async fn security_audit_endpoints_fallback_without_uplink() {
 }
 
 #[tokio::test]
-async fn publish_validation_and_user_login_edges() {
+async fn publish_validation_edges() {
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), None).await;
+    let auth = common::start_token_echo_auth().await;
+    let app = test_app_with_external_auth(dir.path().to_path_buf(), None, &auth.uri()).await;
 
-    let token = create_user(&app, "dora", "secret").await;
+    let token = "dora".to_string();
 
     let mut bad_manifest = pkg_manifest("badpkg", "1.0.0", "badpkg-1.0.0.tgz", b"bad");
     bad_manifest["_attachments"] = json!({});
@@ -1351,150 +1083,14 @@ async fn publish_validation_and_user_login_edges() {
         body.get("error").and_then(Value::as_str),
         Some("unsupported registry call")
     );
-
-    let req = Request::builder()
-        .method(Method::PUT)
-        .uri("/-/user/org.couchdb.user:dora")
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::from(
-            serde_json::to_vec(&json!({"name":"dora","password":"secret"})).expect("payload"),
-        ))
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let body = json_body(resp).await;
-    assert!(body.get("token").and_then(Value::as_str).is_some());
-
-    let req = Request::builder()
-        .method(Method::PUT)
-        .uri("/-/user/org.couchdb.user:dora")
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::from(
-            serde_json::to_vec(&json!({"name":"dora","password":"wrong"})).expect("payload"),
-        ))
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-    let req = Request::builder()
-        .method(Method::PUT)
-        .uri("/-/user/org.couchdb.user:yeti")
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::from(
-            serde_json::to_vec(&json!({"name":"dora","password":"secret"})).expect("payload"),
-        ))
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let body = json_body(resp).await;
-    assert_eq!(
-        body.get("error").and_then(Value::as_str),
-        Some("username does not match logged in user")
-    );
-}
-
-#[tokio::test]
-async fn login_session_edge_cases() {
-    let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), None).await;
-
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri("/-/v1/done/not-a-valid-session")
-        .body(Body::empty())
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let body = json_body(resp).await;
-    assert_eq!(
-        body.get("error").and_then(Value::as_str),
-        Some("session id is invalid")
-    );
-
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/-/v1/login")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(b"{}".to_vec()))
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = json_body(resp).await;
-    let done = body
-        .get("doneUrl")
-        .and_then(Value::as_str)
-        .expect("doneUrl");
-    let session_id = done
-        .split("/-/v1/done/")
-        .last()
-        .expect("session suffix")
-        .to_string();
-
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(format!("/-/v1/done/{session_id}"))
-        .body(Body::empty())
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::ACCEPTED);
-    assert_eq!(
-        resp.headers()
-            .get(header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok()),
-        Some("5")
-    );
-
-    let _token = create_user(&app, "session-user", "password").await;
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri(format!("/-/v1/login_cli/{session_id}"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({"username":"session-user","password":"password"}))
-                .expect("payload"),
-        ))
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(format!("/-/v1/done/{session_id}"))
-        .body(Body::empty())
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn login_endpoints_disabled_without_web_login_flag() {
-    let dir = TempDir::new().expect("dir");
-    let app = test_app_with_rules_and_web_login(
-        dir.path().to_path_buf(),
-        None,
-        vec![PackageRule::open("**")],
-        false,
-    )
-    .await;
-
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/-/v1/login")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(b"{}".to_vec()))
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn owner_and_star_flows() {
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), None).await;
-    let token = create_user(&app, "owner", "secret").await;
+    let auth = common::start_token_echo_auth().await;
+    let app = test_app_with_external_auth(dir.path().to_path_buf(), None, &auth.uri()).await;
+    let token = "owner".to_string();
 
     for (name, tarball, data) in [
         ("foo", "foo-1.0.0.tgz", b"foo".as_slice()),
@@ -1625,8 +1221,9 @@ async fn owner_and_star_flows() {
 #[tokio::test]
 async fn scoped_and_encoded_package_routes() {
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), None).await;
-    let token = create_user(&app, "scopeuser", "secret").await;
+    let auth = common::start_token_echo_auth().await;
+    let app = test_app_with_external_auth(dir.path().to_path_buf(), None, &auth.uri()).await;
+    let token = "scopeuser".to_string();
 
     let manifest = pkg_manifest("@scope/foo", "1.0.0", "foo-1.0.0.tgz", b"scoped");
     let req = Request::builder()
@@ -1681,8 +1278,9 @@ async fn scoped_and_encoded_package_routes() {
 #[tokio::test]
 async fn scoped_publish_normalizes_scoped_attachment_keys() {
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), None).await;
-    let token = create_user(&app, "scope-normalize-user", "secret").await;
+    let auth = common::start_token_echo_auth().await;
+    let app = test_app_with_external_auth(dir.path().to_path_buf(), None, &auth.uri()).await;
+    let token = "scope-normalize-user".to_string();
 
     let package = "@scope/normalize";
     let tarball = "normalize-1.0.0.tgz";
@@ -1787,8 +1385,9 @@ async fn scoped_publish_normalizes_scoped_attachment_keys() {
 #[tokio::test]
 async fn install_v1_manifest_strips_non_install_fields() {
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), None).await;
-    let token = create_user(&app, "shape-user", "secret").await;
+    let auth = common::start_token_echo_auth().await;
+    let app = test_app_with_external_auth(dir.path().to_path_buf(), None, &auth.uri()).await;
+    let token = "shape-user".to_string();
 
     let mut manifest = pkg_manifest("shapepkg", "1.0.0", "shapepkg-1.0.0.tgz", b"shape");
     manifest["versions"]["1.0.0"]["dependencies"] = json!({ "dep-a": "^1.0.0" });
@@ -1861,33 +1460,12 @@ async fn install_v1_manifest_strips_non_install_fields() {
 }
 
 #[tokio::test]
-async fn user_and_publish_error_paths() {
+async fn publish_error_paths() {
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), None).await;
+    let auth = common::start_token_echo_auth().await;
+    let app = test_app_with_external_auth(dir.path().to_path_buf(), None, &auth.uri()).await;
 
-    let token = create_user(&app, "eve", "secret").await;
-
-    let req = Request::builder()
-        .method(Method::PUT)
-        .uri("/-/user/org.couchdb.user:eve")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({"name":"eve","password":"secret"})).expect("payload"),
-        ))
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-
-    let req = Request::builder()
-        .method(Method::PUT)
-        .uri("/-/user/org.couchdb.user:newuser")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({"name":"newuser","password":"12"})).expect("payload"),
-        ))
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let token = "eve".to_string();
 
     let req = Request::builder()
         .method(Method::GET)
@@ -1897,13 +1475,6 @@ async fn user_and_publish_error_paths() {
     let resp = send(&app, req).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(json_body(resp).await, json!({}));
-
-    let req = Request::builder()
-        .method(Method::DELETE)
-        .uri("/-/user/token/someSecretToken")
-        .body(Body::empty())
-        .expect("request");
-    assert_eq!(send(&app, req).await.status(), StatusCode::OK);
 
     let manifest = pkg_manifest("dead", "1.0.0", "dead-1.0.0.tgz", b"dead");
     let req = Request::builder()
@@ -1934,27 +1505,14 @@ async fn user_and_publish_error_paths() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = json_body(resp).await;
     assert_eq!(body["error"].as_str(), Some("no such file available"));
-
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri("/dead")
-        .header(header::AUTHORIZATION, "Bearer invalid-token")
-        .body(Body::empty())
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    let body = json_body(resp).await;
-    assert_eq!(
-        body["error"].as_str(),
-        Some("authorization required to access package dead")
-    );
 }
 
 #[tokio::test]
 async fn local_database_routes_return_local_packages_and_since_filter() {
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), None).await;
-    let token = create_user(&app, "local-index", "secret").await;
+    let auth = common::start_token_echo_auth().await;
+    let app = test_app_with_external_auth(dir.path().to_path_buf(), None, &auth.uri()).await;
+    let token = "local-index".to_string();
 
     for (name, version, filename, bytes) in [
         (
@@ -2007,68 +1565,9 @@ async fn local_database_routes_return_local_packages_and_since_filter() {
 }
 
 #[tokio::test]
-async fn profile_user_and_star_error_edges() {
+async fn star_error_edges() {
     let dir = TempDir::new().expect("dir");
     let app = test_app(dir.path().to_path_buf(), None).await;
-
-    let token = create_user(&app, "edgeuser", "secret").await;
-
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri("/-/user/org.couchdb.user:edgeuser")
-        .body(Body::empty())
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = json_body(resp).await;
-    assert_eq!(body["ok"], json!(false));
-
-    let req = Request::builder()
-        .method(Method::DELETE)
-        .uri("/-/user/token/someSecretToken")
-        .body(Body::empty())
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = json_body(resp).await;
-    assert_eq!(body["ok"].as_str(), Some("Logged out"));
-
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/-/npm/v1/user")
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::from(
-            serde_json::to_vec(&json!({ "tfa": "_" })).expect("payload"),
-        ))
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/-/npm/v1/user")
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::from(
-            serde_json::to_vec(&json!({ "password": { "new": "foobar", "old": null } }))
-                .expect("payload"),
-        ))
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/-/npm/v1/user")
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::from(
-            serde_json::to_vec(&json!({ "another": "_" })).expect("payload"),
-        ))
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
     let req = Request::builder()
         .method(Method::GET)
@@ -2082,8 +1581,9 @@ async fn profile_user_and_star_error_edges() {
 #[tokio::test]
 async fn unpublish_and_search_shape_edges() {
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), None).await;
-    let token = create_user(&app, "unpublisher", "secret").await;
+    let auth = common::start_token_echo_auth().await;
+    let app = test_app_with_external_auth(dir.path().to_path_buf(), None, &auth.uri()).await;
+    let token = "unpublisher".to_string();
 
     let manifest = pkg_manifest("zap", "1.0.0", "zap-1.0.0.tgz", b"zap");
     let req = Request::builder()
@@ -2133,8 +1633,9 @@ async fn unpublish_and_search_shape_edges() {
 #[tokio::test]
 async fn remove_package_returns_not_found_when_authoritative_package_state_is_missing() {
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), None).await;
-    let token = create_user(&app, "delete-fail", "secret").await;
+    let auth = common::start_token_echo_auth().await;
+    let app = test_app_with_external_auth(dir.path().to_path_buf(), None, &auth.uri()).await;
+    let token = "delete-fail".to_string();
 
     let manifest = pkg_manifest("delete-fail", "1.0.0", "delete-fail-1.0.0.tgz", b"blob");
     let req = Request::builder()
@@ -2175,8 +1676,9 @@ async fn remove_package_returns_not_found_when_authoritative_package_state_is_mi
 #[tokio::test]
 async fn deprecate_and_undeprecate_flow() {
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), None).await;
-    let token = create_user(&app, "deprecator", "secret").await;
+    let auth = common::start_token_echo_auth().await;
+    let app = test_app_with_external_auth(dir.path().to_path_buf(), None, &auth.uri()).await;
+    let token = "deprecator".to_string();
 
     let manifest = pkg_manifest("deprecable", "1.0.0", "deprecable-1.0.0.tgz", b"dep");
     let req = Request::builder()
@@ -2268,8 +1770,9 @@ async fn deprecate_and_undeprecate_flow() {
 #[tokio::test]
 async fn publish_keeps_top_level_readme_when_version_readme_is_empty() {
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), None).await;
-    let token = create_user(&app, "readme-user", "secret").await;
+    let auth = common::start_token_echo_auth().await;
+    let app = test_app_with_external_auth(dir.path().to_path_buf(), None, &auth.uri()).await;
+    let token = "readme-user".to_string();
 
     let mut manifest = pkg_manifest("readme-only", "1.0.0", "readme-only-1.0.0.tgz", b"readme");
     manifest["versions"]["1.0.0"]["readme"] = Value::String(String::new());
@@ -2295,8 +1798,9 @@ async fn publish_keeps_top_level_readme_when_version_readme_is_empty() {
 #[tokio::test]
 async fn deprecate_all_existing_versions_keeps_new_publish_undeprecated() {
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), None).await;
-    let token = create_user(&app, "deprecator-all", "secret").await;
+    let auth = common::start_token_echo_auth().await;
+    let app = test_app_with_external_auth(dir.path().to_path_buf(), None, &auth.uri()).await;
+    let token = "deprecator-all".to_string();
     let package = "@verdaccio/deprecated-3";
 
     for (version, filename, data) in [
@@ -2387,8 +1891,9 @@ async fn deprecate_all_existing_versions_keeps_new_publish_undeprecated() {
 #[tokio::test]
 async fn unpublish_specific_version_via_put_rev_flow() {
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), None).await;
-    let token = create_user(&app, "unpub-put", "secret").await;
+    let auth = common::start_token_echo_auth().await;
+    let app = test_app_with_external_auth(dir.path().to_path_buf(), None, &auth.uri()).await;
+    let token = "unpub-put".to_string();
 
     for (version, filename, data) in [
         ("1.0.0", "put-unpub-1.0.0.tgz", b"v1".as_slice()),
@@ -2521,8 +2026,9 @@ async fn unpublish_specific_version_via_put_rev_flow() {
 #[tokio::test]
 async fn metadata_only_update_cannot_add_new_version_without_attachment() {
     let dir = TempDir::new().expect("dir");
-    let app = test_app(dir.path().to_path_buf(), None).await;
-    let token = create_user(&app, "meta-guard", "secret").await;
+    let auth = common::start_token_echo_auth().await;
+    let app = test_app_with_external_auth(dir.path().to_path_buf(), None, &auth.uri()).await;
+    let token = "meta-guard".to_string();
 
     let manifest = pkg_manifest("meta-guard", "1.0.0", "meta-guard-1.0.0.tgz", b"meta");
     let req = Request::builder()
@@ -2577,8 +2083,11 @@ async fn acl_authenticated_access_filters_package_and_search() {
             proxy: None,
         },
     ];
-    let app = test_app_with_rules(dir.path().to_path_buf(), None, rules).await;
-    let token = create_user(&app, "acl-user", "secret").await;
+    let auth = common::start_token_echo_auth().await;
+    let app =
+        test_app_with_rules_and_external_auth(dir.path().to_path_buf(), None, rules, &auth.uri())
+            .await;
+    let token = "acl-user".to_string();
 
     let manifest = pkg_manifest("vue", "1.0.0", "vue-1.0.0.tgz", b"vue");
     let req = Request::builder()
@@ -2627,9 +2136,12 @@ async fn acl_user_specific_publish_permission() {
         },
         PackageRule::open("**"),
     ];
-    let app = test_app_with_rules(dir.path().to_path_buf(), None, rules).await;
-    let jota_token = create_user(&app, "jota", "secret").await;
-    let other_token = create_user(&app, "other", "secret").await;
+    let auth = common::start_token_echo_auth().await;
+    let app =
+        test_app_with_rules_and_external_auth(dir.path().to_path_buf(), None, rules, &auth.uri())
+            .await;
+    let jota_token = "jota".to_string();
+    let other_token = "other".to_string();
 
     let manifest = pkg_manifest("private-auth", "1.0.0", "private-auth-1.0.0.tgz", b"pkg");
     let req = Request::builder()
@@ -2696,9 +2208,12 @@ async fn acl_unpublish_can_remove_tarball_without_publish_permission() {
         },
         PackageRule::open("**"),
     ];
-    let app = test_app_with_rules(dir.path().to_path_buf(), None, rules).await;
-    let alice_token = create_user(&app, "alice-unpub", "secret").await;
-    let bob_token = create_user(&app, "bob-unpub", "secret").await;
+    let auth = common::start_token_echo_auth().await;
+    let app =
+        test_app_with_rules_and_external_auth(dir.path().to_path_buf(), None, rules, &auth.uri())
+            .await;
+    let alice_token = "alice-unpub".to_string();
+    let bob_token = "bob-unpub".to_string();
 
     let manifest = pkg_manifest(
         "acl-unpub-only",
@@ -2777,7 +2292,7 @@ async fn acl_proxy_rule_selects_named_uplink() {
         },
     ];
 
-    let app = test_app_with_explicit_uplinks(dir.path().to_path_buf(), uplinks, rules, true).await;
+    let app = test_app_with_explicit_uplinks(dir.path().to_path_buf(), uplinks, rules).await;
     let req = Request::builder()
         .method(Method::GET)
         .uri("/special")
@@ -2819,8 +2334,15 @@ async fn package_rule_without_proxy_with_cache_keeps_local_manifest() {
         unpublish: vec!["$authenticated".to_string()],
         proxy: None,
     }];
-    let app = test_app_with_explicit_uplinks(dir.path().to_path_buf(), uplinks, rules, true).await;
-    let token = create_user(&app, "locked-owner", "secret").await;
+    let auth = common::start_token_echo_auth().await;
+    let app = test_app_with_explicit_uplinks_and_external_auth(
+        dir.path().to_path_buf(),
+        uplinks,
+        rules,
+        &auth.uri(),
+    )
+    .await;
+    let token = "locked-owner".to_string();
 
     let manifest = pkg_manifest("locked", "8.0.0", "locked-8.0.0.tgz", b"local-only");
     let req = Request::builder()
@@ -2886,7 +2408,7 @@ async fn package_rule_without_proxy_skips_upstream_fetch() {
         unpublish: vec!["$authenticated".to_string()],
         proxy: None,
     }];
-    let app = test_app_with_explicit_uplinks(dir.path().to_path_buf(), uplinks, rules, true).await;
+    let app = test_app_with_explicit_uplinks(dir.path().to_path_buf(), uplinks, rules).await;
 
     let req = Request::builder()
         .method(Method::GET)
@@ -2949,7 +2471,7 @@ async fn manifest_fetch_with_proxy_does_not_fall_back_to_other_uplinks() {
         unpublish: vec!["$authenticated".to_string()],
         proxy: Some("a".to_string()),
     }];
-    let app = test_app_with_explicit_uplinks(dir.path().to_path_buf(), uplinks, rules, true).await;
+    let app = test_app_with_explicit_uplinks(dir.path().to_path_buf(), uplinks, rules).await;
 
     let req = Request::builder()
         .method(Method::GET)
@@ -3008,7 +2530,7 @@ async fn manifest_fetch_returns_503_when_all_uplinks_are_down() {
         unpublish: vec!["$authenticated".to_string()],
         proxy: Some("a".to_string()),
     }];
-    let app = test_app_with_explicit_uplinks(dir.path().to_path_buf(), uplinks, rules, true).await;
+    let app = test_app_with_explicit_uplinks(dir.path().to_path_buf(), uplinks, rules).await;
 
     let req = Request::builder()
         .method(Method::GET)
@@ -3046,16 +2568,17 @@ async fn manifest_fetch_returns_503_when_all_uplinks_are_down() {
 #[tokio::test]
 async fn publish_check_owners_blocks_non_owner_mutations() {
     let dir = TempDir::new().expect("dir");
-    let app = test_app_with_rules_and_options(
+    let auth = common::start_token_echo_auth().await;
+    let app = test_app_with_rules_and_options_and_external_auth(
         dir.path().to_path_buf(),
         None,
         vec![PackageRule::open("**")],
         true,
-        true,
+        &auth.uri(),
     )
     .await;
-    let owner_token = create_user(&app, "owner-check", "secret").await;
-    let other_token = create_user(&app, "other-check", "secret").await;
+    let owner_token = "owner-check".to_string();
+    let other_token = "other-check".to_string();
 
     let manifest = pkg_manifest("guarded", "1.0.0", "guarded-1.0.0.tgz", b"guarded");
     let req = Request::builder()
@@ -3102,15 +2625,16 @@ async fn publish_check_owners_blocks_non_owner_mutations() {
 #[tokio::test]
 async fn publish_check_owners_allows_owner_mutations() {
     let dir = TempDir::new().expect("dir");
-    let app = test_app_with_rules_and_options(
+    let auth = common::start_token_echo_auth().await;
+    let app = test_app_with_rules_and_options_and_external_auth(
         dir.path().to_path_buf(),
         None,
         vec![PackageRule::open("**")],
         true,
-        true,
+        &auth.uri(),
     )
     .await;
-    let owner_token = create_user(&app, "owner-pass", "secret").await;
+    let owner_token = "owner-pass".to_string();
 
     let manifest = pkg_manifest("ownedpkg", "1.0.0", "ownedpkg-1.0.0.tgz", b"owned");
     let req = Request::builder()
@@ -3143,16 +2667,17 @@ async fn publish_check_owners_allows_owner_mutations() {
 #[tokio::test]
 async fn publish_check_owners_disabled_allows_non_owner_mutations() {
     let dir = TempDir::new().expect("dir");
-    let app = test_app_with_rules_and_options(
+    let auth = common::start_token_echo_auth().await;
+    let app = test_app_with_rules_and_options_and_external_auth(
         dir.path().to_path_buf(),
         None,
         vec![PackageRule::open("**")],
-        true,
         false,
+        &auth.uri(),
     )
     .await;
-    let owner_token = create_user(&app, "owner-free", "secret").await;
-    let other_token = create_user(&app, "other-free", "secret").await;
+    let owner_token = "owner-free".to_string();
+    let other_token = "other-free".to_string();
 
     let manifest = pkg_manifest("freepkg", "1.0.0", "freepkg-1.0.0.tgz", b"free");
     let req = Request::builder()
@@ -3176,9 +2701,16 @@ async fn publish_check_owners_disabled_allows_non_owner_mutations() {
 
 #[tokio::test]
 async fn url_prefix_routes_api_and_web_requests() {
+    let auth = common::start_token_echo_auth().await;
     let dir = TempDir::new().expect("dir");
-    let app =
-        test_app_with_runtime_settings(dir.path().to_path_buf(), None, "/verdaccio", false).await;
+    let app = test_app_with_runtime_settings_and_external_auth(
+        dir.path().to_path_buf(),
+        None,
+        "/verdaccio",
+        false,
+        &auth.uri(),
+    )
+    .await;
 
     let req = Request::builder()
         .method(Method::GET)
@@ -3194,23 +2726,22 @@ async fn url_prefix_routes_api_and_web_requests() {
         .expect("request");
     assert_eq!(send(&app, req).await.status(), StatusCode::NOT_FOUND);
 
+    // whoami served under the url prefix using external-auth bearer tokens.
     let req = Request::builder()
-        .method(Method::PUT)
-        .uri("/verdaccio/-/user/org.couchdb.user:prefixed")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({"name":"prefixed","password":"secret"})).expect("payload"),
-        ))
+        .method(Method::GET)
+        .uri("/verdaccio/-/whoami")
+        .header(header::AUTHORIZATION, "Bearer prefixed")
+        .body(Body::empty())
         .expect("request");
     let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
-    let token = body
-        .get("token")
-        .and_then(Value::as_str)
-        .expect("token")
-        .to_string();
+    assert_eq!(
+        body.get("username").and_then(Value::as_str),
+        Some("prefixed")
+    );
 
+    let token = "prefixed".to_string();
     let manifest = pkg_manifest(
         "prefixed-pkg",
         "1.0.0",
@@ -3239,43 +2770,6 @@ async fn url_prefix_routes_api_and_web_requests() {
         .as_str()
         .unwrap_or_default();
     assert!(tarball.starts_with("http://registry.internal:4873/verdaccio/"));
-}
-
-#[tokio::test]
-async fn trust_proxy_and_url_prefix_shape_login_links() {
-    let dir = TempDir::new().expect("dir");
-    let app_untrusted =
-        test_app_with_runtime_settings(dir.path().join("untrusted"), None, "/verdaccio", false)
-            .await;
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/verdaccio/-/v1/login")
-        .header(header::HOST, "registry.internal:4873")
-        .header("x-forwarded-proto", "https")
-        .header("x-forwarded-host", "registry.example.com")
-        .body(Body::empty())
-        .expect("request");
-    let resp = send(&app_untrusted, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = json_body(resp).await;
-    let login = body["loginUrl"].as_str().unwrap_or_default();
-    assert!(login.starts_with("http://registry.internal:4873/verdaccio/"));
-
-    let app_trusted =
-        test_app_with_runtime_settings(dir.path().join("trusted"), None, "/verdaccio", true).await;
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/verdaccio/-/v1/login")
-        .header(header::HOST, "registry.internal:4873")
-        .header("x-forwarded-proto", "https")
-        .header("x-forwarded-host", "registry.example.com")
-        .body(Body::empty())
-        .expect("request");
-    let resp = send(&app_trusted, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = json_body(resp).await;
-    let login = body["loginUrl"].as_str().unwrap_or_default();
-    assert!(login.starts_with("https://registry.example.com/verdaccio/"));
 }
 
 #[tokio::test]
@@ -3333,7 +2827,6 @@ async fn generic_unmatched_routes_passthrough_falls_back_after_transient_error()
         dir.path().to_path_buf(),
         uplinks,
         vec![PackageRule::open("**")],
-        true,
     )
     .await;
 
@@ -3369,7 +2862,6 @@ async fn generic_unmatched_routes_passthrough_returns_503_when_all_uplinks_fail(
         dir.path().to_path_buf(),
         uplinks,
         vec![PackageRule::open("**")],
-        true,
     )
     .await;
 
@@ -3398,21 +2890,14 @@ fn s3_test_config(data_dir: PathBuf, endpoint: String) -> Config {
         acl_rules: vec![PackageRule::open("**")],
         web_enabled: true,
         web_title: "Rustaccio".to_string(),
-        web_login: false,
         publish_check_owners: false,
-        password_min_length: 3,
-        login_session_ttl_seconds: 120,
         max_body_size: 50 * 1024 * 1024,
         audit_enabled: true,
         url_prefix: "/".to_string(),
         trust_proxy: false,
         keep_alive_timeout_secs: None,
         log_level: "info".to_string(),
-        auth_plugin: AuthPluginConfig {
-            backend: AuthBackend::Local,
-            external_mode: false,
-            http: None,
-        },
+        auth_plugin: None,
         tarball_storage: TarballStorageConfig {
             backend: TarballStorageBackend::S3,
             s3: Some(S3TarballStorageConfig {
@@ -3510,10 +2995,12 @@ async fn s3_mode_writes_verdaccio_package_sidecar_on_publish() {
         .await;
 
     let dir = TempDir::new().expect("dir");
-    let cfg = s3_test_config(dir.path().to_path_buf(), s3.uri());
+    let auth = common::start_token_echo_auth().await;
+    let mut cfg = s3_test_config(dir.path().to_path_buf(), s3.uri());
+    cfg.auth_plugin = Some(common::external_auth_plugin(&auth.uri()));
     let state = runtime::build_state(&cfg, None).await.expect("state");
     let app = build_router(state);
-    let token = create_user(&app, "sidecar-writer", "secret").await;
+    let token = "sidecar-writer".to_string();
 
     let manifest = pkg_manifest("sidecar-pkg", "1.0.0", "sidecar-pkg-1.0.0.tgz", b"payload");
     let req = Request::builder()
@@ -3620,10 +3107,12 @@ async fn s3_mode_scoped_publish_writes_verdaccio_tarball_key_layout() {
         .await;
 
     let dir = TempDir::new().expect("dir");
-    let cfg = s3_test_config(dir.path().to_path_buf(), s3.uri());
+    let auth = common::start_token_echo_auth().await;
+    let mut cfg = s3_test_config(dir.path().to_path_buf(), s3.uri());
+    cfg.auth_plugin = Some(common::external_auth_plugin(&auth.uri()));
     let state = runtime::build_state(&cfg, None).await.expect("state");
     let app = build_router(state);
-    let token = create_user(&app, "scoped-s3-user", "secret").await;
+    let token = "scoped-s3-user".to_string();
 
     let manifest = pkg_manifest(
         "@scope/scoped-s3-pkg",
@@ -3715,10 +3204,12 @@ async fn s3_mode_put_rev_unpublish_rewrites_sidecar_and_deletes_tarball_blob() {
         .await;
 
     let dir = TempDir::new().expect("dir");
-    let cfg = s3_test_config(dir.path().to_path_buf(), s3.uri());
+    let auth = common::start_token_echo_auth().await;
+    let mut cfg = s3_test_config(dir.path().to_path_buf(), s3.uri());
+    cfg.auth_plugin = Some(common::external_auth_plugin(&auth.uri()));
     let state = runtime::build_state(&cfg, None).await.expect("state");
     let app = build_router(state);
-    let token = create_user(&app, "put-unpub-s3-user", "secret").await;
+    let token = "put-unpub-s3-user".to_string();
 
     for (version, filename, data) in [
         ("1.0.0", "put-unpub-s3-1.0.0.tgz", b"v1".as_slice()),

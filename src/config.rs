@@ -8,52 +8,19 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AuthBackend {
-    Local,
-    Http,
-}
-
-impl AuthBackend {
-    fn parse(value: &str) -> Result<Self, String> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "local" => Ok(Self::Local),
-            "http" => Ok(Self::Http),
-            other => Err(format!(
-                "unsupported auth backend `{other}` (expected `local` or `http`)"
-            )),
-        }
-    }
-}
-
+/// Configuration for the external HTTP authentication backend.
+///
+/// When present, incoming bearer tokens are verified by calling the external
+/// service's `request_auth_endpoint`. When absent (`Config.auth_plugin == None`)
+/// the registry runs without authentication (anonymous), subject to ACL/policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpAuthPluginConfig {
     pub base_url: String,
-    pub add_user_endpoint: String,
-    pub login_endpoint: String,
-    pub change_password_endpoint: String,
     pub request_auth_endpoint: Option<String>,
     pub allow_access_endpoint: Option<String>,
     pub allow_publish_endpoint: Option<String>,
     pub allow_unpublish_endpoint: Option<String>,
     pub timeout_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthPluginConfig {
-    pub backend: AuthBackend,
-    pub external_mode: bool,
-    pub http: Option<HttpAuthPluginConfig>,
-}
-
-impl Default for AuthPluginConfig {
-    fn default() -> Self {
-        Self {
-            backend: AuthBackend::Local,
-            external_mode: false,
-            http: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,17 +77,14 @@ pub struct Config {
     pub acl_rules: Vec<PackageRule>,
     pub web_enabled: bool,
     pub web_title: String,
-    pub web_login: bool,
     pub publish_check_owners: bool,
-    pub password_min_length: usize,
-    pub login_session_ttl_seconds: i64,
     pub max_body_size: usize,
     pub audit_enabled: bool,
     pub url_prefix: String,
     pub trust_proxy: bool,
     pub keep_alive_timeout_secs: Option<u64>,
     pub log_level: String,
-    pub auth_plugin: AuthPluginConfig,
+    pub auth_plugin: Option<HttpAuthPluginConfig>,
     pub tarball_storage: TarballStorageConfig,
 }
 
@@ -132,12 +96,9 @@ struct RawEnvConfig {
     bind: Option<String>,
     data_dir: Option<String>,
     upstream: Option<String>,
-    web_login: Option<String>,
     web_enable: Option<String>,
     web_title: Option<String>,
     publish_check_owners: Option<String>,
-    password_min: Option<String>,
-    login_session_ttl_seconds: Option<String>,
     max_body_size: Option<String>,
     audit_enabled: Option<String>,
     url_prefix: Option<String>,
@@ -145,11 +106,7 @@ struct RawEnvConfig {
     keep_alive_timeout: Option<String>,
     log_level: Option<String>,
     auth_backend: Option<String>,
-    auth_external_mode: Option<String>,
     auth_http_base_url: Option<String>,
-    auth_http_adduser_endpoint: Option<String>,
-    auth_http_login_endpoint: Option<String>,
-    auth_http_change_password_endpoint: Option<String>,
     auth_http_request_auth_endpoint: Option<String>,
     auth_http_allow_access_endpoint: Option<String>,
     auth_http_allow_publish_endpoint: Option<String>,
@@ -200,17 +157,14 @@ impl Config {
             acl_rules: vec![PackageRule::open("**")],
             web_enabled: true,
             web_title: "Rustaccio".to_string(),
-            web_login: false,
             publish_check_owners: false,
-            password_min_length: 3,
-            login_session_ttl_seconds: 120,
             max_body_size: 50 * 1024 * 1024,
             audit_enabled: true,
             url_prefix: "/".to_string(),
             trust_proxy: false,
             keep_alive_timeout_secs: None,
             log_level: "info".to_string(),
-            auth_plugin: AuthPluginConfig::default(),
+            auth_plugin: None,
             tarball_storage: TarballStorageConfig::default(),
         }
     }
@@ -288,9 +242,6 @@ impl Config {
             }
         }
 
-        if let Some(parsed) = parse_env_value::<bool>(env_cfg.web_login.as_deref()) {
-            self.web_login = parsed;
-        }
         if let Some(parsed) = parse_env_value::<bool>(env_cfg.web_enable.as_deref()) {
             self.web_enabled = parsed;
         }
@@ -300,12 +251,6 @@ impl Config {
 
         if let Some(parsed) = parse_env_value::<bool>(env_cfg.publish_check_owners.as_deref()) {
             self.publish_check_owners = parsed;
-        }
-        if let Some(parsed) = parse_env_value::<usize>(env_cfg.password_min.as_deref()) {
-            self.password_min_length = parsed;
-        }
-        if let Some(parsed) = parse_env_value::<i64>(env_cfg.login_session_ttl_seconds.as_deref()) {
-            self.login_session_ttl_seconds = parsed;
         }
         if let Some(value) = env_cfg.max_body_size.as_deref()
             && let Some(parsed) = parse_body_size(value)
@@ -349,36 +294,42 @@ impl Config {
     }
 
     fn apply_auth_env_overrides(&mut self, env_cfg: &RawEnvConfig) -> Result<(), String> {
-        if let Some(value) = env_cfg.auth_backend.as_deref() {
-            self.auth_plugin.backend = AuthBackend::parse(value)
-                .map_err(|err| format!("RUSTACCIO_AUTH_BACKEND: {err}"))?;
-        }
-        if let Some(parsed) = parse_env_value::<bool>(env_cfg.auth_external_mode.as_deref()) {
-            self.auth_plugin.external_mode = parsed;
-        }
-
-        if self.auth_plugin.backend == AuthBackend::Local {
-            self.auth_plugin.http = None;
-            return Ok(());
+        // `RUSTACCIO_AUTH_BACKEND` selects the auth mode: `http` enables external
+        // token verification; `none` (or unset) disables authentication entirely.
+        match env_cfg.auth_backend.as_deref().map(str::trim) {
+            Some(value) if value.eq_ignore_ascii_case("http") => {}
+            Some(value) if value.is_empty() || value.eq_ignore_ascii_case("none") => {
+                self.auth_plugin = None;
+                return Ok(());
+            }
+            Some(other) => {
+                return Err(format!(
+                    "RUSTACCIO_AUTH_BACKEND: unsupported auth backend `{other}` (expected `http` or `none`)"
+                ));
+            }
+            None => {
+                // No backend override: leave whatever the config file / defaults set,
+                // but still allow the env vars below to populate an http plugin.
+                if self.auth_plugin.is_none()
+                    && env_cfg.auth_http_base_url.is_none()
+                    && env_cfg.auth_http_request_auth_endpoint.is_none()
+                    && env_cfg.auth_http_allow_access_endpoint.is_none()
+                    && env_cfg.auth_http_allow_publish_endpoint.is_none()
+                    && env_cfg.auth_http_allow_unpublish_endpoint.is_none()
+                    && env_cfg.auth_http_timeout_ms.is_none()
+                {
+                    return Ok(());
+                }
+            }
         }
 
         let mut http = self
             .auth_plugin
-            .http
             .clone()
             .unwrap_or_else(default_http_auth_config);
 
         if let Some(value) = env_cfg.auth_http_base_url.as_deref() {
             http.base_url = value.to_string();
-        }
-        if let Some(value) = env_cfg.auth_http_adduser_endpoint.as_deref() {
-            http.add_user_endpoint = value.to_string();
-        }
-        if let Some(value) = env_cfg.auth_http_login_endpoint.as_deref() {
-            http.login_endpoint = value.to_string();
-        }
-        if let Some(value) = env_cfg.auth_http_change_password_endpoint.as_deref() {
-            http.change_password_endpoint = value.to_string();
         }
         if let Some(value) = env_cfg.auth_http_request_auth_endpoint.as_deref() {
             http.request_auth_endpoint = empty_string_to_none(value.to_string());
@@ -395,7 +346,7 @@ impl Config {
         if let Some(parsed) = parse_env_value::<u64>(env_cfg.auth_http_timeout_ms.as_deref()) {
             http.timeout_ms = parsed;
         }
-        self.auth_plugin.http = Some(http);
+        self.auth_plugin = Some(http);
         Ok(())
     }
 
@@ -455,7 +406,6 @@ impl Config {
         self.upstream_registry = loaded.upstream_registry;
         self.web_enabled = loaded.web_enabled;
         self.web_title = loaded.web_title;
-        self.web_login = loaded.web_login;
         self.publish_check_owners = loaded.publish_check_owners;
         self.max_body_size = loaded.max_body_size;
         self.audit_enabled = loaded.audit_enabled;
@@ -556,16 +506,10 @@ impl Config {
             },
             web_enabled,
             web_title,
-            web_login: parsed
-                .flags
-                .and_then(|flags| flags.web_login)
-                .unwrap_or(false),
             publish_check_owners: parsed
                 .publish
                 .and_then(|publish| publish.check_owners)
                 .unwrap_or(false),
-            password_min_length: 3,
-            login_session_ttl_seconds: 120,
             max_body_size,
             audit_enabled,
             url_prefix,
@@ -610,15 +554,9 @@ fn load_rustaccio_env() -> Result<RawEnvConfig, String> {
         bind: env_value_for_var(&settings, "RUSTACCIO_BIND"),
         data_dir: env_value_for_var(&settings, "RUSTACCIO_DATA_DIR"),
         upstream: env_value_for_var(&settings, "RUSTACCIO_UPSTREAM"),
-        web_login: env_value_for_var(&settings, "RUSTACCIO_WEB_LOGIN"),
         web_enable: env_value_for_var(&settings, "RUSTACCIO_WEB_ENABLE"),
         web_title: env_value_for_var(&settings, "RUSTACCIO_WEB_TITLE"),
         publish_check_owners: env_value_for_var(&settings, "RUSTACCIO_PUBLISH_CHECK_OWNERS"),
-        password_min: env_value_for_var(&settings, "RUSTACCIO_PASSWORD_MIN"),
-        login_session_ttl_seconds: env_value_for_var(
-            &settings,
-            "RUSTACCIO_LOGIN_SESSION_TTL_SECONDS",
-        ),
         max_body_size: env_value_for_var(&settings, "RUSTACCIO_MAX_BODY_SIZE"),
         audit_enabled: env_value_for_var(&settings, "RUSTACCIO_AUDIT_ENABLED"),
         url_prefix: env_value_for_var(&settings, "RUSTACCIO_URL_PREFIX"),
@@ -626,20 +564,7 @@ fn load_rustaccio_env() -> Result<RawEnvConfig, String> {
         keep_alive_timeout: env_value_for_var(&settings, "RUSTACCIO_KEEP_ALIVE_TIMEOUT"),
         log_level: env_value_for_var(&settings, "RUSTACCIO_LOG_LEVEL"),
         auth_backend: env_value_for_var(&settings, "RUSTACCIO_AUTH_BACKEND"),
-        auth_external_mode: env_value_for_var(&settings, "RUSTACCIO_AUTH_EXTERNAL_MODE"),
         auth_http_base_url: env_value_for_var(&settings, "RUSTACCIO_AUTH_HTTP_BASE_URL"),
-        auth_http_adduser_endpoint: env_value_for_var(
-            &settings,
-            "RUSTACCIO_AUTH_HTTP_ADDUSER_ENDPOINT",
-        ),
-        auth_http_login_endpoint: env_value_for_var(
-            &settings,
-            "RUSTACCIO_AUTH_HTTP_LOGIN_ENDPOINT",
-        ),
-        auth_http_change_password_endpoint: env_value_for_var(
-            &settings,
-            "RUSTACCIO_AUTH_HTTP_CHANGE_PASSWORD_ENDPOINT",
-        ),
         auth_http_request_auth_endpoint: env_value_for_var(
             &settings,
             "RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT",
@@ -709,9 +634,6 @@ pub fn default_s3_storage_config_for_examples() -> S3TarballStorageConfig {
 fn default_http_auth_config() -> HttpAuthPluginConfig {
     HttpAuthPluginConfig {
         base_url: String::new(),
-        add_user_endpoint: "/adduser".to_string(),
-        login_endpoint: "/authenticate".to_string(),
-        change_password_endpoint: "/change-password".to_string(),
         request_auth_endpoint: None,
         allow_access_endpoint: None,
         allow_publish_endpoint: None,
@@ -736,53 +658,42 @@ fn empty_string_to_none(value: String) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
 }
 
-fn parse_auth_from_yaml(auth: Option<YamlAuth>) -> Result<AuthPluginConfig, String> {
+fn parse_auth_from_yaml(auth: Option<YamlAuth>) -> Result<Option<HttpAuthPluginConfig>, String> {
     let Some(auth) = auth else {
-        return Ok(AuthPluginConfig::default());
+        return Ok(None);
     };
 
-    let backend = auth
-        .backend
-        .as_deref()
-        .map(AuthBackend::parse)
-        .transpose()?
-        .unwrap_or(AuthBackend::Local);
-    let external_mode = auth.external.unwrap_or(false);
-
+    // `backend: none` (or omitted with no http section) means no authentication.
+    let backend = auth.backend.as_deref().map(str::trim);
     match backend {
-        AuthBackend::Local => Ok(AuthPluginConfig {
-            backend,
-            external_mode,
-            http: None,
-        }),
-        AuthBackend::Http => {
-            let http = auth.http.ok_or_else(|| {
-                "auth.http section is required when auth.backend=http".to_string()
-            })?;
-
-            Ok(AuthPluginConfig {
-                backend,
-                external_mode,
-                http: Some(HttpAuthPluginConfig {
-                    base_url: http.base_url,
-                    add_user_endpoint: http
-                        .add_user_endpoint
-                        .unwrap_or_else(|| "/adduser".to_string()),
-                    login_endpoint: http
-                        .login_endpoint
-                        .unwrap_or_else(|| "/authenticate".to_string()),
-                    change_password_endpoint: http
-                        .change_password_endpoint
-                        .unwrap_or_else(|| "/change-password".to_string()),
-                    request_auth_endpoint: http.request_auth_endpoint,
-                    allow_access_endpoint: http.allow_access_endpoint,
-                    allow_publish_endpoint: http.allow_publish_endpoint,
-                    allow_unpublish_endpoint: http.allow_unpublish_endpoint,
-                    timeout_ms: http.timeout_ms.unwrap_or(5_000),
-                }),
-            })
+        Some(value) if value.eq_ignore_ascii_case("http") => {}
+        Some(value) if value.is_empty() || value.eq_ignore_ascii_case("none") => {
+            return Ok(None);
+        }
+        Some(other) => {
+            return Err(format!(
+                "auth.backend: unsupported value `{other}` (expected `http` or `none`)"
+            ));
+        }
+        None => {
+            if auth.http.is_none() {
+                return Ok(None);
+            }
         }
     }
+
+    let http = auth
+        .http
+        .ok_or_else(|| "auth.http section is required when auth.backend=http".to_string())?;
+
+    Ok(Some(HttpAuthPluginConfig {
+        base_url: http.base_url,
+        request_auth_endpoint: http.request_auth_endpoint,
+        allow_access_endpoint: http.allow_access_endpoint,
+        allow_publish_endpoint: http.allow_publish_endpoint,
+        allow_unpublish_endpoint: http.allow_unpublish_endpoint,
+        timeout_ms: http.timeout_ms.unwrap_or(5_000),
+    }))
 }
 
 fn parse_storage_from_yaml(
@@ -864,7 +775,6 @@ struct YamlConfig {
     uplinks: Option<HashMap<String, YamlUplink>>,
     packages: Option<serde_yaml::Mapping>,
     web: Option<YamlWeb>,
-    flags: Option<YamlFlags>,
     publish: Option<YamlPublish>,
     middlewares: Option<YamlMiddlewares>,
     max_body_size: Option<String>,
@@ -885,12 +795,6 @@ struct YamlUplink {
 }
 
 #[derive(Debug, Deserialize)]
-struct YamlFlags {
-    #[serde(rename = "webLogin")]
-    web_login: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
 struct YamlPublish {
     check_owners: Option<bool>,
 }
@@ -898,7 +802,6 @@ struct YamlPublish {
 #[derive(Debug, Deserialize)]
 struct YamlAuth {
     backend: Option<String>,
-    external: Option<bool>,
     http: Option<YamlAuthHttp>,
 }
 
@@ -906,12 +809,6 @@ struct YamlAuth {
 struct YamlAuthHttp {
     #[serde(rename = "baseUrl")]
     base_url: String,
-    #[serde(rename = "addUserEndpoint")]
-    add_user_endpoint: Option<String>,
-    #[serde(rename = "loginEndpoint")]
-    login_endpoint: Option<String>,
-    #[serde(rename = "changePasswordEndpoint")]
-    change_password_endpoint: Option<String>,
     #[serde(rename = "requestAuthEndpoint")]
     request_auth_endpoint: Option<String>,
     #[serde(rename = "allowAccessEndpoint")]
@@ -1117,7 +1014,7 @@ fn yaml_truthy(value: &serde_yaml::Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthBackend, Config, TarballStorageBackend};
+    use super::{Config, TarballStorageBackend};
     use std::io::Write;
 
     #[test]
@@ -1138,8 +1035,6 @@ packages:
     access: $all
     publish: $authenticated
     unpublish: $authenticated
-flags:
-  webLogin: true
 publish:
   check_owners: true
 "#
@@ -1155,9 +1050,8 @@ publish:
         assert_eq!(cfg.acl_rules[0].pattern, "vue");
         assert_eq!(cfg.acl_rules[0].proxy.as_deref(), Some("npmjs"));
         assert_eq!(cfg.acl_rules[1].pattern, "**");
-        assert!(cfg.web_login);
         assert!(cfg.publish_check_owners);
-        assert_eq!(cfg.auth_plugin.backend, AuthBackend::Local);
+        assert!(cfg.auth_plugin.is_none());
         assert_eq!(cfg.tarball_storage.backend, TarballStorageBackend::Local);
     }
 
@@ -1202,9 +1096,7 @@ auth:
   backend: http
   http:
     baseUrl: http://auth.local:9000
-    addUserEndpoint: /users/add
-    loginEndpoint: /users/login
-    changePasswordEndpoint: /users/password
+    requestAuthEndpoint: /request-auth
     timeoutMs: 2500
 storage:
   backend: s3
@@ -1221,12 +1113,9 @@ storage:
         .expect("write");
 
         let cfg = Config::from_yaml_file(file.path().to_path_buf()).expect("parse");
-        assert_eq!(cfg.auth_plugin.backend, AuthBackend::Http);
-        let auth = cfg.auth_plugin.http.expect("http auth");
+        let auth = cfg.auth_plugin.expect("http auth");
         assert_eq!(auth.base_url, "http://auth.local:9000");
-        assert_eq!(auth.add_user_endpoint, "/users/add");
-        assert_eq!(auth.login_endpoint, "/users/login");
-        assert_eq!(auth.change_password_endpoint, "/users/password");
+        assert_eq!(auth.request_auth_endpoint.as_deref(), Some("/request-auth"));
         assert_eq!(auth.timeout_ms, 2500);
 
         assert_eq!(cfg.tarball_storage.backend, TarballStorageBackend::S3);

@@ -4,13 +4,15 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use rustaccio::{
-    config::{AuthBackend, AuthPluginConfig, Config, TarballStorageBackend, TarballStorageConfig},
+    config::{Config, TarballStorageBackend, TarballStorageConfig},
     runtime,
 };
 use serde_json::json;
 use std::{collections::HashMap, future::Future, sync::OnceLock};
 use tempfile::TempDir;
 use tower::ServiceExt;
+
+mod common;
 
 static ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
@@ -24,21 +26,14 @@ fn base_config(data_dir: std::path::PathBuf) -> Config {
         acl_rules: vec![rustaccio::acl::PackageRule::open("**")],
         web_enabled: true,
         web_title: "Rustaccio".to_string(),
-        web_login: false,
         publish_check_owners: false,
-        password_min_length: 3,
-        login_session_ttl_seconds: 120,
         max_body_size: 50 * 1024 * 1024,
         audit_enabled: true,
         url_prefix: "/".to_string(),
         trust_proxy: false,
         keep_alive_timeout_secs: None,
         log_level: "info".to_string(),
-        auth_plugin: AuthPluginConfig {
-            backend: AuthBackend::Local,
-            external_mode: false,
-            http: None,
-        },
+        auth_plugin: None,
         tarball_storage: TarballStorageConfig {
             backend: TarballStorageBackend::Local,
             s3: None,
@@ -153,33 +148,14 @@ async fn memory_quota_limits_publishes_when_enabled() {
             ("RUSTACCIO_QUOTA_DOWNLOADS_PER_DAY", Some("0")),
         ],
         async {
+            let auth = common::start_token_echo_auth().await;
             let dir = TempDir::new().expect("dir");
-            let cfg = base_config(dir.path().to_path_buf());
+            let mut cfg = base_config(dir.path().to_path_buf());
+            cfg.auth_plugin = Some(common::external_auth_plugin(&auth.uri()));
             let app = app_with_env(&cfg).await;
 
-            let create = Request::builder()
-                .method(Method::PUT)
-                .uri("/-/user/org.couchdb.user:alice")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&json!({"name":"alice","password":"secret"}))
-                        .expect("payload"),
-                ))
-                .expect("request");
-            let create_resp = app.clone().oneshot(create).await.expect("response");
-            assert_eq!(create_resp.status(), StatusCode::CREATED);
-            let create_body = create_resp
-                .into_body()
-                .collect()
-                .await
-                .expect("collect")
-                .to_bytes();
-            let token = serde_json::from_slice::<serde_json::Value>(&create_body)
-                .expect("json")
-                .get("token")
-                .and_then(serde_json::Value::as_str)
-                .expect("token")
-                .to_string();
+            // The token-echo auth server authenticates this bearer token as user `alice`.
+            let token = "alice";
 
             let publish1 = Request::builder()
                 .method(Method::PUT)

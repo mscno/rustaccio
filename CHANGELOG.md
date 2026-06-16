@@ -19,7 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Breaking: removed snapshot-based package metadata persistence and shared S3 `__rustaccio_meta/state.json` package snapshots. Package metadata is now always sidecar-authoritative (`package.json`), and local `state.json` persists auth/session/token records only.
+- Breaking: authentication is now limited to two modes selected by `RUSTACCIO_AUTH_BACKEND`: `none` (anonymous, subject to ACL/policy) and `http` (external HTTP token verification). The `http` backend verifies incoming bearer tokens against `RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT` and resolves identity (`username`/`groups`) from the response. Tokens are issued out of band by the external system and supplied by clients via `.npmrc` (`//<registry>/:_authToken=<token>`).
+- Breaking: managed mode now requires `RUSTACCIO_AUTH_BACKEND=http` plus `RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT` instead of the removed `RUSTACCIO_AUTH_EXTERNAL_MODE` flag.
+- Breaking: removed snapshot-based package metadata persistence and shared S3 `__rustaccio_meta/state.json` package snapshots. Package metadata is now always sidecar-authoritative (`package.json`), and Rustaccio no longer writes any local `state.json` (no on-disk auth/session/token records).
 - Breaking: runtime startup now enforces deployment profiles (`local|s3|managed`) with `RUSTACCIO_RUNTIME_PROFILE` override or automatic profile inference from config, including strict backend requirements for the managed profile (`redis` rate limiting + `postgres` quotas + `redis|s3` state coordination).
 - Breaking: backend selector parsing is now strict for auth, tarball, and policy backends (invalid backend values fail fast at startup instead of silently falling back).
 - Added bounded in-memory caches with periodic pruning for package metadata and external policy decisions; added package discovery modes (`single-node|multi-node`) with optional periodic shared-backend package-name refresh.
@@ -33,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- Breaking: removed the local authentication backend (`RUSTACCIO_AUTH_BACKEND=local` / `auth.backend: local`) and all local user/credential management. There is no local user database.
+- Breaking: removed `npm login`/`npm adduser` (PUT `/-/user`), npm token create/list/revoke (`/-/npm/v1/tokens`), profile/password change (`/-/npm/v1/user` POST), and the web login session flow (`/-/v1/login`, `/-/v1/done`, `/-/v1/login_cli`) along with the web UI login/register forms.
+- Breaking: removed on-disk auth/session persistence — `state.json` and its `users`, `auth_tokens`, `npm_tokens`, and `login_sessions` no longer exist.
+- Breaking: removed auth config keys and env vars: `flags.webLogin`/`RUSTACCIO_WEB_LOGIN`, `RUSTACCIO_PASSWORD_MIN`, `RUSTACCIO_LOGIN_SESSION_TTL_SECONDS`, `RUSTACCIO_AUTH_TOKEN_TTL_SECS`, `RUSTACCIO_AUTH_EXTERNAL_MODE`, and the auth HTTP endpoints `addUserEndpoint`/`loginEndpoint`/`changePasswordEndpoint` (env `RUSTACCIO_AUTH_HTTP_ADDUSER_ENDPOINT`, `..._LOGIN_ENDPOINT`, `..._CHANGE_PASSWORD_ENDPOINT`). The external HTTP request-auth and optional `allow*` policy hooks (plus `RUSTACCIO_AUTH_HTTP_TIMEOUT_MS`) are retained.
 - Legacy Verdaccio `store.aws-s3-storage` YAML compatibility path for tarball backend configuration.
 
 ### Fixed

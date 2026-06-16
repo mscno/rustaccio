@@ -70,8 +70,6 @@ fn index_response(state: &AppState) -> Response<Body> {
     let config = json!({
         "title": state.web_title,
         "urlPrefix": state.url_prefix,
-        "webLoginEnabled": state.web_login_enabled,
-        "externalAuthMode": state.auth_external_mode,
     });
 
     let title = escape_html(&state.web_title);

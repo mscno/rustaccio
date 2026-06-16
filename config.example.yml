@@ -23,9 +23,6 @@ web:
   enable: true
   title: Rustaccio
 
-flags:
-  webLogin: false
-
 publish:
   check_owners: false
 
@@ -45,14 +42,12 @@ log:
   level: info
 
 auth:
-  backend: local
-  external: false
+  # No authentication by default (anonymous, subject to ACL/policy).
+  backend: none
+  # External token verification:
   # backend: http
   # http:
   #   baseUrl: http://127.0.0.1:9000
-  #   addUserEndpoint: /adduser
-  #   loginEndpoint: /authenticate
-  #   changePasswordEndpoint: /change-password
   #   requestAuthEndpoint: /request-auth
   #   allowAccessEndpoint: /allow-access
   #   allowPublishEndpoint: /allow-publish

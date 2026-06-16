@@ -1,39 +1,29 @@
 use crate::{
     auth::AuthHook,
     auth_plugin::HttpAuthPlugin,
-    config::{AuthBackend, Config, TarballStorageBackend},
+    config::{Config, TarballStorageBackend},
     constants::{
-        API_ERROR_BAD_USERNAME_PASSWORD, API_ERROR_MUST_BE_LOGGED, API_ERROR_NO_PACKAGE,
-        API_ERROR_NO_SUCH_FILE, API_ERROR_PACKAGE_EXIST, API_ERROR_PARAMETERS_NOT_VALID,
-        API_ERROR_PASSWORD_SHORT, API_ERROR_PROFILE_ERROR, API_ERROR_REVISION_CONFLICT,
-        API_ERROR_SESSION_ID_INVALID, API_ERROR_SESSION_ID_REQUIRED,
-        API_ERROR_SESSION_TOKEN_EXPIRED, API_ERROR_TFA_DISABLED, API_ERROR_UNAUTHORIZED_ACCESS,
-        API_ERROR_UNSUPPORTED_REGISTRY_CALL, API_ERROR_USERNAME_ALREADY_REGISTERED,
-        API_ERROR_USERNAME_MISMATCH, API_ERROR_VERSION_NOT_EXIST, API_MESSAGE_LOGGED_OUT,
-        API_MESSAGE_PKG_CHANGED, API_MESSAGE_PKG_CREATED, API_MESSAGE_PKG_REMOVED,
-        API_MESSAGE_TAG_ADDED, API_MESSAGE_TAG_REMOVED, API_MESSAGE_TARBALL_REMOVED,
+        API_ERROR_MUST_BE_LOGGED, API_ERROR_NO_PACKAGE, API_ERROR_NO_SUCH_FILE,
+        API_ERROR_PACKAGE_EXIST, API_ERROR_PARAMETERS_NOT_VALID, API_ERROR_REVISION_CONFLICT,
+        API_ERROR_UNAUTHORIZED_ACCESS, API_ERROR_UNSUPPORTED_REGISTRY_CALL,
+        API_ERROR_VERSION_NOT_EXIST, API_MESSAGE_PKG_CHANGED, API_MESSAGE_PKG_CREATED,
+        API_MESSAGE_PKG_REMOVED, API_MESSAGE_TAG_ADDED, API_MESSAGE_TAG_REMOVED,
+        API_MESSAGE_TARBALL_REMOVED,
     },
     error::RegistryError,
-    models::{
-        AuthIdentity, AuthTokenRecord, LoginSessionRecord, NpmTokenRecord, PackageRecord,
-        PersistedState, UserRecord,
-    },
+    models::{AuthIdentity, PackageRecord, PersistedState},
     state_coordination::StateWriteCoordinator,
     tarball_backend::TarballBackend,
 };
-use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::http::StatusCode;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::{SecondsFormat, Utc};
-use password_hash::{SaltString, rand_core::OsRng};
 use rand::RngCore;
-use serde::Serialize;
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicI64, Ordering as AtomicOrdering},
@@ -42,7 +32,6 @@ use std::{
 };
 use tokio::sync::RwLock;
 use tracing::{debug, instrument, warn};
-use uuid::Uuid;
 
 #[derive(Default)]
 pub struct StoreOptions {
@@ -167,14 +156,10 @@ impl KnownPackagesIndex {
 
 pub struct Store {
     state: RwLock<PersistedState>,
-    state_file: PathBuf,
     tarball_backend: TarballBackend,
     state_coordinator: StateWriteCoordinator,
     auth_plugin: Option<HttpAuthPlugin>,
     auth_hook: Option<Arc<dyn AuthHook>>,
-    password_min_length: usize,
-    login_session_ttl_seconds: i64,
-    auth_token_ttl_ms: i64,
     package_cache: PackageCacheSettings,
     metadata_backend: MetadataBackend,
     strict_revision_checks: bool,
@@ -183,27 +168,18 @@ pub struct Store {
     maintenance_started: AtomicBool,
 }
 
-#[derive(Serialize)]
-struct PersistedStateView<'a> {
-    users: &'a HashMap<String, UserRecord>,
-    auth_tokens: &'a HashMap<String, AuthTokenRecord>,
-    npm_tokens: &'a Vec<NpmTokenRecord>,
-    login_sessions: &'a HashMap<String, LoginSessionRecord>,
-    packages: HashMap<&'a String, &'a PackageRecord>,
-}
-
 #[derive(Default)]
 struct MetadataOnlyMergeResult {
     tarballs_to_delete: HashSet<String>,
 }
 
 impl Store {
-    #[instrument(skip(config), fields(data_dir = %config.data_dir.display(), auth_backend = ?config.auth_plugin.backend))]
+    #[instrument(skip(config), fields(data_dir = %config.data_dir.display(), auth_backend = config.auth_plugin.is_some()))]
     pub async fn open(config: &Config) -> Result<Self, RegistryError> {
         Self::open_with_options(config, StoreOptions::default()).await
     }
 
-    #[instrument(skip(config, options), fields(data_dir = %config.data_dir.display(), auth_backend = ?config.auth_plugin.backend, embedded_auth_hook = options.auth_hook.is_some()))]
+    #[instrument(skip(config, options), fields(data_dir = %config.data_dir.display(), auth_backend = config.auth_plugin.is_some(), embedded_auth_hook = options.auth_hook.is_some()))]
     pub async fn open_with_options(
         config: &Config,
         options: StoreOptions,
@@ -222,35 +198,20 @@ impl Store {
         };
         let package_cache = PackageCacheSettings::from_env(default_discovery_mode)?;
         let strict_revision_checks = strict_revision_checks_from_env();
-        let auth_token_ttl_ms = Self::auth_token_ttl_ms_from_env();
 
-        let state_file = config.data_dir.join("state.json");
-        let mut state = Self::read_local_snapshot(&state_file).await?;
-        state.packages.clear();
+        let state = PersistedState::default();
 
-        let auth_plugin = match config.auth_plugin.backend {
-            AuthBackend::Local => None,
-            AuthBackend::Http => {
-                let plugin_cfg = config.auth_plugin.http.as_ref().ok_or_else(|| {
-                    RegistryError::http(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "auth backend http requires auth.http config",
-                    )
-                })?;
-                Some(HttpAuthPlugin::new(plugin_cfg)?)
-            }
+        let auth_plugin = match config.auth_plugin.as_ref() {
+            Some(plugin_cfg) => Some(HttpAuthPlugin::new(plugin_cfg)?),
+            None => None,
         };
 
         let store = Self {
             state: RwLock::new(state),
-            state_file,
             tarball_backend,
             state_coordinator,
             auth_plugin,
             auth_hook: options.auth_hook,
-            password_min_length: config.password_min_length,
-            login_session_ttl_seconds: config.login_session_ttl_seconds,
-            auth_token_ttl_ms,
             package_cache: package_cache.clone(),
             metadata_backend,
             strict_revision_checks,
@@ -258,7 +219,6 @@ impl Store {
             last_package_cache_prune_ms: AtomicI64::new(0),
             maintenance_started: AtomicBool::new(false),
         };
-        store.prune_expired_auth_state_now("startup").await?;
         debug!(
             discovery_mode = package_cache.discovery_mode.as_str(),
             max_entries = package_cache.max_entries,
@@ -266,8 +226,6 @@ impl Store {
             prune_interval_ms = package_cache.prune_interval_ms,
             negative_ttl_ms = package_cache.negative_ttl_ms,
             discovery_refresh_interval_ms = package_cache.discovery_refresh_interval_ms,
-            auth_token_ttl_ms,
-            login_session_ttl_seconds = config.login_session_ttl_seconds,
             metadata_backend = metadata_backend.as_str(),
             strict_revision_checks,
             "store initialized"
@@ -306,9 +264,6 @@ impl Store {
 
             loop {
                 interval.tick().await;
-                if let Err(error) = store.prune_expired_auth_state_now("scheduled").await {
-                    warn!(error = ?error, "failed to prune expired auth state");
-                }
                 store.prune_package_cache_if_due(false).await;
                 if let Err(error) = store.refresh_known_packages_if_due(false).await {
                     warn!(error = ?error, "failed to refresh known package index");
@@ -521,72 +476,6 @@ impl Store {
 
     fn package_lock_scope(package_name: &str) -> String {
         format!("package:{package_name}")
-    }
-
-    fn auth_token_ttl_ms_from_env() -> i64 {
-        const DEFAULT_AUTH_TOKEN_TTL_SECS: u64 = 30 * 24 * 60 * 60;
-        (parse_u64_env("RUSTACCIO_AUTH_TOKEN_TTL_SECS", DEFAULT_AUTH_TOKEN_TTL_SECS) as i64)
-            .saturating_mul(1_000)
-    }
-
-    fn auth_token_expires_at_ms(&self, created_at: i64) -> Option<i64> {
-        if self.auth_token_ttl_ms <= 0 {
-            None
-        } else {
-            Some(created_at.saturating_add(self.auth_token_ttl_ms))
-        }
-    }
-
-    fn auth_token_record_expired(&self, record: &AuthTokenRecord, now_ms: i64) -> bool {
-        record
-            .expires_at
-            .or_else(|| self.auth_token_expires_at_ms(record.created_at))
-            .is_some_and(|expires_at_ms| expires_at_ms <= now_ms)
-    }
-
-    fn login_session_expired(&self, created_at: i64, now_ms: i64) -> bool {
-        created_at < now_ms.saturating_sub(self.login_session_ttl_seconds.saturating_mul(1_000))
-    }
-
-    fn prune_expired_auth_state_locked(
-        &self,
-        state: &mut PersistedState,
-        now_ms: i64,
-    ) -> (usize, usize) {
-        let auth_tokens_before = state.auth_tokens.len();
-        state
-            .auth_tokens
-            .retain(|_, record| !self.auth_token_record_expired(record, now_ms));
-        let login_sessions_before = state.login_sessions.len();
-        state
-            .login_sessions
-            .retain(|_, session| !self.login_session_expired(session.created_at, now_ms));
-
-        (
-            auth_tokens_before.saturating_sub(state.auth_tokens.len()),
-            login_sessions_before.saturating_sub(state.login_sessions.len()),
-        )
-    }
-
-    async fn prune_expired_auth_state_now(
-        &self,
-        reason: &str,
-    ) -> Result<(usize, usize), RegistryError> {
-        let now_ms = Self::now_ms();
-        let (expired_auth_tokens, expired_login_sessions) = {
-            let mut state = self.state.write().await;
-            self.prune_expired_auth_state_locked(&mut state, now_ms)
-        };
-        if expired_auth_tokens == 0 && expired_login_sessions == 0 {
-            return Ok((0, 0));
-        }
-
-        self.persist_state().await?;
-        debug!(
-            expired_auth_tokens,
-            expired_login_sessions, reason, "pruned expired auth state"
-        );
-        Ok((expired_auth_tokens, expired_login_sessions))
     }
 
     async fn run_package_exclusive<T, F, Fut>(
@@ -1050,70 +939,6 @@ impl Store {
         hex::encode(buf)
     }
 
-    fn token_key(token: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(token.as_bytes());
-        hex::encode(hasher.finalize())
-    }
-
-    fn mask_token(token: &str, exposed: usize) -> String {
-        if token.len() <= exposed * 2 {
-            return "***".to_string();
-        }
-        format!(
-            "{}...{}",
-            &token[0..exposed],
-            &token[token.len() - exposed..token.len()]
-        )
-    }
-
-    async fn read_local_snapshot(state_file: &Path) -> Result<PersistedState, RegistryError> {
-        if tokio::fs::try_exists(state_file).await.unwrap_or(false) {
-            let bytes = tokio::fs::read(state_file).await?;
-            if bytes.is_empty() {
-                Ok(PersistedState::default())
-            } else {
-                Ok(serde_json::from_slice(&bytes)?)
-            }
-        } else {
-            Ok(PersistedState::default())
-        }
-    }
-
-    async fn write_local_snapshot_bytes(
-        state_file: &Path,
-        bytes: &[u8],
-    ) -> Result<(), RegistryError> {
-        let tmp_file = state_file.with_extension("json.tmp");
-        tokio::fs::write(&tmp_file, bytes).await?;
-        tokio::fs::rename(&tmp_file, state_file).await?;
-        Ok(())
-    }
-
-    async fn persist_state(&self) -> Result<(), RegistryError> {
-        self.state_coordinator
-            .run_exclusive_scoped("state", "persist_state", || async {
-                let bytes = {
-                    let state = self.state.read().await;
-                    Self::serialize_persisted_state(&state)?
-                };
-                Self::write_local_snapshot_bytes(&self.state_file, &bytes).await?;
-                Ok(())
-            })
-            .await
-    }
-
-    fn serialize_persisted_state(state: &PersistedState) -> Result<Vec<u8>, RegistryError> {
-        let view = PersistedStateView {
-            users: &state.users,
-            auth_tokens: &state.auth_tokens,
-            npm_tokens: &state.npm_tokens,
-            login_sessions: &state.login_sessions,
-            packages: HashMap::new(),
-        };
-        Ok(serde_json::to_vec_pretty(&view)?)
-    }
-
     async fn load_authoritative_package_record(
         &self,
         package_name: &str,
@@ -1372,55 +1197,6 @@ impl Store {
             .is_some()
     }
 
-    pub async fn username_from_auth_token_result(
-        &self,
-        token: &str,
-    ) -> Result<Option<String>, RegistryError> {
-        let now_ms = Self::now_ms();
-
-        enum TokenLookup {
-            Hit(String),
-            Miss,
-            Expired,
-        }
-
-        let lookup = {
-            let state = self.state.read().await;
-            match state.auth_tokens.get(token) {
-                Some(record) if self.auth_token_record_expired(record, now_ms) => {
-                    TokenLookup::Expired
-                }
-                Some(record) => TokenLookup::Hit(record.user.clone()),
-                None => TokenLookup::Miss,
-            }
-        };
-
-        match lookup {
-            TokenLookup::Hit(user) => Ok(Some(user)),
-            TokenLookup::Miss => Ok(None),
-            TokenLookup::Expired => {
-                let removed = {
-                    let mut state = self.state.write().await;
-                    if state
-                        .auth_tokens
-                        .get(token)
-                        .is_some_and(|record| self.auth_token_record_expired(record, now_ms))
-                    {
-                        state.auth_tokens.remove(token);
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if removed {
-                    self.persist_state().await?;
-                    debug!("pruned expired auth token during lookup");
-                }
-                Ok(None)
-            }
-        }
-    }
-
     pub async fn authenticate_request(
         &self,
         token: &str,
@@ -1466,24 +1242,8 @@ impl Store {
             }
         }
 
-        let local_identity = self
-            .username_from_auth_token_result(token)
-            .await?
-            .map(|username| AuthIdentity {
-                username: Some(username),
-                groups: Vec::new(),
-            });
-        if local_identity.is_some() {
-            debug!(
-                method,
-                path,
-                source = "local_token_store",
-                "request auth accepted"
-            );
-        } else {
-            debug!(method, path, "request auth yielded no identity");
-        }
-        Ok(local_identity)
+        debug!(method, path, "request auth yielded no identity");
+        Ok(None)
     }
 
     pub async fn allow_access(
@@ -1549,374 +1309,6 @@ impl Store {
             return Ok(Some(allowed));
         }
         Ok(None)
-    }
-
-    #[instrument(skip(self, password), fields(username = name))]
-    pub async fn create_user(&self, name: &str, password: &str) -> Result<String, RegistryError> {
-        if password.len() < self.password_min_length {
-            return Err(RegistryError::http(
-                StatusCode::BAD_REQUEST,
-                API_ERROR_PASSWORD_SHORT,
-            ));
-        }
-
-        let source;
-        if let Some(hook) = &self.auth_hook {
-            debug!("delegating user creation to embedded auth hook");
-            hook.add_user(name, password, self.password_min_length)
-                .await?;
-            source = "embedded auth hook";
-        } else if let Some(plugin) = &self.auth_plugin {
-            debug!("delegating user creation to auth plugin");
-            plugin
-                .add_user(name, password, self.password_min_length)
-                .await?;
-            source = "auth plugin";
-        } else {
-            let mut state = self.state.write().await;
-            if state.users.contains_key(name) {
-                return Err(RegistryError::http(
-                    StatusCode::CONFLICT,
-                    API_ERROR_USERNAME_ALREADY_REGISTERED,
-                ));
-            }
-
-            let hash = hash_password(password)?;
-            state.users.insert(
-                name.to_string(),
-                UserRecord {
-                    password_hash: hash,
-                    created_at: Self::now_ms(),
-                },
-            );
-            source = "local auth store";
-        }
-
-        let token = {
-            let mut state = self.state.write().await;
-            let created_at = Self::now_ms();
-            let token = Self::random_token_hex(24);
-            state.auth_tokens.insert(
-                token.clone(),
-                AuthTokenRecord {
-                    user: name.to_string(),
-                    created_at,
-                    expires_at: self.auth_token_expires_at_ms(created_at),
-                },
-            );
-            token
-        };
-
-        self.persist_state().await?;
-        debug!(source, "created user");
-        Ok(token)
-    }
-
-    #[instrument(skip(self, password), fields(username = name))]
-    pub async fn login_user(&self, name: &str, password: &str) -> Result<String, RegistryError> {
-        if let Some(hook) = &self.auth_hook {
-            debug!("delegating login to embedded auth hook");
-            hook.authenticate(name, password).await?;
-        } else if let Some(plugin) = &self.auth_plugin {
-            debug!("delegating login to auth plugin");
-            plugin.authenticate(name, password).await?;
-        } else {
-            let state = self.state.read().await;
-            let Some(user) = state.users.get(name) else {
-                return Err(RegistryError::http(
-                    StatusCode::UNAUTHORIZED,
-                    API_ERROR_BAD_USERNAME_PASSWORD,
-                ));
-            };
-            verify_password(&user.password_hash, password)?;
-        }
-
-        let token = {
-            let mut state = self.state.write().await;
-            let created_at = Self::now_ms();
-            let token = Self::random_token_hex(24);
-            state.auth_tokens.insert(
-                token.clone(),
-                AuthTokenRecord {
-                    user: name.to_string(),
-                    created_at,
-                    expires_at: self.auth_token_expires_at_ms(created_at),
-                },
-            );
-            token
-        };
-
-        self.persist_state().await?;
-        debug!("user login succeeded");
-        Ok(token)
-    }
-
-    pub async fn verify_credentials(
-        &self,
-        name: &str,
-        password: &str,
-    ) -> Result<(), RegistryError> {
-        if let Some(hook) = &self.auth_hook {
-            return hook.authenticate(name, password).await;
-        }
-        if let Some(plugin) = &self.auth_plugin {
-            return plugin.authenticate(name, password).await;
-        }
-
-        let state = self.state.read().await;
-        let Some(user) = state.users.get(name) else {
-            return Err(RegistryError::http(
-                StatusCode::UNAUTHORIZED,
-                API_ERROR_BAD_USERNAME_PASSWORD,
-            ));
-        };
-        verify_password(&user.password_hash, password)
-    }
-
-    #[instrument(skip(self, old, new), fields(username = name))]
-    pub async fn change_password(
-        &self,
-        name: &str,
-        old: &str,
-        new: &str,
-    ) -> Result<(), RegistryError> {
-        if let Some(hook) = &self.auth_hook {
-            return hook
-                .change_password(name, old, new, self.password_min_length)
-                .await;
-        }
-        if let Some(plugin) = &self.auth_plugin {
-            return plugin
-                .change_password(name, old, new, self.password_min_length)
-                .await;
-        }
-
-        if new.len() < self.password_min_length {
-            return Err(RegistryError::http(
-                StatusCode::UNAUTHORIZED,
-                API_ERROR_PASSWORD_SHORT,
-            ));
-        }
-
-        {
-            let mut state = self.state.write().await;
-            let Some(user) = state.users.get_mut(name) else {
-                return Err(RegistryError::http(
-                    StatusCode::UNAUTHORIZED,
-                    API_ERROR_BAD_USERNAME_PASSWORD,
-                ));
-            };
-            verify_password(&user.password_hash, old).map_err(|_| {
-                RegistryError::http(StatusCode::FORBIDDEN, API_ERROR_BAD_USERNAME_PASSWORD)
-            })?;
-            user.password_hash = hash_password(new)?;
-        }
-
-        self.persist_state().await?;
-        debug!("password changed");
-        Ok(())
-    }
-
-    #[instrument(skip(self))]
-    pub async fn create_login_session(&self) -> Result<String, RegistryError> {
-        let session_id = Uuid::new_v4().to_string();
-        {
-            let mut state = self.state.write().await;
-            state.login_sessions.insert(
-                session_id.clone(),
-                LoginSessionRecord {
-                    token: String::new(),
-                    created_at: Self::now_ms(),
-                },
-            );
-        }
-        self.persist_state().await?;
-        debug!("created login session");
-        Ok(session_id)
-    }
-
-    pub async fn set_login_session_token(
-        &self,
-        session_id: &str,
-        token: String,
-    ) -> Result<(), RegistryError> {
-        let now_ms = Self::now_ms();
-
-        enum LoginSessionUpdate {
-            Updated,
-            Missing,
-            Expired,
-        }
-
-        let outcome = {
-            let mut state = self.state.write().await;
-            match state
-                .login_sessions
-                .get(session_id)
-                .map(|session| session.created_at)
-            {
-                Some(created_at) if self.login_session_expired(created_at, now_ms) => {
-                    state.login_sessions.remove(session_id);
-                    LoginSessionUpdate::Expired
-                }
-                Some(_) => {
-                    if let Some(session) = state.login_sessions.get_mut(session_id) {
-                        session.token = token;
-                        session.created_at = now_ms;
-                    }
-                    LoginSessionUpdate::Updated
-                }
-                None => LoginSessionUpdate::Missing,
-            }
-        };
-
-        match outcome {
-            LoginSessionUpdate::Updated => {
-                self.persist_state().await?;
-                Ok(())
-            }
-            LoginSessionUpdate::Missing => Err(RegistryError::http(
-                StatusCode::BAD_REQUEST,
-                API_ERROR_SESSION_ID_INVALID,
-            )),
-            LoginSessionUpdate::Expired => {
-                self.persist_state().await?;
-                warn!("login session expired before token assignment");
-                Err(RegistryError::http(
-                    StatusCode::UNAUTHORIZED,
-                    API_ERROR_SESSION_TOKEN_EXPIRED,
-                ))
-            }
-        }
-    }
-
-    #[instrument(skip(self), fields(session_id))]
-    pub async fn poll_login_session(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<String>, RegistryError> {
-        let now_ms = Self::now_ms();
-
-        enum LoginSessionPoll {
-            Missing,
-            Pending,
-            Ready(String),
-            Expired,
-        }
-
-        let outcome = {
-            let mut state = self.state.write().await;
-            match state
-                .login_sessions
-                .get(session_id)
-                .map(|session| session.created_at)
-            {
-                Some(created_at) if self.login_session_expired(created_at, now_ms) => {
-                    state.login_sessions.remove(session_id);
-                    LoginSessionPoll::Expired
-                }
-                Some(_) => {
-                    let Some(session) = state.login_sessions.get(session_id) else {
-                        return Err(RegistryError::http(
-                            StatusCode::BAD_REQUEST,
-                            API_ERROR_SESSION_ID_INVALID,
-                        ));
-                    };
-
-                    if session.token.is_empty() {
-                        LoginSessionPoll::Pending
-                    } else {
-                        let token = session.token.clone();
-                        state.login_sessions.remove(session_id);
-                        LoginSessionPoll::Ready(token)
-                    }
-                }
-                None => LoginSessionPoll::Missing,
-            }
-        };
-
-        match outcome {
-            LoginSessionPoll::Missing => Err(RegistryError::http(
-                StatusCode::BAD_REQUEST,
-                API_ERROR_SESSION_ID_INVALID,
-            )),
-            LoginSessionPoll::Pending => Ok(None),
-            LoginSessionPoll::Ready(token) => {
-                self.persist_state().await?;
-                debug!("login session completed");
-                Ok(Some(token))
-            }
-            LoginSessionPoll::Expired => {
-                self.persist_state().await?;
-                warn!("login session token expired");
-                Err(RegistryError::http(
-                    StatusCode::UNAUTHORIZED,
-                    API_ERROR_SESSION_TOKEN_EXPIRED,
-                ))
-            }
-        }
-    }
-
-    pub async fn list_npm_tokens(&self, user: &str) -> Vec<NpmTokenRecord> {
-        let state = self.state.read().await;
-        state
-            .npm_tokens
-            .iter()
-            .filter(|token| token.user == user)
-            .cloned()
-            .collect()
-    }
-
-    #[instrument(skip(self, password, cidr_whitelist), fields(username = user, readonly))]
-    pub async fn create_npm_token(
-        &self,
-        user: &str,
-        password: &str,
-        readonly: bool,
-        cidr_whitelist: Vec<String>,
-    ) -> Result<(NpmTokenRecord, String), RegistryError> {
-        self.verify_credentials(user, password).await?;
-
-        let raw_token = Self::random_token_hex(24);
-        let token_key = Self::token_key(&raw_token);
-
-        let token = NpmTokenRecord {
-            user: user.to_string(),
-            token: Self::mask_token(&raw_token, 5),
-            key: token_key.clone(),
-            auth_key: token_key.clone(),
-            cidr: cidr_whitelist,
-            readonly,
-            created: Self::now_ms(),
-        };
-
-        {
-            let mut state = self.state.write().await;
-            state.npm_tokens.push(token.clone());
-        }
-
-        self.persist_state().await?;
-        debug!("created npm token");
-        Ok((token, raw_token))
-    }
-
-    #[instrument(skip(self), fields(username = user))]
-    pub async fn delete_npm_token(&self, user: &str, token_key: &str) -> Result<(), RegistryError> {
-        let changed = {
-            let mut state = self.state.write().await;
-            let before = state.npm_tokens.len();
-            state
-                .npm_tokens
-                .retain(|token| !(token.user == user && token.key == token_key));
-            before != state.npm_tokens.len()
-        };
-        if !changed {
-            return Ok(());
-        }
-
-        self.persist_state().await?;
-        debug!("deleted npm token");
-        Ok(())
     }
 
     fn package_record<'a>(
@@ -3327,60 +2719,6 @@ impl Store {
         out
     }
 
-    pub fn normalize_token_response(token: &NpmTokenRecord, raw_token: Option<String>) -> Value {
-        json!({
-            "token": raw_token.unwrap_or_else(|| token.token.clone()),
-            "key": token.key,
-            "cidr": token.cidr,
-            "cidr_whitelist": token.cidr,
-            "readonly": token.readonly,
-            "created": chrono::DateTime::from_timestamp_millis(token.created)
-                .unwrap_or_else(Utc::now)
-                .to_rfc3339(),
-            "user": token.user,
-        })
-    }
-
-    pub fn format_logged_user(name: &str) -> String {
-        format!("you are authenticated as '{name}'")
-    }
-
-    pub fn validate_user_name(route_param: &str, body_name: &str) -> bool {
-        route_param
-            .split_once(':')
-            .map(|(_, n)| n == body_name)
-            .unwrap_or(false)
-    }
-
-    pub fn validate_password_length(&self, password: Option<&str>) -> Result<(), RegistryError> {
-        let Some(password) = password else {
-            return Err(RegistryError::http(
-                StatusCode::BAD_REQUEST,
-                API_ERROR_PASSWORD_SHORT,
-            ));
-        };
-        if password.len() < self.password_min_length {
-            return Err(RegistryError::http(
-                StatusCode::BAD_REQUEST,
-                API_ERROR_PASSWORD_SHORT,
-            ));
-        }
-        Ok(())
-    }
-
-    pub fn token_list_response(&self, tokens: Vec<NpmTokenRecord>) -> Value {
-        let objects: Vec<Value> = tokens
-            .iter()
-            .map(|token| Self::normalize_token_response(token, None))
-            .collect();
-        json!({
-            "objects": objects,
-            "urls": {
-                "next": ""
-            }
-        })
-    }
-
     pub fn parse_star_key(raw: &str) -> String {
         raw.trim_matches('"').trim_matches('\'').to_string()
     }
@@ -3419,79 +2757,12 @@ impl Store {
         Ok((readonly, cidr_whitelist))
     }
 
-    pub fn ensure_session_id(session_id: Option<&str>) -> Result<&str, RegistryError> {
-        let Some(session_id) = session_id else {
-            return Err(RegistryError::http(
-                StatusCode::BAD_REQUEST,
-                API_ERROR_SESSION_ID_REQUIRED,
-            ));
-        };
-        if session_id.len() != 36 {
-            return Err(RegistryError::http(
-                StatusCode::BAD_REQUEST,
-                API_ERROR_SESSION_ID_INVALID,
-            ));
-        }
-        Ok(session_id)
-    }
-
-    pub fn ensure_profile_body_valid(
-        password_old: Option<&str>,
-        password_new: Option<&str>,
-        tfa_present: bool,
-        min_len: usize,
-    ) -> Result<(), RegistryError> {
-        if tfa_present {
-            return Err(RegistryError::http(
-                StatusCode::SERVICE_UNAVAILABLE,
-                API_ERROR_TFA_DISABLED,
-            ));
-        }
-
-        if let Some(new) = password_new {
-            if new.len() < min_len {
-                return Err(RegistryError::http(
-                    StatusCode::UNAUTHORIZED,
-                    API_ERROR_PASSWORD_SHORT,
-                ));
-            }
-            if password_old.unwrap_or_default().is_empty() {
-                return Err(RegistryError::http(
-                    StatusCode::BAD_REQUEST,
-                    "old password is required",
-                ));
-            }
-            return Ok(());
-        }
-
-        Err(RegistryError::http(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            API_ERROR_PROFILE_ERROR,
-        ))
-    }
-
     pub fn login_required_message() -> &'static str {
         API_ERROR_MUST_BE_LOGGED
     }
 
     pub fn unauthorized_access_message() -> &'static str {
         API_ERROR_UNAUTHORIZED_ACCESS
-    }
-
-    pub fn bad_username_password_message() -> &'static str {
-        API_ERROR_BAD_USERNAME_PASSWORD
-    }
-
-    pub fn username_mismatch_message() -> &'static str {
-        API_ERROR_USERNAME_MISMATCH
-    }
-
-    pub fn logged_out_message() -> &'static str {
-        API_MESSAGE_LOGGED_OUT
-    }
-
-    pub fn session_expired_message() -> &'static str {
-        API_ERROR_SESSION_TOKEN_EXPIRED
     }
 
     pub fn package_removed_message() -> &'static str {
@@ -3521,21 +2792,6 @@ impl Store {
     pub fn unsupported_registry_call_message() -> &'static str {
         API_ERROR_UNSUPPORTED_REGISTRY_CALL
     }
-}
-
-fn hash_password(password: &str) -> Result<String, RegistryError> {
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map(|hash| hash.to_string())
-        .map_err(|_| RegistryError::Internal)
-}
-
-fn verify_password(hash: &str, password: &str) -> Result<(), RegistryError> {
-    let parsed_hash = PasswordHash::new(hash).map_err(|_| RegistryError::Internal)?;
-    Argon2::default()
-        .verify_password(password.as_bytes(), &parsed_hash)
-        .map_err(|_| RegistryError::http(StatusCode::UNAUTHORIZED, API_ERROR_BAD_USERNAME_PASSWORD))
 }
 
 pub fn default_profile(name: &str) -> Value {
@@ -3765,11 +3021,7 @@ pub fn ok_object() -> Value {
 #[cfg(test)]
 mod tests {
     use super::{PackageCacheSettings, PackageDiscoveryMode, Store};
-    use crate::{
-        config::Config,
-        error::RegistryError,
-        models::{AuthTokenRecord, LoginSessionRecord, PackageRecord, PersistedState},
-    };
+    use crate::{config::Config, error::RegistryError, models::PackageRecord};
     use axum::http::StatusCode;
     use serde_json::{Map, Value, json};
     use std::{io::Write, path::Path};
@@ -3974,158 +3226,5 @@ mod tests {
         assert!(
             matches!(err, RegistryError::Http { status, .. } if status == StatusCode::CONFLICT)
         );
-    }
-
-    #[tokio::test]
-    async fn startup_prunes_expired_auth_tokens_and_login_sessions() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let data_dir = temp.path().join("registry");
-        tokio::fs::create_dir_all(&data_dir)
-            .await
-            .expect("create data dir");
-
-        let now_ms = Store::now_ms();
-        let mut state = PersistedState::default();
-        state.auth_tokens.insert(
-            "expired-token".to_string(),
-            AuthTokenRecord {
-                user: "alice".to_string(),
-                created_at: now_ms - (31_i64 * 24 * 60 * 60 * 1_000),
-                expires_at: None,
-            },
-        );
-        state.auth_tokens.insert(
-            "fresh-token".to_string(),
-            AuthTokenRecord {
-                user: "bob".to_string(),
-                created_at: now_ms,
-                expires_at: Some(now_ms + 60_000),
-            },
-        );
-        state.login_sessions.insert(
-            "expired-session".to_string(),
-            LoginSessionRecord {
-                token: String::new(),
-                created_at: now_ms - 180_000,
-            },
-        );
-        state.login_sessions.insert(
-            "fresh-session".to_string(),
-            LoginSessionRecord {
-                token: String::new(),
-                created_at: now_ms,
-            },
-        );
-
-        tokio::fs::write(
-            data_dir.join("state.json"),
-            serde_json::to_vec_pretty(&state).expect("serialize state"),
-        )
-        .await
-        .expect("write state file");
-
-        let config = config_for_data_dir(&data_dir);
-        let store = Store::open(&config).await.expect("open store");
-
-        assert_eq!(
-            store
-                .username_from_auth_token_result("expired-token")
-                .await
-                .expect("expired token lookup"),
-            None
-        );
-        assert_eq!(
-            store
-                .username_from_auth_token_result("fresh-token")
-                .await
-                .expect("fresh token lookup"),
-            Some("bob".to_string())
-        );
-
-        let state = store.state.read().await;
-        assert!(!state.auth_tokens.contains_key("expired-token"));
-        assert!(state.auth_tokens.contains_key("fresh-token"));
-        assert!(!state.login_sessions.contains_key("expired-session"));
-        assert!(state.login_sessions.contains_key("fresh-session"));
-    }
-
-    #[tokio::test]
-    async fn local_auth_tokens_get_expiry_timestamp() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let data_dir = temp.path().join("registry");
-        let config = config_for_data_dir(&data_dir);
-        let store = Store::open(&config).await.expect("open store");
-
-        let token = store
-            .create_user("expiry-user", "secret")
-            .await
-            .expect("create user");
-
-        let state = store.state.read().await;
-        let record = state.auth_tokens.get(&token).expect("auth token stored");
-        assert_eq!(
-            record.expires_at,
-            store.auth_token_expires_at_ms(record.created_at)
-        );
-        assert!(record.expires_at.is_some());
-    }
-
-    #[tokio::test]
-    async fn expired_auth_token_is_pruned_on_lookup() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let data_dir = temp.path().join("registry");
-        let config = config_for_data_dir(&data_dir);
-        let store = Store::open(&config).await.expect("open store");
-
-        {
-            let mut state = store.state.write().await;
-            state.auth_tokens.insert(
-                "expired-token".to_string(),
-                AuthTokenRecord {
-                    user: "alice".to_string(),
-                    created_at: Store::now_ms() - (31_i64 * 24 * 60 * 60 * 1_000),
-                    expires_at: None,
-                },
-            );
-        }
-
-        assert_eq!(
-            store
-                .username_from_auth_token_result("expired-token")
-                .await
-                .expect("expired token lookup"),
-            None
-        );
-        let state = store.state.read().await;
-        assert!(!state.auth_tokens.contains_key("expired-token"));
-    }
-
-    #[tokio::test]
-    async fn poll_login_session_rejects_and_prunes_expired_session() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let data_dir = temp.path().join("registry");
-        let config = config_for_data_dir(&data_dir);
-        let store = Store::open(&config).await.expect("open store");
-
-        {
-            let mut state = store.state.write().await;
-            state.login_sessions.insert(
-                "expired-session".to_string(),
-                LoginSessionRecord {
-                    token: String::new(),
-                    created_at: Store::now_ms() - 180_000,
-                },
-            );
-        }
-
-        let err = store
-            .poll_login_session("expired-session")
-            .await
-            .expect_err("expired session should fail");
-        assert!(
-            matches!(err, RegistryError::Http { status, .. } if status == StatusCode::UNAUTHORIZED)
-        );
-        let state = store.state.read().await;
-        assert!(!state.login_sessions.contains_key("expired-session"));
     }
 }

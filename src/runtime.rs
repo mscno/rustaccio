@@ -2,7 +2,7 @@ use crate::{
     acl::Acl,
     app::{AdminAccessConfig, AppState, build_router},
     auth::AuthHook,
-    config::{AuthBackend, Config, TarballStorageBackend},
+    config::{Config, TarballStorageBackend},
     error::RegistryError,
     events::EventDispatcher,
     governance::GovernanceEngine,
@@ -71,13 +71,11 @@ pub async fn build_state(
         uplinks,
         web_enabled: config.web_enabled,
         web_title: config.web_title.clone(),
-        web_login_enabled: config.web_login,
         publish_check_owners: config.publish_check_owners,
         max_body_size: config.max_body_size,
         audit_enabled: config.audit_enabled,
         url_prefix: config.url_prefix.clone(),
         trust_proxy: config.trust_proxy,
-        auth_external_mode: config.auth_plugin.external_mode,
     })
 }
 
@@ -329,24 +327,16 @@ fn validate_managed_mode_guardrails_with_flag(
         ));
     }
 
-    if !config.auth_plugin.external_mode {
-        return Err(RegistryError::http(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "RUSTACCIO_MANAGED_MODE=true requires auth.plugin.externalMode=true",
-        ));
-    }
-    if config.auth_plugin.backend != AuthBackend::Http {
+    let Some(auth_plugin) = config.auth_plugin.as_ref() else {
         return Err(RegistryError::http(
             StatusCode::INTERNAL_SERVER_ERROR,
             "RUSTACCIO_MANAGED_MODE=true requires RUSTACCIO_AUTH_BACKEND=http",
         ));
-    }
+    };
 
-    let has_request_auth_endpoint = config
-        .auth_plugin
-        .http
-        .as_ref()
-        .and_then(|http| http.request_auth_endpoint.as_deref())
+    let has_request_auth_endpoint = auth_plugin
+        .request_auth_endpoint
+        .as_deref()
         .is_some_and(|endpoint| !endpoint.trim().is_empty());
     if !has_request_auth_endpoint {
         return Err(RegistryError::http(
@@ -512,16 +502,22 @@ mod tests {
     };
     use crate::{
         app::AdminAccessConfig,
-        config::{
-            AuthBackend, AuthPluginConfig, Config, TarballStorageBackend, TarballStorageConfig,
-            default_http_auth_config_for_examples,
-        },
+        config::{Config, HttpAuthPluginConfig, TarballStorageBackend, TarballStorageConfig},
     };
 
-    fn config_with_external_mode(external_mode: bool) -> Config {
-        let mut http = default_http_auth_config_for_examples();
-        http.base_url = "http://auth.local".to_string();
-        http.request_auth_endpoint = Some("/request-auth".to_string());
+    fn config_with_auth(enabled: bool) -> Config {
+        let auth_plugin = if enabled {
+            Some(HttpAuthPluginConfig {
+                base_url: "http://auth.local".to_string(),
+                request_auth_endpoint: Some("/request-auth".to_string()),
+                allow_access_endpoint: None,
+                allow_publish_endpoint: None,
+                allow_unpublish_endpoint: None,
+                timeout_ms: 5000,
+            })
+        } else {
+            None
+        };
         Config {
             bind: "127.0.0.1:4873".parse().expect("bind"),
             data_dir: std::env::temp_dir(),
@@ -531,21 +527,14 @@ mod tests {
             acl_rules: vec![crate::acl::PackageRule::open("**")],
             web_enabled: true,
             web_title: "Rustaccio".to_string(),
-            web_login: true,
             publish_check_owners: false,
-            password_min_length: 3,
-            login_session_ttl_seconds: 600,
             max_body_size: 50 * 1024 * 1024,
             audit_enabled: true,
             url_prefix: "/".to_string(),
             trust_proxy: false,
             keep_alive_timeout_secs: None,
             log_level: "info".to_string(),
-            auth_plugin: AuthPluginConfig {
-                backend: AuthBackend::Http,
-                external_mode,
-                http: Some(http),
-            },
+            auth_plugin,
             tarball_storage: TarballStorageConfig {
                 backend: TarballStorageBackend::Local,
                 s3: None,
@@ -562,14 +551,14 @@ mod tests {
 
     #[test]
     fn managed_mode_guardrails_allow_simple_mode_defaults() {
-        let config = config_with_external_mode(false);
+        let config = config_with_auth(false);
         let admin = AdminAccessConfig::default();
         assert!(validate_managed_mode_guardrails_with_flag(false, &config, &admin).is_ok());
     }
 
     #[test]
     fn managed_mode_guardrails_reject_any_authenticated_admin_access() {
-        let config = config_with_external_mode(true);
+        let config = config_with_auth(true);
         let admin = AdminAccessConfig {
             allow_any_authenticated: true,
             users: vec!["ops".to_string()],
@@ -585,7 +574,7 @@ mod tests {
 
     #[test]
     fn managed_mode_guardrails_reject_missing_admin_principals() {
-        let config = config_with_external_mode(true);
+        let config = config_with_auth(true);
         let admin = AdminAccessConfig {
             allow_any_authenticated: false,
             users: Vec::new(),
@@ -600,34 +589,8 @@ mod tests {
     }
 
     #[test]
-    fn managed_mode_guardrails_require_external_auth_mode() {
-        let config = config_with_external_mode(false);
-        let admin = AdminAccessConfig {
-            allow_any_authenticated: false,
-            users: vec!["ops".to_string()],
-            groups: Vec::new(),
-        };
-        let err = validate_managed_mode_guardrails_with_flag(true, &config, &admin)
-            .expect_err("must fail");
-        assert!(err.to_string().contains("auth.plugin.externalMode=true"));
-    }
-
-    #[test]
-    fn managed_mode_guardrails_accept_external_mode_with_explicit_admins() {
-        let config = config_with_external_mode(true);
-        let admin = AdminAccessConfig {
-            allow_any_authenticated: false,
-            users: vec!["ops".to_string()],
-            groups: vec!["platform-admins".to_string()],
-        };
-        assert!(validate_managed_mode_guardrails_with_flag(true, &config, &admin).is_ok());
-    }
-
-    #[test]
-    fn managed_mode_guardrails_require_http_auth_backend() {
-        let mut config = config_with_external_mode(true);
-        config.auth_plugin.backend = AuthBackend::Local;
-        config.auth_plugin.http = None;
+    fn managed_mode_guardrails_require_auth_plugin() {
+        let config = config_with_auth(false);
         let admin = AdminAccessConfig {
             allow_any_authenticated: false,
             users: vec!["ops".to_string()],
@@ -639,10 +602,21 @@ mod tests {
     }
 
     #[test]
+    fn managed_mode_guardrails_accept_external_mode_with_explicit_admins() {
+        let config = config_with_auth(true);
+        let admin = AdminAccessConfig {
+            allow_any_authenticated: false,
+            users: vec!["ops".to_string()],
+            groups: vec!["platform-admins".to_string()],
+        };
+        assert!(validate_managed_mode_guardrails_with_flag(true, &config, &admin).is_ok());
+    }
+
+    #[test]
     fn managed_mode_guardrails_require_request_auth_endpoint() {
-        let mut config = config_with_external_mode(true);
-        if let Some(http) = config.auth_plugin.http.as_mut() {
-            http.request_auth_endpoint = None;
+        let mut config = config_with_auth(true);
+        if let Some(plugin) = config.auth_plugin.as_mut() {
+            plugin.request_auth_endpoint = None;
         }
         let admin = AdminAccessConfig {
             allow_any_authenticated: false,

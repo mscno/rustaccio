@@ -4,10 +4,9 @@ use axum::{
     body::Body,
     http::{Method, Request, StatusCode, header},
 };
-use http_body_util::BodyExt;
 use redis::aio::MultiplexedConnection;
 use rustaccio::{
-    config::{AuthBackend, AuthPluginConfig, Config, TarballStorageBackend, TarballStorageConfig},
+    config::{Config, TarballStorageBackend, TarballStorageConfig},
     runtime,
 };
 use serde_json::json;
@@ -16,6 +15,8 @@ use tempfile::TempDir;
 use tokio_postgres::NoTls;
 use tower::ServiceExt;
 use uuid::Uuid;
+
+mod common;
 
 static ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
@@ -29,21 +30,14 @@ fn base_config(data_dir: std::path::PathBuf) -> Config {
         acl_rules: vec![rustaccio::acl::PackageRule::open("**")],
         web_enabled: true,
         web_title: "Rustaccio".to_string(),
-        web_login: false,
         publish_check_owners: false,
-        password_min_length: 3,
-        login_session_ttl_seconds: 120,
         max_body_size: 50 * 1024 * 1024,
         audit_enabled: true,
         url_prefix: "/".to_string(),
         trust_proxy: false,
         keep_alive_timeout_secs: None,
         log_level: "info".to_string(),
-        auth_plugin: AuthPluginConfig {
-            backend: AuthBackend::Local,
-            external_mode: false,
-            http: None,
-        },
+        auth_plugin: None,
         tarball_storage: TarballStorageConfig {
             backend: TarballStorageBackend::Local,
             s3: None,
@@ -193,31 +187,6 @@ fn publish_manifest(name: &str) -> serde_json::Value {
     })
 }
 
-async fn create_user(app: &axum::Router, username: &str, password: &str) -> String {
-    let req = Request::builder()
-        .method(Method::PUT)
-        .uri(format!("/-/user/org.couchdb.user:{username}"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({"name": username, "password": password})).expect("payload"),
-        ))
-        .expect("request");
-    let resp = app.clone().oneshot(req).await.expect("response");
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let body = resp
-        .into_body()
-        .collect()
-        .await
-        .expect("collect")
-        .to_bytes();
-    serde_json::from_slice::<serde_json::Value>(&body)
-        .expect("json")
-        .get("token")
-        .and_then(serde_json::Value::as_str)
-        .expect("token")
-        .to_string()
-}
-
 #[tokio::test]
 #[ignore = "requires local Redis (`just governance-up`)"]
 async fn redis_rate_limiter_enforces_limit() {
@@ -233,9 +202,13 @@ async fn redis_rate_limiter_enforces_limit() {
             ("RUSTACCIO_MANAGED_MODE", Some("true")),
             ("RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED", Some("false")),
             ("RUSTACCIO_ADMIN_USERS", Some("ops")),
-            ("RUSTACCIO_AUTH_EXTERNAL_MODE", Some("true")),
             ("RUSTACCIO_RATE_LIMIT_BACKEND", Some("redis")),
             ("RUSTACCIO_RATE_LIMIT_REDIS_URL", Some(redis_url.as_str())),
+            ("RUSTACCIO_STATE_COORDINATION_BACKEND", Some("redis")),
+            (
+                "RUSTACCIO_STATE_COORDINATION_REDIS_URL",
+                Some(redis_url.as_str()),
+            ),
             ("RUSTACCIO_RATE_LIMIT_REQUESTS_PER_WINDOW", Some("2")),
             ("RUSTACCIO_RATE_LIMIT_WINDOW_SECS", Some("60")),
             ("RUSTACCIO_RATE_LIMIT_FAIL_OPEN", Some("false")),
@@ -247,8 +220,10 @@ async fn redis_rate_limiter_enforces_limit() {
             ("RUSTACCIO_METRICS_BACKEND", Some("none")),
         ],
         async {
+            let auth = common::start_token_echo_auth().await;
             let dir = TempDir::new().expect("dir");
-            let cfg = base_config(dir.path().to_path_buf());
+            let mut cfg = base_config(dir.path().to_path_buf());
+            cfg.auth_plugin = Some(common::external_auth_plugin(&auth.uri()));
             let app = app_with_env(&cfg).await;
 
             for index in 0..3 {
@@ -281,10 +256,14 @@ async fn redis_rate_limiter_fail_open_allows_when_backend_is_down() {
             ("RUSTACCIO_MANAGED_MODE", Some("true")),
             ("RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED", Some("false")),
             ("RUSTACCIO_ADMIN_USERS", Some("ops")),
-            ("RUSTACCIO_AUTH_EXTERNAL_MODE", Some("true")),
             ("RUSTACCIO_RATE_LIMIT_BACKEND", Some("redis")),
             (
                 "RUSTACCIO_RATE_LIMIT_REDIS_URL",
+                Some("redis://127.0.0.1:1/"),
+            ),
+            ("RUSTACCIO_STATE_COORDINATION_BACKEND", Some("redis")),
+            (
+                "RUSTACCIO_STATE_COORDINATION_REDIS_URL",
                 Some("redis://127.0.0.1:1/"),
             ),
             ("RUSTACCIO_RATE_LIMIT_REQUESTS_PER_WINDOW", Some("1")),
@@ -298,8 +277,10 @@ async fn redis_rate_limiter_fail_open_allows_when_backend_is_down() {
             ("RUSTACCIO_METRICS_BACKEND", Some("none")),
         ],
         async {
+            let auth = common::start_token_echo_auth().await;
             let dir = TempDir::new().expect("dir");
-            let cfg = base_config(dir.path().to_path_buf());
+            let mut cfg = base_config(dir.path().to_path_buf());
+            cfg.auth_plugin = Some(common::external_auth_plugin(&auth.uri()));
             let app = app_with_env(&cfg).await;
 
             for _ in 0..2 {
@@ -328,10 +309,14 @@ async fn redis_rate_limiter_fail_closed_rejects_when_backend_is_down() {
             ("RUSTACCIO_MANAGED_MODE", Some("true")),
             ("RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED", Some("false")),
             ("RUSTACCIO_ADMIN_USERS", Some("ops")),
-            ("RUSTACCIO_AUTH_EXTERNAL_MODE", Some("true")),
             ("RUSTACCIO_RATE_LIMIT_BACKEND", Some("redis")),
             (
                 "RUSTACCIO_RATE_LIMIT_REDIS_URL",
+                Some("redis://127.0.0.1:1/"),
+            ),
+            ("RUSTACCIO_STATE_COORDINATION_BACKEND", Some("redis")),
+            (
+                "RUSTACCIO_STATE_COORDINATION_REDIS_URL",
                 Some("redis://127.0.0.1:1/"),
             ),
             ("RUSTACCIO_RATE_LIMIT_REQUESTS_PER_WINDOW", Some("1")),
@@ -345,8 +330,10 @@ async fn redis_rate_limiter_fail_closed_rejects_when_backend_is_down() {
             ("RUSTACCIO_METRICS_BACKEND", Some("none")),
         ],
         async {
+            let auth = common::start_token_echo_auth().await;
             let dir = TempDir::new().expect("dir");
-            let cfg = base_config(dir.path().to_path_buf());
+            let mut cfg = base_config(dir.path().to_path_buf());
+            cfg.auth_plugin = Some(common::external_auth_plugin(&auth.uri()));
             let app = app_with_env(&cfg).await;
 
             let req = Request::builder()
@@ -376,9 +363,13 @@ async fn postgres_quota_migrations_and_limits_are_enforced() {
             ("RUSTACCIO_MANAGED_MODE", Some("true")),
             ("RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED", Some("false")),
             ("RUSTACCIO_ADMIN_USERS", Some("ops")),
-            ("RUSTACCIO_AUTH_EXTERNAL_MODE", Some("true")),
             ("RUSTACCIO_RATE_LIMIT_BACKEND", Some("redis")),
             ("RUSTACCIO_RATE_LIMIT_REDIS_URL", Some(redis_url.as_str())),
+            ("RUSTACCIO_STATE_COORDINATION_BACKEND", Some("redis")),
+            (
+                "RUSTACCIO_STATE_COORDINATION_REDIS_URL",
+                Some(redis_url.as_str()),
+            ),
             ("RUSTACCIO_RATE_LIMIT_REQUESTS_PER_WINDOW", Some("0")),
             ("RUSTACCIO_RATE_LIMIT_WINDOW_SECS", Some("60")),
             ("RUSTACCIO_QUOTA_BACKEND", Some("postgres")),
@@ -390,8 +381,10 @@ async fn postgres_quota_migrations_and_limits_are_enforced() {
             ("RUSTACCIO_METRICS_BACKEND", Some("none")),
         ],
         async {
+            let auth = common::start_token_echo_auth().await;
             let dir = TempDir::new().expect("dir");
-            let cfg = base_config(dir.path().to_path_buf());
+            let mut cfg = base_config(dir.path().to_path_buf());
+            cfg.auth_plugin = Some(common::external_auth_plugin(&auth.uri()));
             let app = app_with_env(&cfg).await;
 
             let db = postgres_client(&postgres_url).await;
@@ -415,8 +408,9 @@ async fn postgres_quota_migrations_and_limits_are_enforced() {
                 .get(0);
             assert!(table_exists);
 
-            let user = format!("pg-it-{}", Uuid::new_v4().as_simple());
-            let token = create_user(&app, &user, "secret").await;
+            // The mock auth service treats the bearer token as the username, so
+            // publishing as `Bearer <user>` authenticates as that user.
+            let token = format!("pg-it-{}", Uuid::new_v4().as_simple());
             for (idx, pkg) in ["pg-it-pkg-one", "pg-it-pkg-two"].iter().enumerate() {
                 let req = Request::builder()
                     .method(Method::PUT)

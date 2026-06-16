@@ -1,6 +1,4 @@
-use crate::config::{
-    Config, default_http_auth_config_for_examples, default_s3_storage_config_for_examples,
-};
+use crate::config::{Config, default_s3_storage_config_for_examples};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -39,7 +37,6 @@ pub fn render_env_example(repo_root: &Path) -> Result<String, String> {
 
 pub fn render_config_example() -> String {
     let cfg = Config::defaults_for_examples();
-    let auth_http = default_http_auth_config_for_examples();
     let s3 = default_s3_storage_config_for_examples();
 
     format!(
@@ -68,9 +65,6 @@ web:
   enable: {web_enabled}
   title: {web_title}
 
-flags:
-  webLogin: {web_login}
-
 publish:
   check_owners: {publish_check_owners}
 
@@ -90,14 +84,12 @@ log:
   level: {log_level}
 
 auth:
-  backend: local
-  external: false
+  # No authentication by default (anonymous, subject to ACL/policy).
+  backend: none
+  # External token verification:
   # backend: http
   # http:
   #   baseUrl: http://127.0.0.1:9000
-  #   addUserEndpoint: {http_adduser}
-  #   loginEndpoint: {http_login}
-  #   changePasswordEndpoint: {http_change_password}
   #   requestAuthEndpoint: /request-auth
   #   allowAccessEndpoint: /allow-access
   #   allowPublishEndpoint: /allow-publish
@@ -120,16 +112,12 @@ store:
         data_dir = cfg.data_dir.display(),
         web_enabled = cfg.web_enabled,
         web_title = cfg.web_title,
-        web_login = cfg.web_login,
         publish_check_owners = cfg.publish_check_owners,
         audit_enabled = cfg.audit_enabled,
         max_body_size_mb = cfg.max_body_size / (1024 * 1024),
         url_prefix = cfg.url_prefix,
         log_level = cfg.log_level,
-        http_adduser = auth_http.add_user_endpoint,
-        http_login = auth_http.login_endpoint,
-        http_change_password = auth_http.change_password_endpoint,
-        http_timeout_ms = auth_http.timeout_ms,
+        http_timeout_ms = 5_000,
         s3_region = s3.region,
         s3_prefix = s3.prefix,
         s3_force_path_style = s3.force_path_style,
@@ -201,33 +189,23 @@ fn env_defaults() -> BTreeMap<&'static str, &'static str> {
         ("RUSTACCIO_EVENT_HTTP_ENDPOINT", "/events/registry"),
         ("RUSTACCIO_EVENT_HTTP_TIMEOUT_MS", "2000"),
         ("RUSTACCIO_EVENT_SINK", "none"),
-        ("RUSTACCIO_AUTH_BACKEND", "local"),
-        ("RUSTACCIO_AUTH_EXTERNAL_MODE", "false"),
-        ("RUSTACCIO_AUTH_HTTP_ADDUSER_ENDPOINT", "/adduser"),
-        (
-            "RUSTACCIO_AUTH_HTTP_CHANGE_PASSWORD_ENDPOINT",
-            "/change-password",
-        ),
-        ("RUSTACCIO_AUTH_HTTP_LOGIN_ENDPOINT", "/authenticate"),
+        ("RUSTACCIO_AUTH_BACKEND", "none"),
+        ("RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT", "/request-auth"),
         ("RUSTACCIO_AUTH_HTTP_TIMEOUT_MS", "5000"),
-        ("RUSTACCIO_AUTH_TOKEN_TTL_SECS", "2592000"),
         ("RUSTACCIO_BIND", "127.0.0.1:4873"),
         ("RUSTACCIO_CONFIG_BASE64", ""),
         ("RUSTACCIO_DATA_DIR", ".rustaccio-data"),
         ("RUSTACCIO_KEEP_ALIVE_TIMEOUT", ""),
         ("RUSTACCIO_LOG_FORMAT", "pretty"),
         ("RUSTACCIO_LOG_LEVEL", "info"),
-        ("RUSTACCIO_LOGIN_SESSION_TTL_SECONDS", "120"),
         ("RUSTACCIO_MAX_BODY_SIZE", "50mb"),
         ("RUSTACCIO_METADATA_BACKEND", "sidecar"),
         ("RUSTACCIO_METRICS_BACKEND", "none"),
         ("RUSTACCIO_METRICS_PATH", "/-/metrics"),
         ("RUSTACCIO_METRICS_REQUIRE_ADMIN", "true"),
-        ("RUSTACCIO_NPM_TOKEN", ""),
         ("RUSTACCIO_OTEL_ENABLED", "false"),
         ("RUSTACCIO_OTEL_EXPORTER_OTLP_ENDPOINT", ""),
         ("RUSTACCIO_OTEL_SERVICE_NAME", "rustaccio"),
-        ("RUSTACCIO_PASSWORD_MIN", "3"),
         ("RUSTACCIO_MANAGED_MODE", "false"),
         ("RUSTACCIO_PACKAGE_CACHE_MAX_ENTRIES", "5000"),
         ("RUSTACCIO_PACKAGE_CACHE_PRUNE_INTERVAL_SECS", "30"),
@@ -299,7 +277,6 @@ fn env_defaults() -> BTreeMap<&'static str, &'static str> {
         ("RUSTACCIO_URL_PREFIX", "/"),
         ("RUSTACCIO_VERBOSE_DEP_LOGS", "false"),
         ("RUSTACCIO_WEB_ENABLE", "true"),
-        ("RUSTACCIO_WEB_LOGIN", "false"),
         ("RUSTACCIO_WEB_TITLE", "Rustaccio"),
     ])
 }

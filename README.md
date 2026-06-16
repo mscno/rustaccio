@@ -28,6 +28,29 @@ cargo run -- --config ./config.yml
 npm config set registry http://127.0.0.1:4873/
 ```
 
+## Authentication
+
+Rustaccio supports exactly two authentication modes:
+
+1. **No auth (anonymous)** — `RUSTACCIO_AUTH_BACKEND=none` (or unset). All requests are anonymous and are subject to ACL/policy rules.
+2. **External HTTP token auth** — `RUSTACCIO_AUTH_BACKEND=http` with a request-auth endpoint. Incoming bearer tokens are verified by POSTing to an external auth service, which returns the caller's identity (`username`/`groups`).
+
+There is no local user database. Rustaccio does not create users, issue tokens, or manage passwords. Tokens are issued **out of band** by the external system; clients place a pre-issued bearer token in their `.npmrc`:
+
+```
+//<registry-host>/:_authToken=<token>
+```
+
+External HTTP token auth env example:
+
+```
+RUSTACCIO_AUTH_BACKEND=http
+RUSTACCIO_AUTH_HTTP_BASE_URL=http://your-auth-service:8080
+RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT=/request-auth
+```
+
+`GET /-/whoami` returns the username resolved from the external identity when a valid bearer token is sent. The token-to-identity contract is documented in [`docs/contracts/auth-request-v1.md`](docs/contracts/auth-request-v1.md). Optional ACL/policy hooks (`allowAccessEndpoint`/`allowPublishEndpoint`/`allowUnpublishEndpoint`) and `RUSTACCIO_AUTH_HTTP_TIMEOUT_MS` are described in [HTTP Auth Plugin Contract](#http-auth-plugin-contract).
+
 ## Deployment
 
 Standalone with defaults (no config file):
@@ -107,13 +130,9 @@ Environment variables:
 - `RUSTACCIO_CONFIG` (optional Verdaccio-style YAML; loads `packages` ACL rules + `uplinks`)
 - `RUSTACCIO_CONFIG_BASE64` (optional base64-encoded Verdaccio-style YAML; mutually exclusive with `RUSTACCIO_CONFIG`)
 - `RUSTACCIO_UPSTREAM` (optional, eg `https://registry.npmjs.org`)
-- `RUSTACCIO_WEB_LOGIN` (default `false`; enables `/-/v1/login*` endpoints)
 - `RUSTACCIO_WEB_ENABLE` (default `true`)
 - `RUSTACCIO_WEB_TITLE` (default `Rustaccio`; used by built-in web UI title)
 - `RUSTACCIO_PUBLISH_CHECK_OWNERS` (default `false`; enforces owner-only package mutations)
-- `RUSTACCIO_PASSWORD_MIN` (default `3`)
-- `RUSTACCIO_LOGIN_SESSION_TTL_SECONDS` (default `120`)
-- `RUSTACCIO_AUTH_TOKEN_TTL_SECS` (default `2592000` / 30 days; `0` keeps local bearer auth tokens non-expiring)
 - `RUSTACCIO_MAX_BODY_SIZE` (default `50mb`, accepts `kb|mb|gb` suffixes)
 - `RUSTACCIO_AUDIT_ENABLED` (default `true`)
 - `RUSTACCIO_URL_PREFIX` (default `/`)
@@ -133,16 +152,12 @@ Environment variables:
 - `RUSTACCIO_UPSTREAM_POOL_IDLE_TIMEOUT_SECS` (default `30`)
 - `RUSTACCIO_UPSTREAM_POOL_MAX_IDLE_PER_HOST` (default `4`)
 - `RUSTACCIO_UPSTREAM_TCP_KEEPALIVE_SECS` (default `30`)
-- `RUSTACCIO_AUTH_BACKEND` (`local` or `http`, default `local`)
+- `RUSTACCIO_AUTH_BACKEND` (`none` or `http`, default `none`; `none`/unset means all requests are anonymous, subject to ACL/policy)
 - `RUSTACCIO_AUTH_HTTP_BASE_URL` (required for `http` auth backend)
-- `RUSTACCIO_AUTH_HTTP_ADDUSER_ENDPOINT` (default `/adduser`)
-- `RUSTACCIO_AUTH_HTTP_LOGIN_ENDPOINT` (default `/authenticate`)
-- `RUSTACCIO_AUTH_HTTP_CHANGE_PASSWORD_ENDPOINT` (default `/change-password`)
-- `RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT` (optional token->identity hook for custom auth middleware parity)
+- `RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT` (required for `http` auth backend; verifies incoming bearer tokens, eg `/request-auth`)
 - `RUSTACCIO_AUTH_HTTP_ALLOW_ACCESS_ENDPOINT` (optional ACL override hook endpoint)
 - `RUSTACCIO_AUTH_HTTP_ALLOW_PUBLISH_ENDPOINT` (optional ACL override hook endpoint)
 - `RUSTACCIO_AUTH_HTTP_ALLOW_UNPUBLISH_ENDPOINT` (optional ACL override hook endpoint)
-- `RUSTACCIO_AUTH_EXTERNAL_MODE` (default `false`; disables local user/token/web-login endpoints)
 - `RUSTACCIO_AUTH_HTTP_TIMEOUT_MS` (default `5000`)
 - `RUSTACCIO_RUNTIME_PROFILE` (`local`, `s3`, or `managed`; primary mode selector when set, otherwise inferred from `RUSTACCIO_MANAGED_MODE` and tarball backend)
 - `RUSTACCIO_STRICT_REVISION_CHECK` (optional `true|false`; default `true` in managed mode, otherwise `false`)
@@ -402,22 +417,18 @@ Key APIs:
 ## Implemented Core API Surface
 
 - `/-/ping`
-- `/-/whoami`
-- `/-/user/*` (add user/login/logout)
+- `/-/whoami` (returns the username from the external identity when a valid bearer token is sent)
 - `/-/v1/search`
 - `/-/all` and `/-/all/since` (deprecated response)
 - `/-/admin/reindex`, `/-/admin/storage-health`, `/-/admin/policy-cache/invalidate`, and `/-/admin/package-cache/invalidate` (admin/ops endpoints)
 - `/-/_view/starredByUser`
 - `/-/package/:package/dist-tags` (+ `:tag`)
-- `/-/npm/v1/user`
 - `/-/npm/v1/bootstrap` (npm/pnpm/yarn/bun onboarding snippets)
-- `/-/npm/v1/tokens` (+ token delete)
 - `/-/npm/v1/security/advisories/bulk`
 - `/-/npm/v1/security/audits/quick`
 - `/-/npm/v1/security/audits`
 - `/-/metrics` (optional, when `RUSTACCIO_METRICS_BACKEND=prometheus`)
-- `/-/v1/login`, `/-/v1/login_cli/:sessionId`, `/-/v1/done/:sessionId`
-- Built-in web UI routes: `/`, `/-/web`, `/-/web/login`, `/-/web/settings`, `/-/web/detail/:package`, and static assets under `/-/web/static/*`
+- Built-in web UI routes: `/`, `/-/web`, `/-/web/settings`, `/-/web/detail/:package`, and static assets under `/-/web/static/*`
 - Package/tarball/publish routes (including scoped packages):
   - `GET|HEAD /:package/:version?`
   - `GET|HEAD /:package/-/:filename`
@@ -431,7 +442,7 @@ Key APIs:
 
 The integration suite in `tests/parity.rs` currently validates:
 
-- user creation/login/conflict/mismatch/logout/whoami
+- whoami identity resolution from external bearer tokens
 - package publish/get/tarball (including scoped and encoded scoped names)
 - package version and dist-tag lookups (`/:package/:versionOrTag`)
 - `?write=true` package reads for unpublish-style flows
@@ -440,16 +451,12 @@ The integration suite in `tests/parity.rs` currently validates:
 - deprecate + undeprecate package versions via metadata updates
 - unpublish-version flow via `PUT /:package/-rev/:revision` metadata mutation
 - `publish.check_owners` parity for write routes (`GET ?write=true`, publish/unpublish, dist-tags)
-- external HTTP auth plugin backend (`add user`, `authenticate`, `change password`)
+- external HTTP auth backend token verification
 - HTTP request-auth hook contract (`token + method + path -> identity/groups`)
 - pluggable tarball backend (`local` filesystem or `s3`)
 - `tarball backend startup reindexing` to discover versions from existing backend tarballs before serving requests
-- npm token APIs (list/create/delete + validation errors)
-- profile APIs (get + password change validation)
 - security audit endpoints (uplink proxy + local fallback response shape)
 - search v1 with pagination semantics
-- login session APIs (`/-/v1/login`, `/-/v1/login_cli/:sessionId`, `/-/v1/done/:sessionId`)
-- `flags.webLogin` parity behavior (login routes disabled unless enabled)
 - deprecated search endpoint (`/-/all`)
 - uplink behavior for package metadata, dist-tags, search, and tarballs
 - package ACL parity subset (`access`/`publish`/`unpublish`) with pattern matching and proxy uplink selection
@@ -464,7 +471,7 @@ Rustaccio targets Verdaccio-compatible npm client behavior for core flows, but i
 - Package routes only consult an explicitly configured package-rule `proxy` uplink; they do not implicitly fall back to `default` or every configured uplink.
 - Authorization parsing currently accepts `Bearer <token>` only.
 - `:revision` route segments are accepted for Verdaccio-compatible route shapes, but revision values are not currently used for optimistic-concurrency checks.
-- `/-/npm/v1/user` currently does not support 2FA updates (`tfa` payload returns `503`).
+- There is no local user store: `npm login`/`npm adduser`, npm token management, password changes, and web-login session flows are not supported. Identity comes only from an external HTTP auth backend verifying pre-issued bearer tokens.
 - Search (`/-/v1/search`) currently uses `text`, `size`, and `from`; score tuning params are ignored, and `total` reflects returned page size.
 - YAML `listen` can be configured as a list for config compatibility, but the server currently binds a single effective socket address.
 - `server.keepAliveTimeout` is currently mapped to an HTTP/1 header-read timeout for keep-alive connections (not a byte-for-byte Node.js socket timeout implementation).
@@ -476,10 +483,10 @@ Rustaccio targets Verdaccio-compatible npm client behavior for core flows, but i
 - `src/api.rs`: HTTP routing + Verdaccio-compatible endpoint behavior
 - `src/acl.rs`: package rule matching + access/publish/unpublish permission checks
 - `src/config.rs`: env + Verdaccio-style YAML parsing (`packages`, `uplinks`)
-- `src/storage.rs`: local state, persistence, auth/token/package operations + backend integration
+- `src/storage.rs`: in-memory package runtime state + tarball/sidecar backend integration
 - `src/policy.rs`: policy engine abstraction (`external policy backend -> auth hook/plugin decisions -> ACL fallback`)
 - `src/governance.rs`: opt-in governance controls (`rate limiting`, `quota`, `metrics`) via trait-based guards/backends
-- `src/auth_plugin.rs`: HTTP auth backend plugin client
+- `src/auth_plugin.rs`: HTTP auth backend client (external bearer-token verification)
 - `src/tarball_backend.rs`: tarball backend abstraction (`local`, `s3`)
 - `src/upstream.rs`: npm uplink proxy client for package/search/tarball
 - `src/app.rs`: app state + router construction
@@ -490,12 +497,8 @@ Rustaccio targets Verdaccio-compatible npm client behavior for core flows, but i
 ```yaml
 auth:
   backend: http
-  external: false
   http:
     baseUrl: http://auth.local:9000
-    addUserEndpoint: /adduser
-    loginEndpoint: /authenticate
-    changePasswordEndpoint: /change-password
     requestAuthEndpoint: /request-auth
     allowAccessEndpoint: /allow-access
     allowPublishEndpoint: /allow-publish
@@ -516,7 +519,7 @@ store:
 
 ## HTTP Auth Plugin Contract
 
-The HTTP auth backend is called by core user endpoints and keeps the same external npm/Verdaccio API contract.
+When `RUSTACCIO_AUTH_BACKEND=http`, Rustaccio verifies every incoming bearer token by calling the external auth service's request-auth endpoint, which returns the caller's identity (`username`/`groups`). Tokens are issued out of band by the external system; Rustaccio never creates users or tokens.
 
 Versioned contract reference: `docs/contracts/auth-request-v1.md`
 
@@ -527,9 +530,6 @@ Use `?scope=<name>` (for example `?scope=acme`) to include scope-specific regist
 
 Versioned contract reference: `docs/contracts/npm-bootstrap-v1.md`
 
-- `POST {baseUrl}{addUserEndpoint}` with `{ "username", "password" }`
-- `POST {baseUrl}{loginEndpoint}` with `{ "username", "password" }`
-- `POST {baseUrl}{changePasswordEndpoint}` with `{ "username", "old_password", "new_password" }`
 - `POST {baseUrl}{requestAuthEndpoint}` with `{ "token", "method", "path", "request_id" }` and response including:
   - `authenticated` (`true|false`, optional)
   - user identity: `username` or `user` or `name` (optional)
@@ -663,7 +663,7 @@ State write coordination (opt-in):
 
 Semantics:
 
-- Coordinates write sections with scoped lease locks (`state` scope for auth/session persistence and `package:<name>` scope for package mutations).
+- Coordinates write sections with scoped lease locks (`package:<name>` scope for package mutations).
 - Prevents overlapping multi-instance write sections when all instances use the same coordination backend.
 - This is a write-coordination primitive, not full multi-writer state conflict resolution.
 
@@ -702,8 +702,7 @@ Behavior:
 - If `RUSTACCIO_MANAGED_MODE=true`, startup enforces stricter guardrails:
   - `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false`
   - at least one explicit admin principal in `RUSTACCIO_ADMIN_USERS` or `RUSTACCIO_ADMIN_GROUPS`
-  - `auth.plugin.externalMode=true` (external identity provider mode)
-  - `RUSTACCIO_AUTH_BACKEND=http`
+  - `RUSTACCIO_AUTH_BACKEND=http` (external identity provider mode)
   - `RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT=<path>`
 
 Recommended managed-mode posture:
@@ -755,8 +754,7 @@ Managed hardening mode:
 - Managed guardrails enforce:
   - `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false`
   - explicit admin principals (`RUSTACCIO_ADMIN_USERS` or `RUSTACCIO_ADMIN_GROUPS`)
-  - `auth.plugin.externalMode=true` (env: `RUSTACCIO_AUTH_EXTERNAL_MODE=true`)
-  - `RUSTACCIO_AUTH_BACKEND=http`
+  - `RUSTACCIO_AUTH_BACKEND=http` (external identity provider mode)
   - `RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT=<path>`
 - Managed profile additionally requires:
   - `RUSTACCIO_RATE_LIMIT_BACKEND=redis`
@@ -803,7 +801,9 @@ Required for Postgres quotas:
 
 Recommended managed security baseline:
 
-- `RUSTACCIO_AUTH_EXTERNAL_MODE=true`
+- `RUSTACCIO_AUTH_BACKEND=http`
+- `RUSTACCIO_AUTH_HTTP_BASE_URL=http://your-auth-service:8080`
+- `RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT=/request-auth`
 - `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false`
 - `RUSTACCIO_ADMIN_GROUPS=<control-plane-admin-group>`
 - `RUSTACCIO_PACKAGE_METADATA_AUTHORITY=sidecar`
@@ -825,7 +825,9 @@ docker run --rm -p 4873:4873 \
   -e RUSTACCIO_CONFIG=/etc/rustaccio/config.yml \
   -e RUSTACCIO_RUNTIME_PROFILE=managed \
   -e RUSTACCIO_MANAGED_MODE=true \
-  -e RUSTACCIO_AUTH_EXTERNAL_MODE=true \
+  -e RUSTACCIO_AUTH_BACKEND=http \
+  -e RUSTACCIO_AUTH_HTTP_BASE_URL=http://your-auth-service:8080 \
+  -e RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT=/request-auth \
   -e RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false \
   -e RUSTACCIO_ADMIN_GROUPS=platform-admins \
   -e RUSTACCIO_PACKAGE_METADATA_AUTHORITY=sidecar \
@@ -847,18 +849,11 @@ Notes:
 
 ## Storage and Data Model
 
-### Core persisted model
+### Core model
 
-The local persisted state file (`<data_dir>/state.json`) stores only auth/session state:
+Rustaccio does not persist any local state file. There is no `state.json` and no on-disk users, auth tokens, npm tokens, or login sessions — those concepts no longer exist. Identity is resolved per request from the external HTTP auth backend, and package metadata authority is sidecar-only (backend-stored `package.json` sidecars).
 
-- `users`
-- `auth_tokens` (local bearer login tokens; expired entries are pruned on startup, lookup, and background maintenance)
-- `npm_tokens` (persistent npm tokens; remain until explicitly deleted)
-- `login_sessions` (short-lived web-login handoff state; expired entries are pruned on startup, poll, and background maintenance)
-
-`packages` is intentionally persisted as an empty map. Package metadata authority is sidecar-only.
-
-Package runtime state (`PackageRecord`) contains:
+Package runtime state is held in memory as a bounded cache. Each `PackageRecord` contains:
 
 - `manifest` (full package manifest JSON)
 - `upstream_tarballs` (filename -> original upstream URL cache)
@@ -928,18 +923,13 @@ Response includes:
 
 This rebuilds package metadata from backend tarballs/sidecars and can repair many drift cases.
 
-### What cannot be reconstructed from tarballs alone
-
-- `users`, `auth_tokens`, `npm_tokens`, and `login_sessions` are local auth/session state.
-- If local `state.json` is lost and no backup exists, those records are not recoverable from tarball blobs.
-
 ### Recommended backup strategy
 
-- Back up local `state.json` for auth/session records.
-- Back up all tarball objects and package sidecars.
+- Back up all tarball objects and package sidecars (this is the full authoritative dataset; there is no local auth/session state to back up).
 - For governance:
   - back up Postgres quota tables
   - persist Redis if you require durable counters across restarts (optional by policy)
+- Identity is managed entirely by the external auth service; back that up according to its own policy.
 
 ### Outbound client lifecycle
 
@@ -964,7 +954,7 @@ Current bottlenecks/limits:
 
 Recommended evolution for high-scale managed deployments:
 
-- Move package/user/token metadata to a transactional DB-backed metadata store.
+- Move package metadata to a transactional DB-backed metadata store.
 - Keep object storage for immutable tarballs/blobs.
 - Add distributed compare-and-swap/evented invalidation for metadata cache coherence.
 
@@ -978,11 +968,10 @@ Licensed under either of:
 ## Embedded Auth Hook Contract
 
 When embedding, implement `AuthHook`:
-- `authenticate_request(token, method, path)` for token-to-identity mapping
+- `authenticate_request(token, method, path)` for token-to-identity mapping (tokens are issued out of band by your system)
 - `allow_access(identity, package)` optional override for read permission
 - `allow_publish(identity, package)` optional override for publish permission
 - `allow_unpublish(identity, package)` optional override for unpublish permission
-- optional: `add_user`, `authenticate`, `change_password` for user/profile/token flows
 
 Returned identity (`AuthIdentity`) is used directly by package ACL rules (`access`, `publish`, `unpublish`) via `username` and `groups`.
 If `allow_*` returns `Some(true|false)`, that decision overrides ACL; `None` falls back to ACL rules.

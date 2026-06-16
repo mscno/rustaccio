@@ -13,10 +13,7 @@ use http_body_util::BodyExt;
 use rustaccio::{
     acl::PackageRule,
     app::build_router,
-    config::{
-        AuthBackend, AuthPluginConfig, Config, S3TarballStorageConfig, TarballStorageBackend,
-        TarballStorageConfig,
-    },
+    config::{Config, S3TarballStorageConfig, TarballStorageBackend, TarballStorageConfig},
     runtime,
 };
 use serde_json::{Value, json};
@@ -24,6 +21,8 @@ use std::{collections::HashMap, time::Duration};
 use tempfile::TempDir;
 use tower::ServiceExt;
 use uuid::Uuid;
+
+mod common;
 
 fn it_endpoint() -> String {
     std::env::var("RUSTACCIO_S3_IT_ENDPOINT")
@@ -105,24 +104,6 @@ async fn json_body(resp: axum::http::Response<Body>) -> Value {
     serde_json::from_slice(&bytes).expect("json")
 }
 
-async fn create_user(app: &axum::Router, name: &str, password: &str) -> String {
-    let req = Request::builder()
-        .method(Method::PUT)
-        .uri(format!("/-/user/org.couchdb.user:{name}"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({ "name": name, "password": password })).expect("payload"),
-        ))
-        .expect("request");
-    let resp = send(app, req).await;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let body = json_body(resp).await;
-    body.get("token")
-        .and_then(Value::as_str)
-        .expect("token")
-        .to_string()
-}
-
 fn pkg_manifest(pkg: &str, version: &str, tarball_filename: &str, data: &[u8]) -> Value {
     let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
     json!({
@@ -168,21 +149,14 @@ fn s3_it_config(
         acl_rules: vec![PackageRule::open("**")],
         web_enabled: true,
         web_title: "Rustaccio".to_string(),
-        web_login: true,
         publish_check_owners: false,
-        password_min_length: 3,
-        login_session_ttl_seconds: 120,
         max_body_size: 50 * 1024 * 1024,
         audit_enabled: true,
         url_prefix: "/".to_string(),
         trust_proxy: false,
         keep_alive_timeout_secs: None,
         log_level: "info".to_string(),
-        auth_plugin: AuthPluginConfig {
-            backend: AuthBackend::Local,
-            external_mode: false,
-            http: None,
-        },
+        auth_plugin: None,
         tarball_storage: TarballStorageConfig {
             backend: TarballStorageBackend::S3,
             s3: Some(S3TarballStorageConfig {
@@ -223,9 +197,27 @@ async fn list_keys(client: &S3Client, bucket: &str, prefix: &str) -> Vec<String>
     out
 }
 
-#[tokio::test]
+#[test]
 #[ignore = "requires local MinIO (`just minio-up`)"]
-async fn minio_backend_publish_and_put_rev_unpublish_flow() {
+fn minio_backend_publish_and_put_rev_unpublish_flow() {
+    // The combined publish/put-rev/unpublish flow builds a single large async
+    // future whose stack frame exceeds the default 2MB thread stack on recent
+    // toolchains, so drive it on a thread with a roomier stack.
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(minio_backend_publish_and_put_rev_unpublish_flow_inner());
+        })
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+async fn minio_backend_publish_and_put_rev_unpublish_flow_inner() {
     let endpoint = it_endpoint();
     let region = it_region();
     let bucket = it_bucket();
@@ -239,17 +231,19 @@ async fn minio_backend_publish_and_put_rev_unpublish_flow() {
     let package = "minio-it-pkg";
     let prefix = format!("rustaccio-it-{}/", Uuid::new_v4().as_simple());
 
+    let auth = common::start_token_echo_auth().await;
     let dir = TempDir::new().expect("temp dir");
-    let cfg = s3_it_config(
+    let mut cfg = s3_it_config(
         dir.path().to_path_buf(),
         endpoint.clone(),
         bucket.clone(),
         prefix.clone(),
     );
+    cfg.auth_plugin = Some(common::external_auth_plugin(&auth.uri()));
     let state = runtime::build_state(&cfg, None).await.expect("state");
     let app = build_router(state);
 
-    let token = create_user(&app, "minio-it-user", "secret").await;
+    let token = "minio-it-user";
 
     for (version, filename, data) in [
         ("1.0.0", "minio-it-pkg-1.0.0.tgz", b"v1".as_slice()),

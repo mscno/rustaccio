@@ -12,10 +12,7 @@ use rustaccio::{
     acl::PackageRule,
     app::{AdminAccessConfig, build_router},
     auth::AuthHook,
-    config::{
-        AuthBackend, AuthPluginConfig, Config, HttpAuthPluginConfig, TarballStorageBackend,
-        TarballStorageConfig,
-    },
+    config::{Config, TarballStorageBackend, TarballStorageConfig},
     models::AuthIdentity,
     runtime,
 };
@@ -23,6 +20,8 @@ use serde_json::{Value, json};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tempfile::TempDir;
 use tower::ServiceExt;
+
+mod common;
 
 #[derive(Debug)]
 struct GroupOnlyHook;
@@ -73,21 +72,14 @@ fn base_config(data_dir: PathBuf) -> Config {
         acl_rules: vec![PackageRule::open("**")],
         web_enabled: true,
         web_title: "Rustaccio".to_string(),
-        web_login: true,
         publish_check_owners: false,
-        password_min_length: 3,
-        login_session_ttl_seconds: 120,
         max_body_size: 50 * 1024 * 1024,
         audit_enabled: true,
         url_prefix: "/".to_string(),
         trust_proxy: false,
         keep_alive_timeout_secs: None,
         log_level: "info".to_string(),
-        auth_plugin: AuthPluginConfig {
-            backend: AuthBackend::Local,
-            external_mode: false,
-            http: None,
-        },
+        auth_plugin: None,
         tarball_storage: TarballStorageConfig {
             backend: TarballStorageBackend::Local,
             s3: None,
@@ -150,41 +142,6 @@ fn manifest(pkg: &str) -> Value {
 }
 
 #[tokio::test]
-async fn external_auth_mode_disables_local_auth_routes() {
-    let dir = TempDir::new().expect("dir");
-    let mut cfg = base_config(dir.path().to_path_buf());
-    cfg.auth_plugin.external_mode = true;
-    let app = app_with_config(&cfg, None).await;
-
-    let req = Request::builder()
-        .method(Method::PUT)
-        .uri("/-/user/org.couchdb.user:alice")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({"name":"alice","password":"secret"})).expect("payload"),
-        ))
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/-/v1/login")
-        .body(Body::empty())
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri("/-/npm/v1/user")
-        .body(Body::empty())
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
 async fn max_body_size_is_enforced_for_json_endpoints() {
     let dir = TempDir::new().expect("dir");
     let mut cfg = base_config(dir.path().to_path_buf());
@@ -205,68 +162,10 @@ async fn max_body_size_is_enforced_for_json_endpoints() {
 }
 
 #[tokio::test]
-async fn trust_proxy_controls_base_url_for_login_links() {
-    let dir = TempDir::new().expect("dir");
-    let cfg_untrusted = base_config(dir.path().join("untrusted"));
-    let app_untrusted = app_with_config(&cfg_untrusted, None).await;
-
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/-/v1/login")
-        .header(header::HOST, "registry.internal:4873")
-        .header("x-forwarded-proto", "https")
-        .header("x-forwarded-host", "registry.example.com")
-        .body(Body::empty())
-        .expect("request");
-    let resp = send(&app_untrusted, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = json_body(resp).await;
-    let login_url = body
-        .get("loginUrl")
-        .and_then(Value::as_str)
-        .expect("loginUrl");
-    assert!(login_url.starts_with("http://registry.internal:4873/"));
-
-    let mut cfg_trusted = base_config(dir.path().join("trusted"));
-    cfg_trusted.trust_proxy = true;
-    let app_trusted = app_with_config(&cfg_trusted, None).await;
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/-/v1/login")
-        .header(header::HOST, "registry.internal:4873")
-        .header("x-forwarded-proto", "https")
-        .header("x-forwarded-host", "registry.example.com")
-        .body(Body::empty())
-        .expect("request");
-    let resp = send(&app_trusted, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = json_body(resp).await;
-    let login_url = body
-        .get("loginUrl")
-        .and_then(Value::as_str)
-        .expect("loginUrl");
-    assert!(login_url.starts_with("https://registry.example.com/"));
-}
-
-#[tokio::test]
 async fn group_only_identity_can_satisfy_acl_publish() {
     let dir = TempDir::new().expect("dir");
     let mut cfg = base_config(dir.path().to_path_buf());
-    cfg.auth_plugin = AuthPluginConfig {
-        backend: AuthBackend::Http,
-        external_mode: false,
-        http: Some(HttpAuthPluginConfig {
-            base_url: "http://unused".to_string(),
-            add_user_endpoint: "/adduser".to_string(),
-            login_endpoint: "/authenticate".to_string(),
-            change_password_endpoint: "/change-password".to_string(),
-            request_auth_endpoint: Some("/request-auth".to_string()),
-            allow_access_endpoint: None,
-            allow_publish_endpoint: None,
-            allow_unpublish_endpoint: None,
-            timeout_ms: 1_000,
-        }),
-    };
+    cfg.auth_plugin = Some(common::external_auth_plugin("http://unused"));
     cfg.acl_rules = vec![PackageRule {
         pattern: "**".to_string(),
         access: vec!["dev-team".to_string()],
@@ -293,21 +192,7 @@ async fn group_only_identity_can_satisfy_acl_publish() {
 async fn external_request_auth_not_found_surfaces_as_bad_gateway() {
     let dir = TempDir::new().expect("dir");
     let mut cfg = base_config(dir.path().to_path_buf());
-    cfg.auth_plugin = AuthPluginConfig {
-        backend: AuthBackend::Http,
-        external_mode: false,
-        http: Some(HttpAuthPluginConfig {
-            base_url: "http://127.0.0.1:9".to_string(),
-            add_user_endpoint: "/adduser".to_string(),
-            login_endpoint: "/authenticate".to_string(),
-            change_password_endpoint: "/change-password".to_string(),
-            request_auth_endpoint: Some("/request-auth".to_string()),
-            allow_access_endpoint: None,
-            allow_publish_endpoint: None,
-            allow_unpublish_endpoint: None,
-            timeout_ms: 1_000,
-        }),
-    };
+    cfg.auth_plugin = Some(common::external_auth_plugin("http://127.0.0.1:9"));
     let app = app_with_config(&cfg, None).await;
 
     let req = Request::builder()
@@ -370,14 +255,6 @@ async fn web_routes_are_hidden_when_web_is_disabled() {
     let req = Request::builder()
         .method(Method::GET)
         .uri("/-/web/static/app.js")
-        .body(Body::empty())
-        .expect("request");
-    let resp = send(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri("/-/web/login")
         .body(Body::empty())
         .expect("request");
     let resp = send(&app, req).await;

@@ -1,5 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-use rustaccio::config::{AuthBackend, Config, TarballStorageBackend};
+use rustaccio::config::{Config, TarballStorageBackend};
 use std::{collections::HashSet, io::Write, path::PathBuf, sync::Mutex};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -22,8 +22,6 @@ packages:
     access: $all
     publish: $authenticated
     unpublish: $authenticated
-flags:
-  webLogin: true
 publish:
   check_owners: true
 "#
@@ -39,9 +37,8 @@ publish:
     assert_eq!(cfg.acl_rules[0].pattern, "vue");
     assert_eq!(cfg.acl_rules[0].proxy.as_deref(), Some("npmjs"));
     assert_eq!(cfg.acl_rules[1].pattern, "**");
-    assert!(cfg.web_login);
     assert!(cfg.publish_check_owners);
-    assert_eq!(cfg.auth_plugin.backend, AuthBackend::Local);
+    assert!(cfg.auth_plugin.is_none());
     assert_eq!(cfg.tarball_storage.backend, TarballStorageBackend::Local);
 }
 
@@ -53,12 +50,8 @@ fn parses_plugin_config_sections() {
         r#"
 auth:
   backend: http
-  external: true
   http:
     baseUrl: http://auth.local:9000
-    addUserEndpoint: /users/add
-    loginEndpoint: /users/login
-    changePasswordEndpoint: /users/password
     requestAuthEndpoint: /request-auth
     allowAccessEndpoint: /allow-access
     allowPublishEndpoint: /allow-publish
@@ -79,13 +72,8 @@ storage:
     .expect("write");
 
     let cfg = Config::from_yaml_file(file.path().to_path_buf()).expect("parse");
-    assert_eq!(cfg.auth_plugin.backend, AuthBackend::Http);
-    assert!(cfg.auth_plugin.external_mode);
-    let auth = cfg.auth_plugin.http.expect("http auth");
+    let auth = cfg.auth_plugin.expect("http auth");
     assert_eq!(auth.base_url, "http://auth.local:9000");
-    assert_eq!(auth.add_user_endpoint, "/users/add");
-    assert_eq!(auth.login_endpoint, "/users/login");
-    assert_eq!(auth.change_password_endpoint, "/users/password");
     assert_eq!(auth.request_auth_endpoint.as_deref(), Some("/request-auth"));
     assert_eq!(auth.allow_access_endpoint.as_deref(), Some("/allow-access"));
     assert_eq!(
@@ -163,7 +151,7 @@ auth:
     .expect("write");
 
     let err = Config::from_yaml_file(file.path().to_path_buf()).expect_err("invalid auth backend");
-    assert!(err.contains("unsupported auth backend"));
+    assert!(err.contains("auth.backend: unsupported value"));
 }
 
 #[test]
@@ -412,12 +400,9 @@ store:
             ),
             ("RUSTACCIO_CONFIG_BASE64", None),
             ("RUSTACCIO_UPSTREAM", None),
-            ("RUSTACCIO_WEB_LOGIN", None),
             ("RUSTACCIO_WEB_ENABLE", Some("true")),
             ("RUSTACCIO_WEB_TITLE", Some("Env Var")),
             ("RUSTACCIO_PUBLISH_CHECK_OWNERS", None),
-            ("RUSTACCIO_PASSWORD_MIN", None),
-            ("RUSTACCIO_LOGIN_SESSION_TTL_SECONDS", None),
             ("RUSTACCIO_MAX_BODY_SIZE", None),
             ("RUSTACCIO_AUDIT_ENABLED", None),
             ("RUSTACCIO_URL_PREFIX", None),
@@ -469,11 +454,7 @@ store:
             ("RUSTACCIO_S3_PREFIX", None),
             ("RUSTACCIO_S3_FORCE_PATH_STYLE", None),
             ("RUSTACCIO_AUTH_BACKEND", Some("http")),
-            ("RUSTACCIO_AUTH_EXTERNAL_MODE", None),
             ("RUSTACCIO_AUTH_HTTP_BASE_URL", Some("http://auth-from-env")),
-            ("RUSTACCIO_AUTH_HTTP_ADDUSER_ENDPOINT", None),
-            ("RUSTACCIO_AUTH_HTTP_LOGIN_ENDPOINT", None),
-            ("RUSTACCIO_AUTH_HTTP_CHANGE_PASSWORD_ENDPOINT", None),
             ("RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT", None),
             ("RUSTACCIO_AUTH_HTTP_ALLOW_ACCESS_ENDPOINT", None),
             ("RUSTACCIO_AUTH_HTTP_ALLOW_PUBLISH_ENDPOINT", None),
@@ -491,8 +472,7 @@ store:
             let s3 = cfg.tarball_storage.s3.expect("s3");
             assert_eq!(s3.bucket, "env-bucket");
             assert_eq!(s3.region, "eu-west-1");
-            assert_eq!(cfg.auth_plugin.backend, AuthBackend::Http);
-            let http = cfg.auth_plugin.http.expect("http");
+            let http = cfg.auth_plugin.expect("http");
             assert_eq!(http.base_url, "http://auth-from-env");
         },
     );
@@ -543,12 +523,9 @@ fn without_config_env(run: impl FnOnce()) {
             ("RUSTACCIO_CONFIG", None),
             ("RUSTACCIO_CONFIG_BASE64", None),
             ("RUSTACCIO_UPSTREAM", None),
-            ("RUSTACCIO_WEB_LOGIN", None),
             ("RUSTACCIO_WEB_ENABLE", None),
             ("RUSTACCIO_WEB_TITLE", None),
             ("RUSTACCIO_PUBLISH_CHECK_OWNERS", None),
-            ("RUSTACCIO_PASSWORD_MIN", None),
-            ("RUSTACCIO_LOGIN_SESSION_TTL_SECONDS", None),
             ("RUSTACCIO_MAX_BODY_SIZE", None),
             ("RUSTACCIO_AUDIT_ENABLED", None),
             ("RUSTACCIO_URL_PREFIX", None),
@@ -556,11 +533,7 @@ fn without_config_env(run: impl FnOnce()) {
             ("RUSTACCIO_KEEP_ALIVE_TIMEOUT", None),
             ("RUSTACCIO_LOG_LEVEL", None),
             ("RUSTACCIO_AUTH_BACKEND", None),
-            ("RUSTACCIO_AUTH_EXTERNAL_MODE", None),
             ("RUSTACCIO_AUTH_HTTP_BASE_URL", None),
-            ("RUSTACCIO_AUTH_HTTP_ADDUSER_ENDPOINT", None),
-            ("RUSTACCIO_AUTH_HTTP_LOGIN_ENDPOINT", None),
-            ("RUSTACCIO_AUTH_HTTP_CHANGE_PASSWORD_ENDPOINT", None),
             ("RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT", None),
             ("RUSTACCIO_AUTH_HTTP_ALLOW_ACCESS_ENDPOINT", None),
             ("RUSTACCIO_AUTH_HTTP_ALLOW_PUBLISH_ENDPOINT", None),
