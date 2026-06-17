@@ -297,7 +297,10 @@ async fn state_coordination_s3_lock_timeout_when_key_is_held() {
     ensure_bucket(&client, &bucket).await;
 
     let prefix = format!("rustaccio-it-locks/{}/", Uuid::new_v4().as_simple());
-    let held_key = format!("{prefix}state.lock");
+    let pkg = format!("state-lock-pkg-{}", Uuid::new_v4().as_simple());
+    // Package writes coordinate on the per-package scope `package:<name>`; seed a
+    // still-held lock at exactly that scope so the publish below cannot acquire it.
+    let held_key = format!("{prefix}package:{pkg}.lock");
     let lease_until_ms = chrono::Utc::now().timestamp_millis() + 10_000;
     let payload = json!({
         "token": "held-token",
@@ -362,7 +365,6 @@ async fn state_coordination_s3_lock_timeout_when_key_is_held() {
             cfg.auth_plugin = Some(common::external_auth_plugin(&auth.uri()));
             let app = app_with_env(&cfg).await;
             let user = format!("state-lock-{}", Uuid::new_v4().as_simple());
-            let pkg = format!("state-lock-pkg-{}", Uuid::new_v4().as_simple());
             assert_eq!(
                 publish_package(&app, &user, &pkg).await,
                 StatusCode::SERVICE_UNAVAILABLE

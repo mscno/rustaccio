@@ -16,13 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `GET /-/npm/v1/bootstrap` endpoint for npm/pnpm/yarn/bun onboarding snippets and `.npmrc` bootstrap guidance.
 - Added admin cache invalidation hook endpoint `POST /-/admin/package-cache/invalidate` for external/event-driven cache eviction.
 - Added opt-in startup connectivity probing via `RUSTACCIO_STARTUP_CONNECTIVITY_CHECK`, logging IPv4/IPv6 TCP reachability to `registry.npmjs.org` and the configured tarball S3 endpoint.
+- Added a `postgres` state-coordination backend (`RUSTACCIO_STATE_COORDINATION_BACKEND=postgres`, `RUSTACCIO_STATE_COORDINATION_POSTGRES_URL`) using session-scoped `pg_advisory_lock`; the multi-instance write lock is now abstracted behind a `LockBackend`/`LockGuard` trait with per-backend modules (`s3`, `redis`, `postgres`). The managed profile accepts `redis|s3|postgres` for state coordination.
 
 ### Changed
 
 - Breaking: authentication is now limited to two modes selected by `RUSTACCIO_AUTH_BACKEND`: `none` (anonymous, subject to ACL/policy) and `http` (external HTTP token verification). The `http` backend verifies incoming bearer tokens against `RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT` and resolves identity (`username`/`groups`) from the response. Tokens are issued out of band by the external system and supplied by clients via `.npmrc` (`//<registry>/:_authToken=<token>`).
 - Breaking: managed mode now requires `RUSTACCIO_AUTH_BACKEND=http` plus `RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT` instead of the removed `RUSTACCIO_AUTH_EXTERNAL_MODE` flag.
 - Breaking: removed snapshot-based package metadata persistence and shared S3 `__rustaccio_meta/state.json` package snapshots. Package metadata is now always sidecar-authoritative (`package.json`), and Rustaccio no longer writes any local `state.json` (no on-disk auth/session/token records).
-- Breaking: runtime startup now enforces deployment profiles (`local|s3|managed`) with `RUSTACCIO_RUNTIME_PROFILE` override or automatic profile inference from config, including strict backend requirements for the managed profile (`redis` rate limiting + `postgres` quotas + `redis|s3` state coordination).
+- Breaking: runtime startup now enforces deployment profiles (`local|s3|managed`) with `RUSTACCIO_RUNTIME_PROFILE` override or automatic profile inference from config, including strict backend requirements for the managed profile (`redis` rate limiting + `postgres` quotas + `redis|s3|postgres` state coordination).
 - Breaking: backend selector parsing is now strict for auth, tarball, and policy backends (invalid backend values fail fast at startup instead of silently falling back).
 - Added bounded in-memory caches with periodic pruning for package metadata and external policy decisions; added package discovery modes (`single-node|multi-node`) with optional periodic shared-backend package-name refresh.
 - Added memory-cardinality bounds for in-memory governance backends (rate limiter/quota) to prevent unbounded key growth.

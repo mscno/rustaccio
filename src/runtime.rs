@@ -292,10 +292,10 @@ fn validate_runtime_profile_with_inputs(
                     "RUSTACCIO_RUNTIME_PROFILE=managed requires RUSTACCIO_QUOTA_BACKEND=postgres",
                 ));
             }
-            if !matches!(state_coord_backend, "redis" | "s3") {
+            if !matches!(state_coord_backend, "redis" | "s3" | "postgres") {
                 return Err(RegistryError::http(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "RUSTACCIO_RUNTIME_PROFILE=managed requires RUSTACCIO_STATE_COORDINATION_BACKEND=redis|s3",
+                    "RUSTACCIO_RUNTIME_PROFILE=managed requires RUSTACCIO_STATE_COORDINATION_BACKEND=redis|s3|postgres",
                 ));
             }
         }

@@ -178,8 +178,9 @@ Environment variables:
 - `RUSTACCIO_METADATA_BACKEND` (`sidecar` or `transactional`; default `sidecar`, `transactional` reserved/not yet available)
 - `RUSTACCIO_PACKAGE_METADATA_AUTHORITY` (`sidecar`, default `sidecar`)
   - Any non-empty value other than `sidecar` is rejected at startup.
-- `RUSTACCIO_STATE_COORDINATION_BACKEND` (`none`, `redis`, or `s3`, default `none`)
+- `RUSTACCIO_STATE_COORDINATION_BACKEND` (`none`, `redis`, `s3`, or `postgres`, default `none`)
 - `RUSTACCIO_STATE_COORDINATION_REDIS_URL` (required for `redis` state coordination backend)
+- `RUSTACCIO_STATE_COORDINATION_POSTGRES_URL` (required for `postgres` state coordination backend; falls back to `RUSTACCIO_QUOTA_POSTGRES_URL`)
 - `RUSTACCIO_STATE_COORDINATION_LOCK_KEY` (default `rustaccio:state:lock`)
 - `RUSTACCIO_STATE_COORDINATION_LEASE_MS` (default `5000`)
 - `RUSTACCIO_STATE_COORDINATION_ACQUIRE_TIMEOUT_MS` (default `15000`)
@@ -646,7 +647,7 @@ Postgres quota migrations:
 
 State write coordination (opt-in):
 
-- `RUSTACCIO_STATE_COORDINATION_BACKEND=none|redis|s3` (default `none`)
+- `RUSTACCIO_STATE_COORDINATION_BACKEND=none|redis|s3|postgres` (default `none`)
 - `RUSTACCIO_STATE_COORDINATION_REDIS_URL` (required when backend=`redis`)
 - `RUSTACCIO_STATE_COORDINATION_LOCK_KEY` (default `rustaccio:state:lock`)
 - `RUSTACCIO_STATE_COORDINATION_LEASE_MS` (default `5000`)
@@ -759,7 +760,7 @@ Managed hardening mode:
 - Managed profile additionally requires:
   - `RUSTACCIO_RATE_LIMIT_BACKEND=redis`
   - `RUSTACCIO_QUOTA_BACKEND=postgres`
-  - `RUSTACCIO_STATE_COORDINATION_BACKEND=redis|s3`
+  - `RUSTACCIO_STATE_COORDINATION_BACKEND=redis|s3|postgres`
 
 Package discovery and cache behavior:
 
@@ -769,7 +770,7 @@ Package discovery and cache behavior:
 - Invalid `RUSTACCIO_PACKAGE_DISCOVERY_MODE` values fail startup (accepted: `single-node`, `multi-node` and their aliases).
 - Package cache growth is bounded by `RUSTACCIO_PACKAGE_CACHE_MAX_ENTRIES`, TTL-controlled by `RUSTACCIO_PACKAGE_CACHE_TTL_SECS`, and pruned periodically by `RUSTACCIO_PACKAGE_CACHE_PRUNE_INTERVAL_SECS`.
 - Missing-package probes are negative-cached with `RUSTACCIO_PACKAGE_NEGATIVE_CACHE_TTL_SECS` to suppress repeated misses.
-- For strict multi-node write safety, still configure `RUSTACCIO_STATE_COORDINATION_BACKEND=redis|s3`; package discovery refresh is not a write lock.
+- For strict multi-node write safety, still configure `RUSTACCIO_STATE_COORDINATION_BACKEND=redis|s3|postgres`; package discovery refresh is not a write lock.
 - External event-driven cache hook: `POST /-/admin/package-cache/invalidate` with `{ "package": "<name>" }` evicts a package from in-memory cache so subsequent reads reload from authoritative storage.
 
 ## Deploying with Redis/Postgres Backends

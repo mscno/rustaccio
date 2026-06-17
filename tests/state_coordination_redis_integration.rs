@@ -227,7 +227,10 @@ async fn state_coordination_redis_lock_timeout_when_key_is_held() {
     let redis_url = redis_it_url();
     wait_for_redis(&redis_url).await;
     let lock_key = format!("rustaccio:test:state-lock:{}", Uuid::new_v4().as_simple());
-    let scoped_lock_key = format!("{lock_key}:state");
+    let pkg = format!("state-lock-pkg-{}", Uuid::new_v4().as_simple());
+    // Package writes coordinate on the per-package scope `package:<name>`; hold a
+    // lock at exactly that scope so the publish below cannot acquire it.
+    let scoped_lock_key = format!("{lock_key}:package:{pkg}");
 
     let mut conn = redis_connection(&redis_url).await;
     let _: Option<String> = redis::cmd("SET")
@@ -267,7 +270,6 @@ async fn state_coordination_redis_lock_timeout_when_key_is_held() {
             cfg.auth_plugin = Some(common::external_auth_plugin(&auth.uri()));
             let app = app_with_env(&cfg).await;
             let user = format!("state-lock-{}", Uuid::new_v4().as_simple());
-            let pkg = format!("state-lock-pkg-{}", Uuid::new_v4().as_simple());
             assert_eq!(
                 publish_package(&app, &user, &pkg).await,
                 StatusCode::SERVICE_UNAVAILABLE

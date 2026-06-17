@@ -249,6 +249,7 @@ fn env_defaults() -> BTreeMap<&'static str, &'static str> {
             "rustaccio:state:lock",
         ),
         ("RUSTACCIO_STATE_COORDINATION_POLL_INTERVAL_MS", "100"),
+        ("RUSTACCIO_STATE_COORDINATION_POSTGRES_URL", ""),
         ("RUSTACCIO_STATE_COORDINATION_REDIS_URL", ""),
         ("RUSTACCIO_STATE_COORDINATION_S3_BUCKET", ""),
         ("RUSTACCIO_STATE_COORDINATION_S3_REGION", ""),
