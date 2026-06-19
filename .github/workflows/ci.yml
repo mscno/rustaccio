@@ -116,7 +116,9 @@ jobs:
           RUSTACCIO_S3_IT_BUCKET: rustaccio-it
           RUSTACCIO_S3_IT_ACCESS_KEY: minioadmin
           RUSTACCIO_S3_IT_SECRET_KEY: minioadmin
-        run: cargo test --all-features --locked --test s3_minio_integration -- --ignored
+        run: |
+          cargo test --all-features --locked --test s3_minio_integration -- --ignored
+          cargo test --all-features --locked --test state_coordination_s3_integration -- --ignored
 
   governance-integration:
     runs-on: ubuntu-latest
@@ -165,6 +167,14 @@ jobs:
           RUSTACCIO_REDIS_IT_URL: redis://127.0.0.1:56379/
           RUSTACCIO_POSTGRES_IT_URL: postgres://postgres:postgres@127.0.0.1:55432/rustaccio
         run: cargo test --all-features --locked --test governance_redis_postgres_integration -- --ignored
+
+      - name: Run state-coordination lock integration tests (redis + postgres)
+        env:
+          RUSTACCIO_REDIS_IT_URL: redis://127.0.0.1:56379/
+          RUSTACCIO_POSTGRES_IT_URL: postgres://postgres:postgres@127.0.0.1:55432/rustaccio
+        run: |
+          cargo test --all-features --locked --test state_coordination_redis_lock_integration -- --ignored
+          cargo test --all-features --locked --test state_coordination_postgres_integration -- --ignored
 
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')

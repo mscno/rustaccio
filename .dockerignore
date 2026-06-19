@@ -9,3 +9,4 @@ target
 node_modules
 verdaccio
 webui/node_modules
+rustaccio-control-plane

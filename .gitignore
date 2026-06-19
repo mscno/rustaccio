@@ -6,3 +6,4 @@ verdaccio
 tmp
 local
 .tmp.Dockerfile.baseline
+rustaccio-control-plane
