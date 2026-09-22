@@ -47,6 +47,7 @@ enum PackageDiscoveryMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetadataBackend {
     Sidecar,
+    Managed,
     TransactionalPreview,
 }
 
@@ -54,6 +55,7 @@ impl MetadataBackend {
     fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "" | "sidecar" => Some(Self::Sidecar),
+            "managed" => Some(Self::Managed),
             "transactional" | "db" | "database" => Some(Self::TransactionalPreview),
             _ => None,
         }
@@ -62,6 +64,7 @@ impl MetadataBackend {
     fn as_str(self) -> &'static str {
         match self {
             Self::Sidecar => "sidecar",
+            Self::Managed => "managed",
             Self::TransactionalPreview => "transactional-preview",
         }
     }
@@ -464,7 +467,7 @@ impl Store {
         if backend == MetadataBackend::TransactionalPreview {
             return Err(RegistryError::http(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "RUSTACCIO_METADATA_BACKEND=transactional is not available yet; use sidecar",
+                "RUSTACCIO_METADATA_BACKEND=transactional is not available yet; use sidecar or managed",
             ));
         }
         Ok(backend)

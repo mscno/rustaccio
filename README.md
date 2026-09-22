@@ -773,6 +773,38 @@ Package discovery and cache behavior:
 - For strict multi-node write safety, still configure `RUSTACCIO_STATE_COORDINATION_BACKEND=redis|s3|postgres`; package discovery refresh is not a write lock.
 - External event-driven cache hook: `POST /-/admin/package-cache/invalidate` with `{ "package": "<name>" }` evicts a package from in-memory cache so subsequent reads reload from authoritative storage.
 
+### Managed data-plane bridge (control-plane managed)
+
+`RUSTACCIO_METADATA_BACKEND=managed` turns Rustaccio into a pure data plane
+for the Go control plane (contract: `docs/contracts/managed-v1.md`). The
+control plane owns metadata, entitlement and publish sessions; the node
+authorizes every private operation over HTTP, decodes/hashes publish bodies
+with bounded memory (spooling tarballs to disk), uploads them to
+control-plane issued create-only presigned URLs, reverse-proxies packument
+reads and metadata writes, redirects (or proxies) tarball downloads, and
+reports download/publish events.
+
+Required env:
+
+- `RUSTACCIO_CONTROL_PLANE_URL` (for example `https://app.privatenpm.com`)
+- `RUSTACCIO_CONTROL_PLANE_TOKEN` (node credential, sent as Bearer on every control-plane call)
+- `RUSTACCIO_TARBALL_BACKEND=s3` plus the usual S3 settings (startup fails otherwise)
+
+Optional env:
+
+- `RUSTACCIO_MANAGED_DOWNLOAD_MODE=redirect|proxy` (default `redirect`: 302 to the resolved presigned URL)
+- `RUSTACCIO_MANAGED_METADATA_ORIGIN` (default: the control-plane URL)
+- `RUSTACCIO_DATA_PLANE_ID` (fleet identity; default: hostname), `RUSTACCIO_REQUIRE_PLACEMENT=true` to refuse startup until the control plane placed the node
+- `RUSTACCIO_MANAGED_DECISION_CACHE_TTL_MS` (default `30000`; decisions never outlive their control-plane `expires_at`), `RUSTACCIO_MANAGED_DECISION_CACHE_MAX_ENTRIES` (default `10000`)
+- `RUSTACCIO_MANAGED_METADATA_CACHE_TTL_MS` (default `0` = off), `RUSTACCIO_MANAGED_METADATA_CACHE_MAX_ENTRIES` (default `128`), `RUSTACCIO_MANAGED_METADATA_CACHE_MAX_BYTES` (default 4 MiB)
+- `RUSTACCIO_MANAGED_MAX_METADATA_BYTES` (default 8 MiB publish metadata bound), `RUSTACCIO_MANAGED_UPLOAD_TIMEOUT_MS` (default `300000`), `RUSTACCIO_MANAGED_EVENT_QUEUE_CAPACITY` (default `1024`, drop-on-full)
+
+In managed mode control-plane failures fail closed (`502` with
+`CONTROL_PLANE_UNAVAILABLE`); local ACLs, uplinks and the external
+auth/policy plugins are not consulted for private operations, and
+non-registry routes fail closed with 404. Admin cache flush endpoints require
+the node credential as the bearer token.
+
 ## Deploying with Redis/Postgres Backends
 
 ### 1) Build image with required compile-time features

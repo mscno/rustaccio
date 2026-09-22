@@ -6,6 +6,7 @@ use crate::{
     error::RegistryError,
     events::EventDispatcher,
     governance::GovernanceEngine,
+    managed::ManagedState,
     observability,
     policy::{DefaultPolicyEngine, HttpPolicyConfig},
     startup_checks,
@@ -61,6 +62,14 @@ pub async fn build_state(
         uplinks.insert("default".to_string(), Upstream::new(url));
     }
 
+    // Managed data-plane bridge: validates control-plane URL + node token +
+    // s3 tarball backend, then heartbeats the fleet registry (with optional
+    // placement enforcement) before serving traffic.
+    let managed = ManagedState::from_config(config).await?;
+    if let Some(managed) = &managed {
+        managed.start().await?;
+    }
+
     Ok(AppState {
         store,
         acl,
@@ -76,6 +85,7 @@ pub async fn build_state(
         audit_enabled: config.audit_enabled,
         url_prefix: config.url_prefix.clone(),
         trust_proxy: config.trust_proxy,
+        managed,
     })
 }
 

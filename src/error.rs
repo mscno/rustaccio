@@ -19,6 +19,7 @@ pub mod code {
     pub const UPSTREAM_BAD_GATEWAY: &str = "UPSTREAM_BAD_GATEWAY";
     pub const UPSTREAM_UNAVAILABLE: &str = "UPSTREAM_UNAVAILABLE";
     pub const UPSTREAM_TIMEOUT: &str = "UPSTREAM_TIMEOUT";
+    pub const CONTROL_PLANE_UNAVAILABLE: &str = "CONTROL_PLANE_UNAVAILABLE";
     pub const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
 }
 

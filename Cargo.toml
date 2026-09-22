@@ -26,13 +26,15 @@ aws-smithy-http-client = { version = "1.1.10", optional = true, default-features
 axum = { version = "0.7.9", default-features = false, features = ["http1", "tokio", "json"] }
 base64 = "0.22.1"
 chrono = { version = "0.4.43", features = ["clock"] }
+futures = "0.3.31"
 config = { version = "0.15.11", default-features = false, features = ["yaml"] }
 hex = "0.4.3"
 hyper = { version = "1.8.0", default-features = false, features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1.19", features = ["server-auto", "service", "tokio", "http1", "http2"] }
 password-hash = "0.5.0"
 rand = "0.8.5"
-reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "stream"] }
+sha1 = "0.10.6"
 redis = { version = "0.27.6", optional = true, default-features = false, features = ["tokio-comp", "script"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["preserve_order"] }

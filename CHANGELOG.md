@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Added a managed data-plane bridge (`RUSTACCIO_METADATA_BACKEND=managed`): Rustaccio runs as a byte-heavy data plane for the Go control plane (`RUSTACCIO_CONTROL_PLANE_URL` + `RUSTACCIO_CONTROL_PLANE_TOKEN`), with control-plane authorization of every private operation, a streaming reserve → upload → finalize publish bridge (bounded memory, SHA-512/SHA-1 hashing, create-only presigned uploads), packument reverse-proxying, redirect/proxy tarball downloads, best-effort usage events, and fleet heartbeat/placement. See `docs/contracts/managed-v1.md`.
+
 ## [0.10.0] - 2026-06-19
 
 ### Added
