@@ -200,6 +200,10 @@ pub struct FinalizePublishRequest<'a> {
     pub token: &'a str,
     pub generation: i64,
     pub fingerprint: &'a str,
+    /// The verified version manifest travels again: the control plane stores
+    /// it on the committed version and checks it against the reservation's
+    /// manifest hash.
+    pub manifest: &'a Value,
     pub integrity: &'a str,
     pub shasum: &'a str,
     pub tarball_bytes: u64,

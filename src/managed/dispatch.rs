@@ -1052,6 +1052,7 @@ async fn publish_inner(
                 token,
                 generation: reserve.generation,
                 fingerprint: &fingerprint,
+                manifest: &publish.manifest,
                 integrity: &integrity,
                 shasum: &shasum,
                 tarball_bytes,

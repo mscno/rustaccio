@@ -248,6 +248,10 @@ async fn publish_flows_through_reserve_upload_finalize() {
     );
     assert_eq!(finalize["tarball_bytes"], 18);
     assert_eq!(finalize["shasum"].as_str().unwrap().len(), 40);
+    // The verified manifest travels to finalize: the control plane stores it
+    // on the committed version and hash-binds it to the reservation.
+    assert_eq!(finalize["manifest"]["name"], "demo");
+    assert_eq!(finalize["manifest"]["version"], "1.0.0");
 }
 
 #[tokio::test]
