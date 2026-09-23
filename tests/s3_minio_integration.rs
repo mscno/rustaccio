@@ -46,7 +46,7 @@ fn it_secret_key() -> String {
 }
 
 async fn s3_client(endpoint: &str, region: &str, access_key: &str, secret_key: &str) -> S3Client {
-    let shared = aws_config::defaults(aws_config::BehaviorVersion::latest())
+    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(Region::new(region.to_string()))
         .credentials_provider(Credentials::new(
             access_key.to_string(),
@@ -54,9 +54,27 @@ async fn s3_client(endpoint: &str, region: &str, access_key: &str, secret_key: &
             None,
             None,
             "rustaccio-it",
-        ))
-        .load()
-        .await;
+        ));
+
+    // aws-config is built without `default-https-client`; provide an explicit
+    // connector for both HTTP and HTTPS endpoints.
+    loader = loader.http_client(
+        if endpoint
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("http://")
+        {
+            aws_smithy_http_client::Builder::new().build_http()
+        } else {
+            aws_smithy_http_client::Builder::new()
+                .tls_provider(aws_smithy_http_client::tls::Provider::rustls(
+                    aws_smithy_http_client::tls::rustls_provider::CryptoMode::Ring,
+                ))
+                .build_https()
+        },
+    );
+
+    let shared = loader.load().await;
 
     let conf = S3ConfigBuilder::from(&shared)
         .endpoint_url(endpoint)
