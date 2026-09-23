@@ -1,5 +1,0 @@
-# Shared compiler cache. CI already uses sccache; this brings local parity for
-# every cargo invocation (including lefthook hooks, which run cargo directly).
-# Requires sccache on PATH (e.g. `brew install sccache`).
-[build]
-rustc-wrapper = "sccache"

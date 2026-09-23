@@ -90,9 +90,6 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
-
       - name: Cache
         uses: Swatinem/rust-cache@v2
 
@@ -133,9 +130,6 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
 
       - name: Cache
         uses: Swatinem/rust-cache@v2

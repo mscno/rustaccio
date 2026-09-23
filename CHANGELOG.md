@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Build
 
-- Added repo-level `.cargo/config.toml` enabling the `sccache` rustc wrapper for all cargo invocations (requires `sccache` on `PATH`, e.g. `brew install sccache`), matching existing CI behavior.
+- Pre-commit hooks now auto-use the `sccache` compiler cache when it is installed (`brew install sccache`), matching the existing `just` recipes and CI behavior.
 - Dev profile now uses `debug = 1` (line tables only) for faster codegen/linking and smaller artifacts; breakpoints and backtraces still work, debugger variable inspection is limited.
 - Release profile no longer uses incremental compilation.
 - Pre-commit hook drops the standalone `cargo check` step; `cargo clippy --all-targets --all-features` is a strict superset and running both forced full rebuilds.

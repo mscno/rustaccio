@@ -7,6 +7,11 @@ pre-commit:
     # (same analysis plus lints, wider feature coverage) and running both forces
     # a full rebuild due to driver/feature-set fingerprint changes.
     cargo-clippy:
-      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # Use sccache when available (same auto-detect pattern as the justfile).
+      run: |
+        if command -v sccache >/dev/null 2>&1; then export RUSTC_WRAPPER=sccache; fi
+        cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo-test:
-      run: cargo test --workspace --all-targets --locked --quiet
+      run: |
+        if command -v sccache >/dev/null 2>&1; then export RUSTC_WRAPPER=sccache; fi
+        cargo test --workspace --all-targets --locked --quiet
