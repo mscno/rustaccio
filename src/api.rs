@@ -65,14 +65,21 @@ pub async fn dispatch(
         return Ok(response);
     }
 
-    let auth_identity = resolve_auth_identity(
-        &state.store,
-        &headers,
-        &method,
-        &path,
-        request_id.as_deref(),
-    )
-    .await?;
+    let managed = state.managed.clone();
+    let auth_identity = if managed.is_some() {
+        // Managed mode: the control plane authenticates and authorizes every
+        // private operation; local auth backends are never consulted.
+        None
+    } else {
+        resolve_auth_identity(
+            &state.store,
+            &headers,
+            &method,
+            &path,
+            request_id.as_deref(),
+        )
+        .await?
+    };
     let auth_user = auth_identity_primary_name(auth_identity.as_ref()).map(ToOwned::to_owned);
 
     if method == Method::GET
@@ -99,10 +106,30 @@ pub async fn dispatch(
         auth_identity.as_ref(),
         &request_context.tenant,
     );
-    state.governance.enforce(&governance_context).await?;
+    if managed.is_none() {
+        state.governance.enforce(&governance_context).await?;
+    }
 
     if method == Method::GET && path == "/-/ping" {
         return Ok(json_response(StatusCode::OK, json!({}), HEADER_JSON));
+    }
+
+    if let Some(managed) = managed {
+        // Boxed: the managed dispatch future is large; boxing keeps the
+        // surrounding dispatch future's layout depth small for dependents.
+        return Box::pin(crate::managed::dispatch::dispatch(
+            crate::managed::dispatch::ManagedRequest {
+                state,
+                managed,
+                method,
+                path,
+                query,
+                headers,
+                request_context,
+                req,
+            },
+        ))
+        .await;
     }
 
     if method == Method::GET && path == "/-/whoami" {
@@ -1608,7 +1635,7 @@ fn text_response(status: StatusCode, content_type: &str, body: String) -> Respon
         .unwrap_or_else(|_| Response::new(Body::from(String::new())))
 }
 
-fn parse_canonical_dist_tags_path(path: &str) -> Option<(String, Option<String>)> {
+pub(crate) fn parse_canonical_dist_tags_path(path: &str) -> Option<(String, Option<String>)> {
     let rest = path.strip_prefix("/-/package/")?;
     let idx = rest.find("/dist-tags")?;
     let pkg = decode_path_component(&rest[..idx]);
@@ -1620,7 +1647,7 @@ fn parse_canonical_dist_tags_path(path: &str) -> Option<(String, Option<String>)
     Some((pkg, tag))
 }
 
-fn parse_package_path(path: &str) -> Option<(String, Vec<String>)> {
+pub(crate) fn parse_package_path(path: &str) -> Option<(String, Vec<String>)> {
     if path.starts_with("/-/") {
         return None;
     }

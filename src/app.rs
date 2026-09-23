@@ -1,6 +1,6 @@
 use crate::{
-    acl::Acl, api, events::EventDispatcher, governance::GovernanceEngine, policy::PolicyEngine,
-    storage::Store, upstream::Upstream,
+    acl::Acl, api, events::EventDispatcher, governance::GovernanceEngine, managed::ManagedState,
+    policy::PolicyEngine, storage::Store, upstream::Upstream,
 };
 use axum::{
     Router,
@@ -70,6 +70,9 @@ pub struct AppState {
     pub audit_enabled: bool,
     pub url_prefix: String,
     pub trust_proxy: bool,
+    /// Present when `RUSTACCIO_METADATA_BACKEND=managed`: the node runs as a
+    /// data plane bridged to the Go control plane.
+    pub managed: Option<Arc<ManagedState>>,
 }
 
 pub fn build_router(state: AppState) -> Router {

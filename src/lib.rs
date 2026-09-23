@@ -14,6 +14,7 @@ pub mod error;
 pub mod events;
 pub mod examples;
 pub mod governance;
+pub mod managed;
 pub mod models;
 pub mod observability;
 pub mod policy;

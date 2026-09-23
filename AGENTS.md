@@ -99,6 +99,7 @@ Rustaccio has two valid operating modes. Agents must preserve both.
 2. Managed-mode safeguards must be additive and explicitly gated behind config/env/feature flags.
 3. Never make Redis/Postgres/OTel/policy dependencies mandatory for core startup.
 4. Never reintroduce package-snapshot authority for package metadata in runtime paths; sidecar remains authoritative.
+   - Exception: `RUSTACCIO_METADATA_BACKEND=managed` selects the managed data-plane bridge (`docs/contracts/managed-v1.md`), where the Go control plane is the metadata authority and Rustaccio only bridges bytes (publish decode/hash/upload, download redirect/proxy, events). This mode is additive and env-gated; sidecar mode behavior must not change.
 5. Document mode impacts in `README.md` when behavior/config changes.
 6. Add/update tests to cover both:
    - simple local path
