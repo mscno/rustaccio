@@ -3,8 +3,9 @@ pre-commit:
   commands:
     cargo-fmt:
       run: cargo fmt --all -- --check
-    cargo-check:
-      run: cargo check --workspace --all-targets --locked
+    # cargo check is intentionally omitted: clippy --all-features is a superset
+    # (same analysis plus lints, wider feature coverage) and running both forces
+    # a full rebuild due to driver/feature-set fingerprint changes.
     cargo-clippy:
       run: cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo-test:

@@ -124,14 +124,23 @@ async fn s3_client(endpoint: &str, region: &str, access_key: &str, secret_key: &
             "rustaccio-it",
         ));
 
-    if endpoint
-        .trim_start()
-        .to_ascii_lowercase()
-        .starts_with("http://")
-    {
-        let http_client = aws_smithy_http_client::Builder::new().build_http();
-        loader = loader.http_client(http_client);
-    }
+    // aws-config is built without `default-https-client`; provide an explicit
+    // connector for both HTTP and HTTPS endpoints.
+    loader = loader.http_client(
+        if endpoint
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("http://")
+        {
+            aws_smithy_http_client::Builder::new().build_http()
+        } else {
+            aws_smithy_http_client::Builder::new()
+                .tls_provider(aws_smithy_http_client::tls::Provider::rustls(
+                    aws_smithy_http_client::tls::rustls_provider::CryptoMode::Ring,
+                ))
+                .build_https()
+        },
+    );
 
     let shared = loader.load().await;
 

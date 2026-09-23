@@ -1,6 +1,6 @@
 [package]
 name = "rustaccio"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 default-run = "rustaccio"
@@ -20,9 +20,9 @@ otel = [
 [dependencies]
 argon2 = "0.5.3"
 async-trait = "0.1.89"
-aws-config = { version = "1.8.14", optional = true }
-aws-sdk-s3 = { version = "1.123.0", optional = true }
-aws-smithy-http-client = { version = "1.1.10", optional = true, default-features = false, features = ["rustls-aws-lc"] }
+aws-config = { version = "1.8.14", optional = true, default-features = false, features = ["credentials-process", "rt-tokio", "sso"] }
+aws-sdk-s3 = { version = "1.123.0", optional = true, default-features = false, features = ["sigv4a", "http-1x", "rustls", "rt-tokio"] }
+aws-smithy-http-client = { version = "1.1.10", optional = true, default-features = false, features = ["rustls-ring"] }
 axum = { version = "0.7.9", default-features = false, features = ["http1", "tokio", "json"] }
 base64 = "0.22.1"
 chrono = { version = "0.4.43", features = ["clock"] }
@@ -62,6 +62,11 @@ tar = "0.4.44"
 tempfile = "3.25.0"
 wiremock = "0.6.5"
 
+[profile.dev]
+# Line tables only: much faster codegen/link and far smaller artifacts.
+# Breakpoints and backtraces still work; debugger variable inspection is limited.
+debug = 1
+
 [profile.release]
 opt-level = 3
 lto = "thin"
@@ -69,7 +74,6 @@ codegen-units = 16
 strip = "symbols"
 panic = "abort"
 debug = 0
-incremental = true
 
 [profile.dist]
 inherits = "release"

@@ -396,24 +396,33 @@ impl S3TarballBackend {
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .region(aws_sdk_s3::config::Region::new(cfg.region.clone()));
 
-        if endpoint_is_https && let Some(ca_bundle) = load_s3_ca_bundle_pem()? {
-            let tls_context = aws_smithy_http_client::tls::TlsContext::builder()
-                .with_trust_store(
-                    aws_smithy_http_client::tls::TrustStore::empty()
-                        .with_native_roots(false)
-                        .with_pem_certificate(ca_bundle),
-                )
-                .build()
-                .map_err(|_| RegistryError::Internal)?;
-            let http_client = aws_smithy_http_client::Builder::new()
-                .tls_provider(aws_smithy_http_client::tls::Provider::rustls(
-                    aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
-                ))
-                .tls_context(tls_context)
-                .build_https();
-            loader = loader.http_client(http_client);
-            debug!("configured s3 http client with PEM CA bundle");
-        }
+        // Always set an explicit connector: aws-config is built without its
+        // `default-https-client` feature so TLS stays on `ring` (avoids
+        // compiling aws-lc-sys alongside the ring already used by reqwest).
+        let http_client = if endpoint_is_https {
+            let client_builder = aws_smithy_http_client::Builder::new().tls_provider(
+                aws_smithy_http_client::tls::Provider::rustls(
+                    aws_smithy_http_client::tls::rustls_provider::CryptoMode::Ring,
+                ),
+            );
+            if let Some(ca_bundle) = load_s3_ca_bundle_pem()? {
+                let tls_context = aws_smithy_http_client::tls::TlsContext::builder()
+                    .with_trust_store(
+                        aws_smithy_http_client::tls::TrustStore::empty()
+                            .with_native_roots(false)
+                            .with_pem_certificate(ca_bundle),
+                    )
+                    .build()
+                    .map_err(|_| RegistryError::Internal)?;
+                debug!("configured s3 http client with PEM CA bundle");
+                client_builder.tls_context(tls_context).build_https()
+            } else {
+                client_builder.build_https()
+            }
+        } else {
+            aws_smithy_http_client::Builder::new().build_http()
+        };
+        loader = loader.http_client(http_client);
 
         if let (Some(access_key), Some(secret_key)) =
             (cfg.access_key_id.clone(), cfg.secret_access_key.clone())

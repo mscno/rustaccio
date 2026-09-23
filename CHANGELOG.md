@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-23
+
+### Changed
+
+- Switched the S3 client's TLS provider from `aws-lc-rs` to `ring` (`ring` was already in the dependency tree via `reqwest`): `aws-smithy-http-client` now uses its `rustls-ring` feature, `aws-config`/`aws-sdk-s3` no longer enable their `default-https-client` feature, and all S3 code paths set an explicit HTTP connector. This removes the large `aws-lc-sys` C build, cutting cold `--features s3` / `--all-features` compile times. No behavioral change is expected for S3 operations; note the S3 client no longer negotiates post-quantum hybrid TLS key exchange.
+
+### Build
+
+- Added repo-level `.cargo/config.toml` enabling the `sccache` rustc wrapper for all cargo invocations (requires `sccache` on `PATH`, e.g. `brew install sccache`), matching existing CI behavior.
+- Dev profile now uses `debug = 1` (line tables only) for faster codegen/linking and smaller artifacts; breakpoints and backtraces still work, debugger variable inspection is limited.
+- Release profile no longer uses incremental compilation.
+- Pre-commit hook drops the standalone `cargo check` step; `cargo clippy --all-targets --all-features` is a strict superset and running both forced full rebuilds.
+
 ## [0.11.0] - 2026-09-23
 
 ### Added

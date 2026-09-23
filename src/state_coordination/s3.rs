@@ -62,10 +62,18 @@ impl S3LockBackend {
                     .starts_with("http://")
             })
             .unwrap_or(false);
-        if endpoint_is_http {
-            let http_client = aws_smithy_http_client::Builder::new().build_http();
-            loader = loader.http_client(http_client);
-        }
+        // Explicit connector in all cases: aws-config is built without
+        // `default-https-client` (keeps TLS on `ring`, avoids aws-lc-sys).
+        let http_client = if endpoint_is_http {
+            aws_smithy_http_client::Builder::new().build_http()
+        } else {
+            aws_smithy_http_client::Builder::new()
+                .tls_provider(aws_smithy_http_client::tls::Provider::rustls(
+                    aws_smithy_http_client::tls::rustls_provider::CryptoMode::Ring,
+                ))
+                .build_https()
+        };
+        loader = loader.http_client(http_client);
 
         if let (Some(access_key), Some(secret_key)) = (access_key_id, secret_access_key) {
             loader = loader.credentials_provider(aws_sdk_s3::config::Credentials::new(
