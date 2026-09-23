@@ -1,17 +1,23 @@
 pre-commit:
   parallel: false
   commands:
+    # Make cargo reachable from non-shell contexts (GUI git clients, IDEs):
+    # source the rustup env if it exists before invoking cargo.
     cargo-fmt:
-      run: cargo fmt --all -- --check
+      run: |
+        [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+        cargo fmt --all -- --check
     # cargo check is intentionally omitted: clippy --all-features is a superset
     # (same analysis plus lints, wider feature coverage) and running both forces
     # a full rebuild due to driver/feature-set fingerprint changes.
     cargo-clippy:
       # Use sccache when available (same auto-detect pattern as the justfile).
       run: |
+        [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
         if command -v sccache >/dev/null 2>&1; then export RUSTC_WRAPPER=sccache; fi
         cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo-test:
       run: |
+        [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
         if command -v sccache >/dev/null 2>&1; then export RUSTC_WRAPPER=sccache; fi
         cargo test --workspace --all-targets --locked --quiet
