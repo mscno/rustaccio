@@ -102,7 +102,7 @@ jobs:
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
             -p 9002:9000 \
-            minio/minio server /data
+            quay.io/minio/minio server /data
           for i in $(seq 1 30); do
             if curl -sf http://127.0.0.1:9002/minio/health/live; then
               echo "MinIO is ready"
