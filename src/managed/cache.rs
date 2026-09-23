@@ -448,10 +448,10 @@ mod tests {
     #[tokio::test]
     async fn decision_cache_expiry_uses_clamped_deadline() {
         let cache = DecisionCache::new(100, 3_600_000);
-        let soon = (chrono::Utc::now() + chrono::Duration::milliseconds(20)).to_rfc3339();
+        let soon = (chrono::Utc::now() + chrono::Duration::milliseconds(500)).to_rfc3339();
         cache.put(&scope(), &decision(true, Some(soon), 1)).await;
         assert!(cache.get(&scope()).await.is_some());
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
         assert!(
             cache.get(&scope()).await.is_none(),
             "entry must expire at the control-plane deadline, not the local TTL"

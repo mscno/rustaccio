@@ -696,7 +696,7 @@ async fn handle_download(input: DownloadInput) -> Result<Response<Body>, Registr
         filename,
     } = input;
 
-    let Some(version) = infer_version_from_filename(&filename) else {
+    let Some(version) = infer_version_from_filename(&filename, &package_name) else {
         return Err(RegistryError::http(
             StatusCode::NOT_FOUND,
             "no such file available",
@@ -862,21 +862,24 @@ async fn handle_download(input: DownloadInput) -> Result<Response<Body>, Registr
 /// Splits at the first `-` followed by a digit so prerelease suffixes
 /// (`pkg-1.0.0-beta.1.tgz`) stay intact; package names themselves never start
 /// with a digit, so the first digit-led segment begins the version.
-fn infer_version_from_filename(filename: &str) -> Option<String> {
+/// Infer the exact version from a tarball filename by stripping the package
+/// base name: `<base>-<semver>.tgz`. The base comes from the request path, so
+/// names containing dashes or digit-starting segments parse correctly.
+fn infer_version_from_filename(filename: &str, package_name: &str) -> Option<String> {
     let stem = filename
         .strip_suffix(".tgz")
         .or_else(|| filename.strip_suffix(".tar.gz"))?;
-    let segments: Vec<&str> = stem.split('-').collect();
-    let start = segments.iter().position(|segment| {
-        segment
-            .chars()
-            .next()
-            .is_some_and(|first| first.is_ascii_digit())
-    })?;
-    if start == 0 {
+    let base = package_name.rsplit('/').next().unwrap_or(package_name);
+    let version = stem.strip_prefix(base)?.strip_prefix('-')?;
+    // The version is npm-semver-shaped: digit-starting with a patch segment.
+    // (The control plane validates strictly; this keeps foreign files 404.)
+    let mut parts = version.split('.');
+    let (major, minor, patch) = (parts.next()?, parts.next()?, parts.next()?);
+    let digit = |s: &str| s.chars().next().is_some_and(|c| c.is_ascii_digit());
+    if !(digit(major) && digit(minor) && digit(patch)) {
         return None;
     }
-    Some(segments[start..].join("-"))
+    Some(version.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1299,18 +1302,33 @@ mod tests {
     #[test]
     fn infers_versions_from_tarball_filenames() {
         assert_eq!(
-            infer_version_from_filename("demo-1.2.3.tgz"),
+            infer_version_from_filename("demo-1.2.3.tgz", "demo"),
             Some("1.2.3".to_string())
         );
         assert_eq!(
-            infer_version_from_filename("core-0.1.0-beta.1.tgz"),
+            infer_version_from_filename("core-0.1.0-beta.1.tgz", "core"),
             Some("0.1.0-beta.1".to_string())
         );
-        assert_eq!(infer_version_from_filename("demo.tgz"), None);
-        assert_eq!(infer_version_from_filename("demo-beta.tgz"), None);
+        assert_eq!(infer_version_from_filename("demo.tgz", "demo"), None);
+        assert_eq!(infer_version_from_filename("demo-beta.tgz", "demo"), None);
         assert_eq!(
-            infer_version_from_filename("demo-1.2.3.tar.gz"),
+            infer_version_from_filename("demo-1.2.3.tar.gz", "demo"),
             Some("1.2.3".to_string())
         );
+        // Scoped names and digit-starting dash segments parse through the
+        // base name, never by segment heuristics.
+        assert_eq!(
+            infer_version_from_filename(
+                "hello-1790123229837107000-1.0.0.tgz",
+                "@it/hello-1790123229837107000"
+            ),
+            Some("1.0.0".to_string())
+        );
+        assert_eq!(
+            infer_version_from_filename("foo-2-3.1.4.tgz", "@scope/foo-2"),
+            Some("3.1.4".to_string())
+        );
+        // A foreign tarball never resolves.
+        assert_eq!(infer_version_from_filename("other-1.0.0.tgz", "demo"), None);
     }
 }
