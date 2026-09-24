@@ -199,7 +199,7 @@ fn env_defaults() -> BTreeMap<&'static str, &'static str> {
         ("RUSTACCIO_DATA_DIR", ".rustaccio-data"),
         ("RUSTACCIO_DATA_PLANE_ID", ""),
         ("RUSTACCIO_KEEP_ALIVE_TIMEOUT", ""),
-        ("RUSTACCIO_LOG_FORMAT", "pretty"),
+        ("RUSTACCIO_LOG_FORMAT", "auto"),
         ("RUSTACCIO_LOG_LEVEL", "info"),
         ("RUSTACCIO_MAX_BODY_SIZE", "50mb"),
         ("RUSTACCIO_METADATA_BACKEND", "sidecar"),

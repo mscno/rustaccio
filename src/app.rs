@@ -5,7 +5,7 @@ use crate::{
 use axum::{
     Router,
     body::Body,
-    http::{HeaderName, StatusCode},
+    http::{HeaderName, Response, StatusCode},
     routing::any,
 };
 use config::{Config as SettingsLoader, Environment};
@@ -14,9 +14,13 @@ use tower_http::{
     limit::RequestBodyLimitLayer,
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     timeout::TimeoutLayer,
-    trace::{DefaultOnFailure, DefaultOnResponse, TraceLayer},
+    trace::{DefaultOnFailure, OnResponse, TraceLayer},
 };
-use tracing::Level;
+use tracing::{Level, Span};
+
+/// Health probes poll every few seconds; their spans are debug-level so they
+/// stay out of info logs.
+const HEALTH_PATH_SUFFIX: &str = "/-/ping";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminAccessConfig {
@@ -87,15 +91,15 @@ pub fn build_router(state: AppState) -> Router {
                 .get(&trace_request_id_header)
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or("-");
-            tracing::span!(
-                Level::INFO,
-                "http_request",
-                method = %request.method(),
-                path = %request.uri().path(),
-                request_id = %request_id
-            )
+            let method = request.method();
+            let path = request.uri().path();
+            if is_health_path(path) {
+                tracing::debug_span!("http_request", %method, %path, %request_id)
+            } else {
+                tracing::info_span!("http_request", %method, %path, %request_id)
+            }
         })
-        .on_response(DefaultOnResponse::new().level(Level::INFO))
+        .on_response(AccessLog)
         .on_failure(DefaultOnFailure::new().level(Level::ERROR));
 
     Router::new()
@@ -106,9 +110,35 @@ pub fn build_router(state: AppState) -> Router {
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(request_timeout_secs),
         ))
+        // Layers wrap outward: the request ID is set before the trace span
+        // reads it, and propagated onto the response afterwards.
+        .layer(trace_layer)
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
         .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
-        .layer(trace_layer)
+}
+
+fn is_health_path(path: &str) -> bool {
+    path.ends_with(HEALTH_PATH_SUFFIX)
+}
+
+/// One access line per request, inside the request span (method, path,
+/// request ID). Nothing is logged when the span is filtered out, as for
+/// health probes at the default level.
+#[derive(Clone, Copy, Debug)]
+struct AccessLog;
+
+impl<B> OnResponse<B> for AccessLog {
+    fn on_response(self, response: &Response<B>, latency: Duration, span: &Span) {
+        if span.is_disabled() {
+            return;
+        }
+        tracing::info!(
+            parent: span,
+            status = response.status().as_u16(),
+            latency_ms = latency.as_millis() as u64,
+            "request completed"
+        );
+    }
 }
 
 fn request_timeout_secs_from_env() -> u64 {
@@ -153,7 +183,17 @@ fn parse_principal_list(raw: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdminAccessConfig, parse_principal_list, parse_request_timeout_secs};
+    use super::{
+        AdminAccessConfig, is_health_path, parse_principal_list, parse_request_timeout_secs,
+    };
+
+    #[test]
+    fn health_probes_are_recognised_under_a_prefix() {
+        assert!(is_health_path("/-/ping"));
+        assert!(is_health_path("/registry/-/ping"));
+        assert!(!is_health_path("/-/pings"));
+        assert!(!is_health_path("/lodash"));
+    }
 
     #[test]
     fn request_timeout_defaults_to_30() {

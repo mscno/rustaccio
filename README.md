@@ -140,7 +140,7 @@ Environment variables:
 - `RUSTACCIO_KEEP_ALIVE_TIMEOUT` (seconds, optional; applied as HTTP/1 keep-alive/header-read timeout)
 - `RUSTACCIO_REQUEST_TIMEOUT_SECS` (default `30`, clamps `1..=300`)
 - `RUSTACCIO_LOG_LEVEL` (default `info`)
-- `RUSTACCIO_LOG_FORMAT` (`pretty`, `compact`, or `json`, default `pretty`)
+- `RUSTACCIO_LOG_FORMAT` (`auto`, `pretty`, `compact`, or `json`, default `auto`: `pretty` on an interactive terminal, `json` otherwise; colours only on a terminal and never with `NO_COLOR`)
 - `RUSTACCIO_VERBOSE_DEP_LOGS` (default `false`; set `true`/`1` to keep noisy dependency targets at your chosen `RUST_LOG` level)
 - `RUST_LOG` (optional full tracing filter; overrides default `rustaccio=<level>,tower_http=info`)
 - `RUSTACCIO_TOKIO_WORKER_THREADS` (default `min(max(available_parallelism, 2), 8)`)

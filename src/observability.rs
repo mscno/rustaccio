@@ -1,4 +1,5 @@
 use config::{Config as SettingsLoader, Environment};
+use std::io::IsTerminal;
 use std::sync::OnceLock;
 #[cfg(feature = "otel")]
 use tracing_opentelemetry::OpenTelemetryLayer;
@@ -6,9 +7,7 @@ use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::Registry;
 #[cfg(not(feature = "otel"))]
 use tracing_subscriber::layer::Identity;
-use tracing_subscriber::{
-    EnvFilter, fmt, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt,
-};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 static TRACING_INIT: OnceLock<()> = OnceLock::new();
 const NOISY_DEP_TARGETS: [&str; 9] = [
@@ -31,15 +30,26 @@ pub enum LogFormat {
 }
 
 impl LogFormat {
+    /// Reads `RUSTACCIO_LOG_FORMAT`. `auto` (the default) picks `pretty` for
+    /// an interactive terminal and `json` otherwise, so containers and log
+    /// shippers get one structured line per event without configuration.
     fn from_env() -> Self {
-        match load_env_value("RUSTACCIO_LOG_FORMAT")
-            .unwrap_or_else(|| "pretty".to_string())
-            .to_ascii_lowercase()
-            .as_str()
+        Self::parse(
+            load_env_value("RUSTACCIO_LOG_FORMAT").as_deref(),
+            std::io::stdout().is_terminal(),
+        )
+    }
+
+    fn parse(raw: Option<&str>, terminal: bool) -> Self {
+        match raw
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
         {
-            "json" => Self::Json,
-            "compact" => Self::Compact,
-            _ => Self::Pretty,
+            Some("json") => Self::Json,
+            Some("compact") => Self::Compact,
+            Some("pretty") => Self::Pretty,
+            _ if terminal => Self::Pretty,
+            _ => Self::Json,
         }
     }
 
@@ -70,6 +80,11 @@ pub fn init_from_env(default_level: &str) -> TracingSettings {
 
     maybe_warn_about_otel_without_feature();
 
+    let ansi = ansi_enabled(
+        std::io::stdout().is_terminal(),
+        load_env_value("NO_COLOR").as_deref(),
+    );
+
     TRACING_INIT.get_or_init(|| match log_format {
         LogFormat::Json => {
             tracing_subscriber::registry()
@@ -81,8 +96,7 @@ pub fn init_from_env(default_level: &str) -> TracingSettings {
                         .json()
                         .flatten_event(true)
                         .with_current_span(true)
-                        .with_span_list(true)
-                        .with_span_events(FmtSpan::CLOSE),
+                        .with_span_list(false),
                 )
                 .init();
         }
@@ -91,13 +105,7 @@ pub fn init_from_env(default_level: &str) -> TracingSettings {
                 .with(otel_layer_from_env())
                 .with(env_filter)
                 .with(tracing_error::ErrorLayer::default())
-                .with(
-                    fmt::layer()
-                        .compact()
-                        .with_target(true)
-                        .with_line_number(true)
-                        .with_span_events(FmtSpan::CLOSE),
-                )
+                .with(fmt::layer().compact().with_ansi(ansi).with_target(true))
                 .init();
         }
         LogFormat::Pretty => {
@@ -108,15 +116,21 @@ pub fn init_from_env(default_level: &str) -> TracingSettings {
                 .with(
                     fmt::layer()
                         .pretty()
+                        .with_ansi(ansi)
                         .with_target(true)
-                        .with_line_number(true)
-                        .with_span_events(FmtSpan::CLOSE),
+                        .with_line_number(true),
                 )
                 .init();
         }
     });
 
     TracingSettings { filter, log_format }
+}
+
+/// Colours only for a terminal, and never when `NO_COLOR` is set to a
+/// non-empty value (https://no-color.org).
+fn ansi_enabled(terminal: bool, no_color: Option<&str>) -> bool {
+    terminal && no_color.is_none_or(str::is_empty)
 }
 
 #[cfg(not(feature = "otel"))]
@@ -209,7 +223,41 @@ fn has_target_directive(filter: &str, target: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_target_directive, with_noisy_dependency_guards};
+    use super::{LogFormat, ansi_enabled, has_target_directive, with_noisy_dependency_guards};
+
+    #[test]
+    fn auto_format_follows_the_terminal() {
+        assert!(matches!(LogFormat::parse(None, true), LogFormat::Pretty));
+        assert!(matches!(LogFormat::parse(None, false), LogFormat::Json));
+        assert!(matches!(
+            LogFormat::parse(Some("auto"), false),
+            LogFormat::Json
+        ));
+    }
+
+    #[test]
+    fn explicit_format_wins_over_the_terminal() {
+        assert!(matches!(
+            LogFormat::parse(Some("pretty"), false),
+            LogFormat::Pretty
+        ));
+        assert!(matches!(
+            LogFormat::parse(Some(" JSON "), true),
+            LogFormat::Json
+        ));
+        assert!(matches!(
+            LogFormat::parse(Some("compact"), true),
+            LogFormat::Compact
+        ));
+    }
+
+    #[test]
+    fn ansi_only_on_a_terminal_without_no_color() {
+        assert!(ansi_enabled(true, None));
+        assert!(ansi_enabled(true, Some("")));
+        assert!(!ansi_enabled(true, Some("1")));
+        assert!(!ansi_enabled(false, None));
+    }
 
     #[test]
     fn appends_dependency_guards_to_global_debug_filter() {

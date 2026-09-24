@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-24
+
+### Changed
+
+- `RUSTACCIO_LOG_FORMAT` defaults to `auto`: `pretty` on an interactive terminal, `json` otherwise (containers, log shippers). Set `pretty` or `compact` explicitly to keep human-readable output outside a terminal.
+- ANSI colours are emitted only when stdout is a terminal, and never when `NO_COLOR` is set.
+- HTTP requests log one `request completed` line (`status`, `latency_ms`, inside the `http_request` span with `method`, `path`, `request_id`) instead of a tower-http response line plus a span-close line.
+- `/-/ping` health probes are logged at debug level, so they no longer appear at the default `info` level.
+
+### Fixed
+
+- The `http_request` span now carries the generated or caller-supplied `x-request-id`; it was always `-` because the trace layer ran before the request ID was set.
+
 ## [0.12.0] - 2026-09-23
 
 ### Changed
