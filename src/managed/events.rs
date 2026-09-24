@@ -36,12 +36,21 @@ impl EventReporter {
         }
     }
 
-    pub fn event(kind: &str, tenant_id: Option<&str>, package: &str, bytes: u64) -> ManagedEvent {
+    pub fn event(
+        kind: &str,
+        tenant_id: Option<&str>,
+        package: &str,
+        version: Option<&str>,
+        bytes: u64,
+        credential_id: Option<&str>,
+    ) -> ManagedEvent {
         ManagedEvent {
             event_id: uuid::Uuid::new_v4().to_string(),
             kind: kind.to_string(),
             tenant_id: tenant_id.unwrap_or_default().to_string(),
             package: package.to_string(),
+            version: version.map(ToOwned::to_owned),
+            credential_id: credential_id.map(ToOwned::to_owned),
             bytes,
             occurred_at: chrono::Utc::now().to_rfc3339(),
         }

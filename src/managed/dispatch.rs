@@ -776,7 +776,9 @@ async fn handle_download(input: DownloadInput) -> Result<Response<Body>, Registr
             super::events::EVENT_DOWNLOAD,
             tenant_id.as_deref(),
             &package_name,
+            resolve.version.as_ref().map(|v| v.semver.as_str()),
             tarball_bytes,
+            resolve.credential_id.as_deref(),
         ));
         return Ok(Response::builder()
             .status(StatusCode::FOUND)
@@ -825,6 +827,8 @@ async fn handle_download(input: DownloadInput) -> Result<Response<Body>, Registr
     let events = managed.events.clone();
     let tenant = tenant_id.clone();
     let package = package_name.clone();
+    let version = resolve.version.as_ref().map(|v| v.semver.clone());
+    let credential_id = resolve.credential_id.clone();
     let counted = response.bytes_stream().map(move |chunk| {
         if let Ok(bytes) = &chunk {
             counter.fetch_add(bytes.len() as u64, Ordering::Relaxed);
@@ -837,7 +841,9 @@ async fn handle_download(input: DownloadInput) -> Result<Response<Body>, Registr
             super::events::EVENT_DOWNLOAD,
             tenant.as_deref(),
             &package,
+            version.as_deref(),
             bytes,
+            credential_id.as_deref(),
         ));
         Ok::<Bytes, reqwest::Error>(Bytes::new())
     });
@@ -1084,7 +1090,9 @@ async fn publish_inner(
         super::events::EVENT_PUBLISH,
         decision.tenant_id(),
         &publish.name,
+        Some(&publish.version),
         tarball_bytes,
+        None,
     ));
     Ok(json_response(StatusCode::CREATED, body))
 }

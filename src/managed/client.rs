@@ -267,6 +267,8 @@ pub struct DownloadResolveResponse {
     pub version: Option<ResolvedVersion>,
     #[serde(default)]
     pub download_url: Option<String>,
+    #[serde(default)]
+    pub credential_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -275,6 +277,10 @@ pub struct ManagedEvent {
     pub kind: String,
     pub tenant_id: String,
     pub package: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
     pub bytes: u64,
     pub occurred_at: String,
 }
@@ -773,6 +779,8 @@ mod tests {
             kind: "download".to_string(),
             tenant_id: "org_1".to_string(),
             package: "@x/y".to_string(),
+            version: Some("1.2.3".to_string()),
+            credential_id: Some("rdk_123".to_string()),
             bytes: 7,
             occurred_at: "2026-09-22T12:00:00Z".to_string(),
         };
@@ -784,6 +792,8 @@ mod tests {
                 "kind": "download",
                 "tenant_id": "org_1",
                 "package": "@x/y",
+                "version": "1.2.3",
+                "credential_id": "rdk_123",
                 "bytes": 7,
                 "occurred_at": "2026-09-22T12:00:00Z"
             })

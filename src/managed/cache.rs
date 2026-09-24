@@ -486,6 +486,7 @@ mod tests {
             package: None,
             version: None,
             download_url: Some("https://example.com/file.tgz".to_string()),
+            credential_id: None,
         };
         cache.put("tok", "host", "pkg", "1.0.0", &response).await;
         assert!(cache.get("tok", "host", "pkg", "1.0.0").await.is_none());

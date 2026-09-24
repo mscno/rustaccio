@@ -139,7 +139,8 @@ header; responses without it are never cached.
 
 1. Authorize `tarball:read` for the exact version inferred from the filename.
 2. `POST /v1/downloads/resolve`; the response (including `download_url`) is
-   cached up to `expires_at`.
+   cached up to `expires_at`. An optional `credential_id` identifies the
+   control-plane download key that authorized the transfer.
 3. With a `download_url`: default `redirect` mode answers `302 Location:
    <url>`; `RUSTACCIO_MANAGED_DOWNLOAD_MODE=proxy` streams the URL through,
    forwarding `Range` so 206/416 pass through. HEAD in proxy mode answers
@@ -156,6 +157,9 @@ best-effort: events sit on a bounded channel
 (`RUSTACCIO_MANAGED_EVENT_QUEUE_CAPACITY`, default 1024), are flushed in
 batches (50 or 5s), and are dropped on overflow with a warning. Event
 delivery never blocks or fails an npm operation.
+Download events echo `credential_id` and the resolved version when present,
+so the control plane can attribute customer delivery. Older control planes
+that omit it remain compatible.
 
 ## Fleet
 
