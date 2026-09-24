@@ -221,7 +221,7 @@ cargo test
 cargo test --features s3
 ```
 
-Run real S3-backend integration tests against local MinIO:
+Run real S3-backend integration tests against a local, pinned S3 emulator:
 
 ```bash
 just minio-up
@@ -239,9 +239,8 @@ just governance-down
 
 Defaults:
 
-- MinIO API: `http://127.0.0.1:9002`
-- MinIO console: `http://127.0.0.1:9003`
-- Access key / secret: `minioadmin` / `minioadmin`
+- S3 API: `http://127.0.0.1:9002`
+- Test access key / secret: `minioadmin` / `minioadmin`
 - Test bucket: `rustaccio-it`
 
 Override integration test connection settings with:

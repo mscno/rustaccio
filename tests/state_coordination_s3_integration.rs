@@ -294,7 +294,7 @@ async fn state_coordination_s3_fail_closed_rejects_writes_when_backend_is_down()
 }
 
 #[tokio::test]
-#[ignore = "requires local MinIO (`just minio-up`)"]
+#[ignore = "requires local S3 emulator (`just minio-up`)"]
 async fn state_coordination_s3_lock_timeout_when_key_is_held() {
     let endpoint = it_endpoint();
     let region = it_region();

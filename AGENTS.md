@@ -30,7 +30,7 @@ cargo test --workspace --no-default-features --all-targets --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 ```
 
-If your changes touch S3/tarball backend behavior, also run integration coverage:
+If your changes touch S3/tarball backend behavior, also run integration coverage against the pinned local S3 emulator:
 
 ```bash
 just minio-up

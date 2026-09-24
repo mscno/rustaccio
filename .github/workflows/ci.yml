@@ -93,23 +93,22 @@ jobs:
       - name: Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Start MinIO
+      - name: Start S3 emulator
         run: |
           docker run -d --name minio \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            -p 9002:9000 \
-            quay.io/minio/minio server /data
+            -e SERVICES=s3 \
+            -p 9002:4566 \
+            localstack/localstack:4.14.0
           for i in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:9002/minio/health/live; then
-              echo "MinIO is ready"
+            if curl -sf http://127.0.0.1:9002/_localstack/health; then
+              echo "S3 emulator is ready"
               break
             fi
-            echo "Waiting for MinIO... ($i)"
+            echo "Waiting for S3 emulator... ($i)"
             sleep 2
           done
 
-      - name: Run MinIO integration tests
+      - name: Run S3 integration tests
         env:
           RUSTACCIO_S3_IT_ENDPOINT: http://127.0.0.1:9002
           RUSTACCIO_S3_IT_REGION: us-east-1

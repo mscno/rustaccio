@@ -216,7 +216,7 @@ async fn list_keys(client: &S3Client, bucket: &str, prefix: &str) -> Vec<String>
 }
 
 #[test]
-#[ignore = "requires local MinIO (`just minio-up`)"]
+#[ignore = "requires local S3 emulator (`just minio-up`)"]
 fn minio_backend_publish_and_put_rev_unpublish_flow() {
     // The combined publish/put-rev/unpublish flow builds a single large async
     // future whose stack frame exceeds the default 2MB thread stack on recent

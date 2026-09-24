@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Managed download events now carry the optional control-plane `credential_id` and resolved version, allowing customer-level delivery attribution by package version in redirect and proxy modes.
 
+### Fixed
+
+- S3 integration tests use a pinned LocalStack community image after the old MinIO image stopped permitting public pulls.
+
 ## [0.13.0] - 2026-09-24
 
 ### Changed
