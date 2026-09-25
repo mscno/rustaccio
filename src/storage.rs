@@ -459,9 +459,7 @@ impl Store {
         let Some(backend) = MetadataBackend::parse(&raw) else {
             return Err(RegistryError::http(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "unsupported RUSTACCIO_METADATA_BACKEND: {raw} (expected sidecar|transactional)"
-                ),
+                format!("unsupported RUSTACCIO_METADATA_BACKEND: {raw} (expected sidecar|managed)"),
             ));
         };
         if backend == MetadataBackend::TransactionalPreview {

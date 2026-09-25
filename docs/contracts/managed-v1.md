@@ -18,7 +18,7 @@ Managed mode is enabled with:
 
 ```
 RUSTACCIO_METADATA_BACKEND=managed
-RUSTACCIO_CONTROL_PLANE_URL=https://app.privatenpm.com
+RUSTACCIO_CONTROL_PLANE_URL=https://control-plane.example.com
 RUSTACCIO_CONTROL_PLANE_TOKEN=<node credential>
 ```
 

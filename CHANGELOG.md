@@ -11,9 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Managed download events now carry the optional control-plane `credential_id` and resolved version, allowing customer-level delivery attribution by package version in redirect and proxy modes.
 
+### Removed
+
+- Removed the `docs/oss-plus-saas-control-plane-spec.md` and `docs/oss-saas-implementation-backlog.md` planning documents; the versioned data-plane contracts in `docs/contracts/` (including `managed-v1.md`) remain the integration reference.
+- Removed the unused `argon2` and `password-hash` dependencies (leftovers from the local auth backend removed in 0.10.0).
+
 ### Fixed
 
 - S3 integration tests use a pinned LocalStack community image after the old MinIO image stopped permitting public pulls.
+- The mode preset files `.env.local.example`, `.env.s3.example` and `.env.managed.example` no longer reference the removed `RUSTACCIO_AUTH_BACKEND=local`, `RUSTACCIO_AUTH_EXTERNAL_MODE` and `RUSTACCIO_AUTH_TOKEN_TTL_SECS` settings, and a mangled line in `.env.s3.example` was repaired.
+- The startup error for an invalid `RUSTACCIO_METADATA_BACKEND` now names the valid values (`sidecar|managed`).
+- Documentation no longer points at a specific hosted control-plane deployment; examples use neutral hostnames.
 
 ## [0.13.0] - 2026-09-24
 

@@ -91,10 +91,10 @@ Container (local build + run):
 docker build -t rustaccio:local .
 # Lower memory pressure on constrained builders (slower compile):
 docker build --build-arg CARGO_BUILD_JOBS=1 -t rustaccio:local .
-# Build image with managed-platform backends enabled at compile-time:
+# Build image with managed-profile backends enabled at compile-time:
 docker build \
   --build-arg CARGO_FEATURES="s3,redis,postgres,otel" \
-  -t rustaccio:saas .
+  -t rustaccio:managed .
 
 docker run --rm -p 4873:4873 \
   -v "$(pwd)/.rustaccio-data:/var/lib/rustaccio/data" \
@@ -175,7 +175,7 @@ Environment variables:
 - `RUSTACCIO_S3_PREFIX` (optional key prefix)
 - `RUSTACCIO_S3_FORCE_PATH_STYLE` (default `true`)
 - `RUSTACCIO_S3_CA_BUNDLE` (optional PEM bundle path for S3 TLS trust; falls back to common system bundle paths when present)
-- `RUSTACCIO_METADATA_BACKEND` (`sidecar` or `transactional`; default `sidecar`, `transactional` reserved/not yet available)
+- `RUSTACCIO_METADATA_BACKEND` (`sidecar` or `managed`; default `sidecar`. `managed` selects the [managed data-plane bridge](#managed-data-plane-bridge-control-plane-managed); `transactional` is reserved and rejected at startup with a pointer to `managed`)
 - `RUSTACCIO_PACKAGE_METADATA_AUTHORITY` (`sidecar`, default `sidecar`)
   - Any non-empty value other than `sidecar` is rejected at startup.
 - `RUSTACCIO_STATE_COORDINATION_BACKEND` (`none`, `redis`, `s3`, or `postgres`, default `none`)
@@ -709,7 +709,7 @@ Recommended managed-mode posture:
 
 - Set `RUSTACCIO_MANAGED_MODE=true`.
 - Set `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false`.
-- Define a dedicated admin group from your control-plane identity provider, and set it in `RUSTACCIO_ADMIN_GROUPS`.
+- Define a dedicated admin group from your identity provider, and set it in `RUSTACCIO_ADMIN_GROUPS`.
 
 ## Run Modes
 
@@ -785,7 +785,7 @@ reports download/publish events.
 
 Required env:
 
-- `RUSTACCIO_CONTROL_PLANE_URL` (for example `https://app.privatenpm.com`)
+- `RUSTACCIO_CONTROL_PLANE_URL` (for example `https://control-plane.example.com`)
 - `RUSTACCIO_CONTROL_PLANE_TOKEN` (node credential, sent as Bearer on every control-plane call)
 - `RUSTACCIO_TARBALL_BACKEND=s3` plus the usual S3 settings (startup fails otherwise)
 
@@ -811,7 +811,7 @@ the node credential as the bearer token.
 ```bash
 docker build \
   --build-arg CARGO_FEATURES="s3,redis,postgres,otel" \
-  -t rustaccio:saas .
+  -t rustaccio:managed .
 ```
 
 ### 2) Runtime env for managed governance
@@ -837,7 +837,7 @@ Recommended managed security baseline:
 - `RUSTACCIO_AUTH_HTTP_BASE_URL=http://your-auth-service:8080`
 - `RUSTACCIO_AUTH_HTTP_REQUEST_AUTH_ENDPOINT=/request-auth`
 - `RUSTACCIO_ADMIN_ALLOW_ANY_AUTHENTICATED=false`
-- `RUSTACCIO_ADMIN_GROUPS=<control-plane-admin-group>`
+- `RUSTACCIO_ADMIN_GROUPS=<admin-group>`
 - `RUSTACCIO_PACKAGE_METADATA_AUTHORITY=sidecar`
 - `RUSTACCIO_STATE_COORDINATION_BACKEND=redis`
 - `RUSTACCIO_STATE_COORDINATION_REDIS_URL=redis://redis:6379/`
@@ -870,7 +870,7 @@ docker run --rm -p 4873:4873 \
   -e RUSTACCIO_QUOTA_BACKEND=postgres \
   -e RUSTACCIO_QUOTA_POSTGRES_URL=postgres://postgres:postgres@postgres:5432/rustaccio \
   -e RUSTACCIO_METRICS_BACKEND=prometheus \
-  rustaccio:saas
+  rustaccio:managed
 ```
 
 Notes:
@@ -984,11 +984,10 @@ Current bottlenecks/limits:
 - Metadata writes are still not transactional across tarball + sidecar artifacts.
 - Sidecar conflict resolution remains optimistic at application level.
 
-Recommended evolution for high-scale managed deployments:
-
-- Move package metadata to a transactional DB-backed metadata store.
-- Keep object storage for immutable tarballs/blobs.
-- Add distributed compare-and-swap/evented invalidation for metadata cache coherence.
+Deployments that need transactional metadata, centralized entitlement and
+publish-session state can run the [managed data-plane
+bridge](#managed-data-plane-bridge-control-plane-managed), where a control
+plane owns metadata and Rustaccio only bridges bytes.
 
 ## License
 
